@@ -1,6 +1,8 @@
 # WLAN Monitor
 
-**See at a glance which devices are on your local Wi-Fi network, how strong your signal is, and how much traffic is flowing.**
+**See who is on your Wi-Fi from the Omarchy bar: every device with name, maker and model, one click to your router's and devices' web pages, plus signal, link speed and live traffic.**
+
+![WLAN Monitor panel and bar icon](preview.png)
 
 WLAN Monitor is a lightweight Omarchy bar widget and popup panel that discovers and lists devices on your local WLAN without requiring root privileges or extra packages.
 

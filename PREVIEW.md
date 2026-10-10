@@ -1,0 +1,3 @@
+# Preview
+
+`preview.png` is composed from real screenshots of the WLAN Monitor panel and bar icon (version 0.2.0, Omarchy shell). To keep personal data out of the listing, the collector was temporarily replaced by a demo script that emits the same JSON with fictional devices: generic names (e.g. "MacBook Air", "Pixel 9", "Brother HL-L2350DW") and made-up MAC addresses. Everything else, including layout, colours, icons and the bar, is the plugin as it renders. Only the panel and the bar section were cropped from the screen, taken on an empty workspace; no other desktop content, personal data or third-party logos are included.
