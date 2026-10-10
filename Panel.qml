@@ -377,9 +377,11 @@ Panel {
             width: parent.width
             spacing: Style.space(8)
             Button {
-              // Same label while scanning so the button row keeps its size.
+              // Same label and glyph while scanning (the icon just spins), so the
+              // button keeps its width and the buttons next to it do not move.
               text: "Rescan"
-              iconText: root.scanning ? "󰦖" : "󰑐"
+              iconText: "󰑐"
+              iconSpinning: root.scanning
               bordered: true
               foreground: root.fg
               fontFamily: root.font
