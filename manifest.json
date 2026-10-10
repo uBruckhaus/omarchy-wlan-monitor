@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "ubruckhaus.wlan-monitor",
+  "name": "WLAN Monitor",
+  "version": "0.1.0",
+  "author": "uBruckhaus",
+  "description": "Local WLAN monitor for the bar: shows the devices on your Wi-Fi network (online and sleeping) with hostnames, manufacturers and models, plus Wi-Fi signal quality, link speed and live traffic.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "WLAN Monitor",
+    "description": "Local WLAN device list, signal quality and traffic",
+    "category": "System",
+    "defaultSection": "right",
+    "allowMultiple": false
+  },
+  "license": "MIT"
+}
