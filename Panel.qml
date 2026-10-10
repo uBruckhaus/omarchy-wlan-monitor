@@ -34,6 +34,8 @@ Panel {
     return null
   }
   readonly property bool trusted: root.link.trusted === true
+  // About five device rows; together with the link section this matches the LLM Monitor panel.
+  readonly property real maxDeviceListHeight: Style.space(244)
   readonly property int onlineCount: Number(stats.online_count || 0)
   readonly property int totalCount: Number(stats.total_count || 0)
   readonly property int idleCount: Number(stats.idle_count || 0)
@@ -94,6 +96,10 @@ Panel {
     Text {
       textFormat: Text.PlainText
       id: meterLabel
+      anchors.left: parent.left
+      anchors.right: meterValue.left
+      anchors.rightMargin: Style.space(8)
+      elide: Text.ElideRight
       text: meter.label
       color: root.dim
       font.family: root.font
@@ -101,6 +107,7 @@ Panel {
     }
     Text {
       textFormat: Text.PlainText
+      id: meterValue
       anchors.right: parent.right
       text: meter.value
       color: root.fg
@@ -216,7 +223,7 @@ Panel {
           }
 
           Meter {
-            label: "Traffic  ·  RX " + root.formatBytes(root.traffic.rx_bytes) + "  TX " + root.formatBytes(root.traffic.tx_bytes)
+            label: "Traffic  ·  " + root.formatBytes(root.traffic.rx_bytes) + " / " + root.formatBytes(root.traffic.tx_bytes)
             value: "↓ " + root.formatRate(root.traffic.rx_rate) + "  ·  ↑ " + root.formatRate(root.traffic.tx_rate)
             // Logarithmic-like visual activity bar up to ~10 MB/s
             fraction: {
@@ -249,93 +256,112 @@ Panel {
             fontFamily: root.font
           }
 
-          Repeater {
-            model: root.devices
-            delegate: Item {
-              id: block
-              required property var modelData
-              width: column.width
-              height: rows.implicitHeight + Style.space(4)
-              readonly property bool online: modelData.online === true
-              readonly property string subtitle: root.deviceSubtitle(modelData)
-              readonly property string webUrl: String(modelData.web_url || "")
+          // Only the device list scrolls, so the panel keeps the LLM Monitor's height
+          // and the link info and buttons stay visible.
+          Flickable {
+            id: deviceScroller
+            width: parent.width
+            height: Math.min(deviceColumn.implicitHeight, root.maxDeviceListHeight)
+            contentWidth: width
+            contentHeight: deviceColumn.implicitHeight
+            clip: true
+            boundsBehavior: Flickable.StopAtBounds
+            interactive: contentHeight > height
 
-              Rectangle {
-                anchors.fill: parent
-                anchors.margins: -Style.space(3)
-                radius: Style.space(6)
-                color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.08)
-                visible: rowMouse.containsMouse && block.webUrl !== ""
-              }
+            Column {
+              id: deviceColumn
+              width: deviceScroller.width
+              spacing: column.spacing
 
-              Column {
-                id: rows
-                width: parent.width
-                anchors.verticalCenter: parent.verticalCenter
-                spacing: Style.space(2)
+              Repeater {
+                model: root.devices
+                delegate: Item {
+                  id: block
+                  required property var modelData
+                  width: deviceColumn.width
+                  height: rows.implicitHeight + Style.space(4)
+                  readonly property bool online: modelData.online === true
+                  readonly property string subtitle: root.deviceSubtitle(modelData)
+                  readonly property string webUrl: String(modelData.web_url || "")
 
-                Item {
-                  width: parent.width
-                  height: deviceName.height
                   Rectangle {
-                    id: dot
-                    anchors.verticalCenter: parent.verticalCenter
-                    width: Style.space(8); height: width; radius: width / 2
-                    color: block.online ? Color.accent : "transparent"
-                    border.width: 1
-                    border.color: block.online ? Color.accent : root.dim
+                    anchors.fill: parent
+                    anchors.margins: -Style.space(3)
+                    radius: Style.space(6)
+                    color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.08)
+                    visible: rowMouse.containsMouse && block.webUrl !== ""
                   }
-                  Text {
-                    textFormat: Text.PlainText
-                    id: deviceName
-                    anchors.left: dot.right
-                    anchors.leftMargin: Style.space(8)
-                    anchors.right: deviceIp.left
-                    anchors.rightMargin: Style.space(8)
-                    elide: Text.ElideRight
-                    text: block.modelData.name
-                    color: block.online ? root.fg : root.dim
-                    font.family: root.font
-                    font.pixelSize: Style.font.body
-                    font.bold: block.online
-                    font.underline: rowMouse.containsMouse && block.webUrl !== ""
-                  }
-                  Text {
-                    textFormat: Text.PlainText
-                    id: deviceIp
-                    anchors.right: parent.right
+
+                  Column {
+                    id: rows
+                    width: parent.width
                     anchors.verticalCenter: parent.verticalCenter
-                    text: root.deviceRightLabel(block.modelData)
-                    color: (block.modelData.is_gateway || block.modelData.is_self)
-                      ? Color.accent
-                      : (block.online ? root.fg : root.dim)
-                    font.family: root.font
-                    font.pixelSize: Style.font.caption
+                    spacing: Style.space(2)
+
+                    Item {
+                      width: parent.width
+                      height: deviceName.height
+                      Rectangle {
+                        id: dot
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: Style.space(8); height: width; radius: width / 2
+                        color: block.online ? Color.accent : "transparent"
+                        border.width: 1
+                        border.color: block.online ? Color.accent : root.dim
+                      }
+                      Text {
+                        textFormat: Text.PlainText
+                        id: deviceName
+                        anchors.left: dot.right
+                        anchors.leftMargin: Style.space(8)
+                        anchors.right: deviceIp.left
+                        anchors.rightMargin: Style.space(8)
+                        elide: Text.ElideRight
+                        text: block.modelData.name
+                        color: block.online ? root.fg : root.dim
+                        font.family: root.font
+                        font.pixelSize: Style.font.body
+                        font.bold: block.online
+                        font.underline: rowMouse.containsMouse && block.webUrl !== ""
+                      }
+                      Text {
+                        textFormat: Text.PlainText
+                        id: deviceIp
+                        anchors.right: parent.right
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: root.deviceRightLabel(block.modelData)
+                        color: (block.modelData.is_gateway || block.modelData.is_self)
+                          ? Color.accent
+                          : (block.online ? root.fg : root.dim)
+                        font.family: root.font
+                        font.pixelSize: Style.font.caption
+                      }
+                    }
+
+                    Text {
+                      textFormat: Text.PlainText
+                      visible: text !== ""
+                      width: parent.width
+                      leftPadding: Style.space(16)
+                      elide: Text.ElideRight
+                      text: rowMouse.containsMouse && block.webUrl !== ""
+                        ? "Open " + block.webUrl
+                        : block.subtitle
+                      color: root.dim
+                      font.family: root.font
+                      font.pixelSize: Style.font.caption
+                    }
+                  }
+
+                  MouseArea {
+                    id: rowMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    enabled: block.webUrl !== ""
+                    cursorShape: block.webUrl !== "" ? Qt.PointingHandCursor : Qt.ArrowCursor
+                    onClicked: root.openWeb(block.webUrl)
                   }
                 }
-
-                Text {
-                  textFormat: Text.PlainText
-                  visible: text !== ""
-                  width: parent.width
-                  leftPadding: Style.space(16)
-                  elide: Text.ElideRight
-                  text: rowMouse.containsMouse && block.webUrl !== ""
-                    ? "Open " + block.webUrl
-                    : block.subtitle
-                  color: root.dim
-                  font.family: root.font
-                  font.pixelSize: Style.font.caption
-                }
-              }
-
-              MouseArea {
-                id: rowMouse
-                anchors.fill: parent
-                hoverEnabled: true
-                enabled: block.webUrl !== ""
-                cursorShape: block.webUrl !== "" ? Qt.PointingHandCursor : Qt.ArrowCursor
-                onClicked: root.openWeb(block.webUrl)
               }
             }
           }
