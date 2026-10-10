@@ -2,9 +2,9 @@
   "schemaVersion": 1,
   "id": "ubruckhaus.wlan-monitor",
   "name": "WLAN Monitor",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "uBruckhaus",
-  "description": "Local WLAN monitor for the bar: shows the devices on your Wi-Fi network (online and sleeping) with hostnames, manufacturers and models, plus Wi-Fi signal quality, link speed and live traffic.",
+  "description": "Local WLAN monitor for the bar: shows the devices on your Wi-Fi network (online, idle and sleeping) with hostnames, manufacturers and models, opens router and device web interfaces with one click, plus Wi-Fi signal quality, link speed and live traffic.",
   "kinds": [
     "bar-widget"
   ],

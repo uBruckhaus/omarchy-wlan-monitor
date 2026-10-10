@@ -6,7 +6,8 @@ import qs.Ui
 
 // Detail popup: Wi-Fi link & signal quality, live throughput, and the list of
 // discovered devices on the local WLAN (online and sleeping) with IP, hostname,
-// manufacturer, model and MAC address.
+// manufacturer, model and MAC address. Rows of devices with a web interface
+// (router, devices announcing _http._tcp / printer admin pages) open it on click.
 Panel {
   id: root
   moduleName: "ubruckhaus.wlan-monitor"
@@ -18,10 +19,25 @@ Panel {
   property var stats: ({})  // pushed by BarWidget on every snapshot
   readonly property var link: stats.link || ({})
   readonly property var traffic: stats.traffic || ({})
-  readonly property var devices: stats.devices || []
+  // Only replace the device list when its content changed, so rows are not rebuilt every tick.
+  property var devices: []
+  property string devicesRev: ""
+  onStatsChanged: {
+    var rev = String(stats.devices_rev || "")
+    if (rev === "" || rev !== devicesRev) {
+      devicesRev = rev
+      devices = stats.devices || []
+    }
+  }
+  readonly property var gatewayDevice: {
+    for (var i = 0; i < devices.length; i++) if (devices[i].is_gateway) return devices[i]
+    return null
+  }
+  readonly property bool trusted: root.link.trusted === true
   readonly property int onlineCount: Number(stats.online_count || 0)
   readonly property int totalCount: Number(stats.total_count || 0)
-  readonly property int sleepingCount: Math.max(0, totalCount - onlineCount)
+  readonly property int idleCount: Number(stats.idle_count || 0)
+  readonly property int sleepingCount: Math.max(0, totalCount - onlineCount - idleCount)
   readonly property bool scanning: root.hostWidget ? root.hostWidget.scanning === true : (stats.scanning === true)
   readonly property color fg: Color.popups.text
   readonly property color dim: Qt.darker(fg, 1.45)
@@ -45,10 +61,14 @@ Panel {
     return Math.round(r) + " B/s"
   }
   function deviceRightLabel(dev) {
-    if (dev.is_gateway) return "router · " + dev.ip
+    var web = dev.web_url ? "󰖟  " : ""
+    if (dev.is_gateway) return web + "router · " + dev.ip
     if (dev.is_self) return "this PC · " + dev.ip
-    if (!dev.online) return "sleeping · " + dev.ip
-    return dev.ip
+    if (!dev.online) return web + (dev.state === "idle" ? "idle · " : "sleeping · ") + dev.ip
+    return web + dev.ip
+  }
+  function openWeb(url) {
+    if (root.hostWidget && root.hostWidget.openUrl(url)) root.close()
   }
   function deviceSubtitle(dev) {
     var parts = []
@@ -190,7 +210,7 @@ Panel {
             label: "Signal"
               + (root.link.channel ? "  ·  Ch " + root.link.channel : "")
               + (root.link.tx_mbps ? "  ·  " + root.link.tx_mbps + (root.link.rx_mbps ? " / " + root.link.rx_mbps : "") + " Mbit/s" : "")
-            value: (root.link.quality || 0) + "% (" + root.link.signal_dbm + " dBm)"
+            value: (root.link.quality || 0) + "%" + (root.link.signal_dbm !== null && root.link.signal_dbm !== undefined ? " (" + root.link.signal_dbm + " dBm)" : "")
             fraction: sigFrac
             fillColor: root.signalColor(sigFrac)
           }
@@ -207,9 +227,23 @@ Panel {
             fillColor: Color.accent
           }
 
+          Text {
+            textFormat: Text.PlainText
+            visible: root.stats.active === true
+            width: parent.width
+            wrapMode: Text.WordWrap
+            text: root.trusted
+              ? "Active scanning: trusted network, subnet sweep every 2 min"
+              : "Passive mode: this network is not trusted, so the subnet is not probed. Rescan once, or trust the network."
+            color: root.dim
+            font.family: root.font
+            font.pixelSize: Style.font.caption
+          }
+
           PanelSeparator { width: parent.width; foreground: root.fg }
           PanelSectionHeader {
             text: "DEVICES ON WLAN (" + root.onlineCount + " ONLINE"
+              + (root.idleCount > 0 ? " · " + root.idleCount + " IDLE" : "")
               + (root.sleepingCount > 0 ? " · " + root.sleepingCount + " SLEEPING" : "") + ")"
             foreground: root.fg
             fontFamily: root.font
@@ -217,73 +251,102 @@ Panel {
 
           Repeater {
             model: root.devices
-            delegate: Column {
+            delegate: Item {
               id: block
               required property var modelData
               width: column.width
-              spacing: Style.space(2)
+              height: rows.implicitHeight + Style.space(4)
               readonly property bool online: modelData.online === true
               readonly property string subtitle: root.deviceSubtitle(modelData)
+              readonly property string webUrl: String(modelData.web_url || "")
 
-              Item {
+              Rectangle {
+                anchors.fill: parent
+                anchors.margins: -Style.space(3)
+                radius: Style.space(6)
+                color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.08)
+                visible: rowMouse.containsMouse && block.webUrl !== ""
+              }
+
+              Column {
+                id: rows
                 width: parent.width
-                height: deviceName.height
-                Rectangle {
-                  id: dot
-                  anchors.verticalCenter: parent.verticalCenter
-                  width: Style.space(8); height: width; radius: width / 2
-                  color: block.online ? Color.accent : "transparent"
-                  border.width: 1
-                  border.color: block.online ? Color.accent : root.dim
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Style.space(2)
+
+                Item {
+                  width: parent.width
+                  height: deviceName.height
+                  Rectangle {
+                    id: dot
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: Style.space(8); height: width; radius: width / 2
+                    color: block.online ? Color.accent : "transparent"
+                    border.width: 1
+                    border.color: block.online ? Color.accent : root.dim
+                  }
+                  Text {
+                    textFormat: Text.PlainText
+                    id: deviceName
+                    anchors.left: dot.right
+                    anchors.leftMargin: Style.space(8)
+                    anchors.right: deviceIp.left
+                    anchors.rightMargin: Style.space(8)
+                    elide: Text.ElideRight
+                    text: block.modelData.name
+                    color: block.online ? root.fg : root.dim
+                    font.family: root.font
+                    font.pixelSize: Style.font.body
+                    font.bold: block.online
+                    font.underline: rowMouse.containsMouse && block.webUrl !== ""
+                  }
+                  Text {
+                    textFormat: Text.PlainText
+                    id: deviceIp
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: root.deviceRightLabel(block.modelData)
+                    color: (block.modelData.is_gateway || block.modelData.is_self)
+                      ? Color.accent
+                      : (block.online ? root.fg : root.dim)
+                    font.family: root.font
+                    font.pixelSize: Style.font.caption
+                  }
                 }
+
                 Text {
                   textFormat: Text.PlainText
-                  id: deviceName
-                  anchors.left: dot.right
-                  anchors.leftMargin: Style.space(8)
-                  anchors.right: deviceIp.left
-                  anchors.rightMargin: Style.space(8)
+                  visible: text !== ""
+                  width: parent.width
+                  leftPadding: Style.space(16)
                   elide: Text.ElideRight
-                  text: block.modelData.name
-                  color: block.online ? root.fg : root.dim
-                  font.family: root.font
-                  font.pixelSize: Style.font.body
-                  font.bold: block.online
-                }
-                Text {
-                  textFormat: Text.PlainText
-                  id: deviceIp
-                  anchors.right: parent.right
-                  anchors.verticalCenter: parent.verticalCenter
-                  text: root.deviceRightLabel(block.modelData)
-                  color: (block.modelData.is_gateway || block.modelData.is_self)
-                    ? Color.accent
-                    : (block.online ? root.fg : root.dim)
+                  text: rowMouse.containsMouse && block.webUrl !== ""
+                    ? "Open " + block.webUrl
+                    : block.subtitle
+                  color: root.dim
                   font.family: root.font
                   font.pixelSize: Style.font.caption
                 }
               }
 
-              Text {
-                textFormat: Text.PlainText
-                visible: block.subtitle !== ""
-                width: block.width
-                leftPadding: Style.space(16)
-                elide: Text.ElideRight
-                text: block.subtitle
-                color: root.dim
-                font.family: root.font
-                font.pixelSize: Style.font.caption
+              MouseArea {
+                id: rowMouse
+                anchors.fill: parent
+                hoverEnabled: true
+                enabled: block.webUrl !== ""
+                cursorShape: block.webUrl !== "" ? Qt.PointingHandCursor : Qt.ArrowCursor
+                onClicked: root.openWeb(block.webUrl)
               }
             }
           }
 
           PanelSeparator { width: parent.width; foreground: root.fg }
 
-          Row {
+          Flow {
+            width: parent.width
             spacing: Style.space(8)
             Button {
-              text: root.scanning ? "Scanning…" : "Rescan WLAN"
+              text: root.scanning ? "Scanning…" : "Rescan"
               iconText: "󰑐"
               bordered: true
               foreground: root.fg
@@ -291,6 +354,29 @@ Panel {
               enabled: !root.scanning
               tooltipText: "Actively probe the local subnet and refresh mDNS / router DNS names"
               onClicked: if (root.hostWidget) root.hostWidget.rescan()
+            }
+            Button {
+              visible: root.gatewayDevice !== null && String(root.gatewayDevice.web_url || "") !== ""
+              text: "Router"
+              iconText: "󰑩"
+              bordered: true
+              foreground: root.fg
+              fontFamily: root.font
+              tooltipText: root.gatewayDevice ? "Open " + root.gatewayDevice.web_url : ""
+              onClicked: if (root.gatewayDevice) root.openWeb(root.gatewayDevice.web_url)
+            }
+            Button {
+              visible: root.stats.active === true
+              text: root.trusted ? "Untrust" : "Trust"
+              iconText: root.trusted ? "󰦜" : "󰕥"
+              bordered: true
+              foreground: root.fg
+              fontFamily: root.font
+              enabled: root.link.can_trust === true
+              tooltipText: root.trusted
+                ? "Stop active scanning on this network (passive discovery only)"
+                : "Allow periodic active scans (ICMP + router DNS) on this network"
+              onClicked: if (root.hostWidget) root.hostWidget.setTrusted(!root.trusted)
             }
             Button {
               text: "Network"

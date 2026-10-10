@@ -8,7 +8,8 @@ import qs.Ui as Ui
 // Bar indicator for the local WLAN. Dim radar icon while disconnected; coloured
 // radar chip plus online device count while connected, with a thin signal-quality
 // bar underneath. Pulses while scanning the subnet. Left click opens the panel;
-// right click triggers an immediate rescan.
+// right click triggers an immediate rescan. Commands (rescan, panel open/closed,
+// trust/untrust network) go to the collector over stdin.
 Ui.BarWidget {
   id: root
   moduleName: "ubruckhaus.wlan-monitor"
@@ -19,7 +20,10 @@ Ui.BarWidget {
   readonly property bool active: stats.active === true
   readonly property int onlineCount: Number(stats.online_count || 0)
   readonly property int totalCount: Number(stats.total_count || 0)
-  readonly property bool scanning: stats.scanning === true || onDemandScanner.running
+  property bool scanBusy: false       // collector reported that a sweep is running
+  property bool rescanPending: false  // user asked for a rescan, waiting for the result
+  readonly property bool scanning: scanBusy || rescanPending
+  readonly property bool trusted: active && stats.link && stats.link.trusted === true
   readonly property string scriptDir: Qt.resolvedUrl("scripts").toString().replace(/^file:\/\//, "")
 
   // Signal quality fraction in 0..1, or -1 when unknown (e.g. Ethernet fallback).
@@ -69,52 +73,62 @@ Ui.BarWidget {
   readonly property string summary: {
     if (!active || !stats.link) return "WLAN Monitor\nNot connected to a local network"
     var link = stats.link
-    var sleeping = Math.max(0, totalCount - onlineCount)
+    var idle = Number(stats.idle_count || 0)
+    var sleeping = Math.max(0, totalCount - onlineCount - idle)
     var header = (link.ssid || link.iface) + (link.band ? " · " + link.band : "")
       + (link.signal_dbm !== null && link.signal_dbm !== undefined ? " · " + link.signal_dbm + " dBm (" + link.quality + "%)" : "")
     var addr = "IP: " + (link.cidr || link.ip) + (link.gateway ? " · Gateway " + link.gateway : "")
-    var counts = "Devices: " + onlineCount + " online" + (sleeping > 0 ? ", " + sleeping + " sleeping" : "")
+    var counts = "Devices: " + onlineCount + " online" + (idle > 0 ? ", " + idle + " idle" : "") + (sleeping > 0 ? ", " + sleeping + " sleeping" : "")
+      + (root.trusted ? "" : " · passive mode (network not trusted)")
     var names = (stats.devices || []).filter(function(d) { return d.online }).slice(0, 6).map(function(d) {
       return "• " + d.name + " (" + d.ip + ")"
     }).join("\n")
     return header + "\n" + addr + "\n" + counts + (names ? "\n" + names : "")
   }
 
+  function send(command) {
+    if (collector.running) collector.write(command + "\n")
+  }
   function rescan() {
-    if (!onDemandScanner.running) onDemandScanner.running = true
+    if (rescanPending) return
+    rescanPending = true
+    send("rescan")
+  }
+  function setTrusted(trust) { send(trust ? "trust" : "untrust") }
+
+  // Open a device's web UI. The collector only builds http(s) URLs for private IPv4
+  // literals; re-check the shape here and hand it to xdg-open as a single argv entry.
+  readonly property var webUrlPattern: /^https?:\/\/(\d{1,3}\.){3}\d{1,3}(:\d{1,5})?\/[A-Za-z0-9._~\/-]{0,100}$/
+  function openUrl(url) {
+    var target = String(url || "")
+    if (!webUrlPattern.test(target)) return false
+    Quickshell.execDetached(["xdg-open", target])
+    return true
   }
 
-  // Continuous background collector streaming a JSON snapshot every 3 seconds.
+  // Background collector streaming a JSON snapshot every 3 s (panel open) / 6 s (closed).
   Process {
     id: collector
     command: ["python3", root.scriptDir + "/wlan-monitor.py"]
     running: true
+    stdinEnabled: true
     stdout: SplitParser {
       onRead: function(line) {
         try {
           var data = JSON.parse(line)
-          if (!data.error) root.stats = data
+          if (data.event === "scanning") { root.scanBusy = true; return }
+          if (data.error) return
+          root.stats = data
+          root.scanBusy = false
+          root.rescanPending = false
         } catch (e) { /* partial line during shutdown */ }
       }
     }
-    onExited: restart.start()
+    onRunningChanged: if (running && root.opened) Qt.callLater(function() { root.send("open") })
+    onExited: { root.scanBusy = false; root.rescanPending = false; restart.start() }
   }
   Timer { id: restart; interval: 5000; onTriggered: collector.running = true }
-
-  // On-demand active subnet + mDNS scan when the user clicks "Rescan WLAN" or right-clicks.
-  Process {
-    id: onDemandScanner
-    command: ["python3", root.scriptDir + "/wlan-monitor.py", "--once"]
-    running: false
-    stdout: SplitParser {
-      onRead: function(line) {
-        try {
-          var data = JSON.parse(line)
-          if (!data.error) root.stats = data
-        } catch (e) {}
-      }
-    }
-  }
+  onOpenedChanged: send(opened ? "open" : "closed")
 
   function injectPanel() {
     var target = panelLoader.item
