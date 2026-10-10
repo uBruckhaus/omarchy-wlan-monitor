@@ -55,6 +55,8 @@ IW_EVERY = 12.0  # full `iw dev link` refresh while the panel is closed (signal 
 ADDR_EVERY = 30.0  # `ip addr` refresh unless the default routes change
 ONLINE_GRACE = 45.0  # a STALE neighbor counts as online this long after it was last confirmed
 SLEEPING_KEEP = 600.0  # keep devices that went away listed as sleeping this long
+SWEEP_MAX_SECONDS = 6.0  # hard time budget for one sweep, including draining replies
+SWEEP_MAX_REPLIES = 4    # replies read per probe sent (ICMP and DNS each), plus a small allowance
 DNS_TTL = 60.0
 DNS_NEGATIVE_TTL = 300.0
 
@@ -529,6 +531,11 @@ def sweep(targets, dns_server=None, settle=0.22):
     targets = list(dict.fromkeys(targets))
     if not targets:
         return {}, set()
+    target_set = set(targets)
+    # A busy or hostile LAN peer must not keep the drain loop busy: one overall deadline
+    # and a fixed number of datagrams read per socket.
+    sweep_deadline = time.monotonic() + SWEEP_MAX_SECONDS
+    budget = {"icmp": SWEEP_MAX_REPLIES * len(targets) + 16, "dns": SWEEP_MAX_REPLIES * len(targets) + 16}
 
     icmp_sock = None
     icmp_payload = b""
@@ -562,24 +569,29 @@ def sweep(targets, dns_server=None, settle=0.22):
     responders = set()
 
     def drain():
-        while icmp_sock and icmp_payload:
+        while icmp_sock and icmp_payload and budget["icmp"] > 0 and time.monotonic() < sweep_deadline:
             try:
                 data, addr = icmp_sock.recvfrom(256)
             except OSError:
                 break
-            if data and data[0] == 0:  # echo reply
+            budget["icmp"] -= 1
+            # Echo replies count only from addresses this sweep actually probed.
+            if data and data[0] == 0 and addr[0] in target_set:
                 responders.add(addr[0])
-        while dns_sock:
+        while dns_sock and budget["dns"] > 0 and time.monotonic() < sweep_deadline:
             try:
                 data, addr = dns_sock.recvfrom(512)
             except OSError:
                 break
+            budget["dns"] -= 1
             ip, names = match_dns_reply(data, addr, dns_server, qid_to_ip)
             if ip and names:
                 ptr_names[ip] = names
 
     try:
         for idx, ip in enumerate(targets):
+            if time.monotonic() >= sweep_deadline:
+                break
             if icmp_sock:
                 try:
                     icmp_sock.sendto(icmp_payload, (ip, icmp_port))
@@ -595,7 +607,7 @@ def sweep(targets, dns_server=None, settle=0.22):
             if (idx + 1) % 6 == 0:
                 time.sleep(0.007)
                 drain()
-        deadline = time.monotonic() + settle
+        deadline = min(time.monotonic() + settle, sweep_deadline)
         while time.monotonic() < deadline:
             time.sleep(0.03)
             drain()
@@ -660,6 +672,11 @@ def parse_neighbors(out):
         if mac:
             neighbors[ip] = {"mac": mac, "state": clean(state, 20)}
     return neighbors
+
+
+def prune_reachable(last_reachable, now, keep_ip, grace=ONLINE_GRACE):
+    """Drop entries that are too old to matter or outside the local subnet."""
+    return {ip: t for ip, t in last_reachable.items() if now - t <= grace and keep_ip(ip)}
 
 
 def neighbor_online(ip, state, now, last_reachable, grace=ONLINE_GRACE):
@@ -1206,11 +1223,23 @@ class Monitor:
         if do_full or do_known:
             neighbors = read_neighbors(iface)
 
+        def in_subnet(ip):
+            if subnet_net is None:
+                return False
+            try:
+                return ipaddress.IPv4Address(ip) in subnet_net
+            except ValueError:
+                return False
+
+        # Only local-subnet addresses are tracked, and entries expire once they can no
+        # longer count (ONLINE_GRACE), so the map stays bounded by the subnet size.
+        responders = {ip for ip in responders if in_subnet(ip)}
         for ip, neigh in neighbors.items():
-            if neigh["state"] in ACTIVE_NEIGH_STATES:
+            if neigh["state"] in ACTIVE_NEIGH_STATES and in_subnet(ip):
                 self.last_reachable[ip] = now
         for ip in responders:
             self.last_reachable[ip] = now
+        self.last_reachable = prune_reachable(self.last_reachable, now, in_subnet)
 
         if gateway_ip and self.gateway_web is None:
             self.gateway_web = probe_web(gateway_ip)

@@ -282,5 +282,70 @@ class TrustTests(unittest.TestCase):
         self.assertTrue(mon.force_next)
 
 
+class FloodSocket:
+    """Fake datagram socket whose peers never stop answering (spoofed and real sources)."""
+
+    reads = 0
+
+    def __init__(self, *args):
+        self.n = 0
+
+    def setblocking(self, flag):
+        pass
+
+    def connect(self, addr):
+        pass
+
+    def sendto(self, data, addr):
+        pass
+
+    def send(self, data):
+        pass
+
+    def recvfrom(self, size):
+        FloodSocket.reads += 1
+        self.n += 1
+        src = "192.168.178.%d" % (self.n % 3 + 1) if self.n % 2 else "10.66.%d.%d" % (self.n // 250 % 250, self.n % 250)
+        return b"\x00" + b"x" * 15, (src, 0)
+
+    def close(self):
+        pass
+
+
+class SweepBudgetTests(unittest.TestCase):
+    def test_flood_is_bounded_and_spoofed_sources_ignored(self):
+        targets = ["192.168.178.%d" % i for i in range(1, 11)]
+        FloodSocket.reads = 0
+        with mock.patch.object(wlan_monitor.socket, "socket", FloodSocket), \
+                mock.patch.object(wlan_monitor.time, "sleep", lambda s: None):
+            start = wlan_monitor.time.monotonic()
+            _, responders = wlan_monitor.sweep(targets, dns_server="192.168.178.1", settle=0.05)
+            elapsed = wlan_monitor.time.monotonic() - start
+        self.assertLess(elapsed, wlan_monitor.SWEEP_MAX_SECONDS + 1)
+        budget = wlan_monitor.SWEEP_MAX_REPLIES * len(targets) + 16
+        self.assertLessEqual(FloodSocket.reads, 2 * budget)
+        self.assertTrue(responders)
+        self.assertTrue(responders <= set(targets))
+
+    def test_sweep_deadline_stops_slow_flood(self):
+        targets = ["192.168.178.%d" % i for i in range(1, 255)]
+        clock = {"t": 0.0}
+
+        def fake_monotonic():
+            clock["t"] += 0.05
+            return clock["t"]
+        with mock.patch.object(wlan_monitor.socket, "socket", FloodSocket), \
+                mock.patch.object(wlan_monitor.time, "sleep", lambda s: None), \
+                mock.patch.object(wlan_monitor.time, "monotonic", fake_monotonic):
+            wlan_monitor.sweep(targets, settle=100)
+        self.assertLess(clock["t"], wlan_monitor.SWEEP_MAX_SECONDS + 1)
+
+    def test_prune_reachable(self):
+        net = ipaddress.IPv4Network("192.168.178.0/24")
+        keep = lambda ip: ipaddress.IPv4Address(ip) in net
+        state = {"192.168.178.5": 100.0, "192.168.178.6": 10.0, "10.66.1.1": 100.0}
+        self.assertEqual(wlan_monitor.prune_reachable(state, 120.0, keep), {"192.168.178.5": 100.0})
+
+
 if __name__ == "__main__":
     unittest.main()
