@@ -418,10 +418,12 @@ Panel {
               bordered: true
               foreground: root.fg
               fontFamily: root.font
-              tooltipText: "Open Omarchy Network settings"
+              tooltipText: "Open the Omarchy Network panel"
               onClicked: {
                 root.close()
-                if (root.bar) root.bar.run("omarchy-launch-wifi")
+                // Third-party plugins may not summon built-in panels directly, so go
+                // through the shell CLI (fixed argv, no shell string).
+                Quickshell.execDetached(["omarchy-shell", "shell", "summon", "omarchy.network", "{}"])
               }
             }
           }

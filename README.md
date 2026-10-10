@@ -14,7 +14,7 @@ WLAN Monitor is a lightweight Omarchy bar widget and popup panel that discovers 
     - Outlined dot (`○`) and **idle** for devices still in the kernel's neighbor cache that have not been confirmed recently, and **sleeping** for devices that went away or are only known from mDNS / router reverse DNS (e.g. phones in Wi-Fi sleep). Gone devices are dropped after 10 minutes.
     - Friendly device name (from mDNS / Zeroconf or router reverse DNS), IP address, hardware manufacturer (from the local IEEE OUI database), device model and MAC address.
   - **Open web interfaces:** devices with a web UI show a `󰖟` mark. Click the row to open it in your default browser. This covers the router (e.g. the FRITZ!Box at `http://192.168.178.1/`), devices announcing `_http._tcp` / `_https._tcp` over mDNS, and printer/scanner admin pages (`adminurl`). The **Router** button opens the router directly.
-  - **Rescan**, **Trust / Untrust** (see below) and a **Network** shortcut.
+  - **Rescan**, **Trust / Untrust** (see below) and a **Network** button that opens Omarchy's built-in Network panel.
 - **Right click:** triggers an immediate WLAN rescan.
 
 ## Trusted networks and scanning
