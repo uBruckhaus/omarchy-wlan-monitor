@@ -15,6 +15,7 @@ WLAN Monitor is a lightweight Omarchy bar widget and popup panel that discovers 
     - Solid accent dot (`●`) for devices confirmed online (the kernel verified them, or they answered a probe within the last 45 s).
     - Outlined dot (`○`) and **idle** for devices still in the kernel's neighbor cache that have not been confirmed recently, and **sleeping** for devices that went away or are only known from mDNS / router reverse DNS (e.g. phones in Wi-Fi sleep). Gone devices are dropped after 10 minutes.
     - Friendly device name (from mDNS / Zeroconf or router reverse DNS), IP address, hardware manufacturer (from the local IEEE OUI database), device model and MAC address.
+  - **Copy IP addresses:** a small copy icon (`󰆏`) next to every device's IP address copies it to the clipboard (via `wl-copy`); a short "copied to clipboard" note confirms it. Only plain IPv4 addresses are copied, passed as a single argument with no shell.
   - **Open web interfaces:** devices with a web UI show a `󰖟` mark. Click the row to open it in your default browser. This covers the router (e.g. the FRITZ!Box at `http://192.168.178.1/`), devices announcing `_http._tcp` / `_https._tcp` over mDNS, and printer/scanner admin pages (`adminurl`). The **Router** button opens the router directly.
   - **Rescan**, **Trust / Untrust** (see below) and a **Network** button that opens Omarchy's built-in Network panel.
 - **Right click:** triggers an immediate WLAN rescan.

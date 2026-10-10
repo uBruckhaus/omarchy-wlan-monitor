@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "ubruckhaus.wlan-monitor",
   "name": "WLAN Monitor",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "author": "uBruckhaus",
   "description": "See who is on your Wi-Fi from the bar: every device with name, maker and model (online or sleeping), one click to your router's and devices' web pages, plus signal, link speed and live traffic. Active scans only on networks you trust.",
   "kinds": [

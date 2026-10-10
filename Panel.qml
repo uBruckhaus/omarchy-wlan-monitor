@@ -79,6 +79,14 @@ Panel {
     root.close()
     Quickshell.execDetached(["omarchy-launch-browser", target])
   }
+  // Copy a device IP via wl-copy (fixed argv, no shell); only plain IPv4 literals.
+  readonly property var ipPattern: /^(\d{1,3}\.){3}\d{1,3}$/
+  function copyIp(ip) {
+    var text = String(ip || "")
+    if (!ipPattern.test(text)) return false
+    Quickshell.execDetached(["wl-copy", text])
+    return true
+  }
   function deviceSubtitle(dev) {
     var parts = []
     if (dev.vendor) parts.push(dev.vendor)
@@ -288,6 +296,13 @@ Panel {
                   readonly property bool online: modelData.online === true
                   readonly property string subtitle: root.deviceSubtitle(modelData)
                   readonly property string webUrl: String(modelData.web_url || "")
+                  property bool copied: false
+
+                  Timer {
+                    id: copiedTimer
+                    interval: 1400
+                    onTriggered: block.copied = false
+                  }
 
                   Rectangle {
                     anchors.fill: parent
@@ -332,14 +347,41 @@ Panel {
                       Text {
                         textFormat: Text.PlainText
                         id: deviceIp
-                        anchors.right: parent.right
+                        anchors.right: copyIcon.left
+                        anchors.rightMargin: Style.space(6)
                         anchors.verticalCenter: parent.verticalCenter
-                        text: root.deviceRightLabel(block.modelData)
+                        text: block.copied ? "copied to clipboard" : root.deviceRightLabel(block.modelData)
                         color: (block.modelData.is_gateway || block.modelData.is_self)
                           ? Color.accent
                           : (block.online ? root.fg : root.dim)
                         font.family: root.font
                         font.pixelSize: Style.font.caption
+                      }
+                      Text {
+                        textFormat: Text.PlainText
+                        id: copyIcon
+                        anchors.right: parent.right
+                        anchors.verticalCenter: parent.verticalCenter
+                        visible: String(block.modelData.ip || "") !== ""
+                        width: visible ? implicitWidth : 0
+                        text: block.copied ? "󰄬" : "󰆏"
+                        color: block.copied || copyMouse.containsMouse ? Color.accent : root.dim
+                        font.family: root.font
+                        font.pixelSize: Style.font.caption
+
+                        MouseArea {
+                          id: copyMouse
+                          anchors.fill: parent
+                          anchors.margins: -Style.space(4)
+                          hoverEnabled: true
+                          cursorShape: Qt.PointingHandCursor
+                          onClicked: {
+                            if (root.copyIp(block.modelData.ip)) {
+                              block.copied = true
+                              copiedTimer.restart()
+                            }
+                          }
+                        }
                       }
                     }
 
@@ -360,6 +402,8 @@ Panel {
 
                   MouseArea {
                     id: rowMouse
+                    // Below the rows so the copy icon's own MouseArea gets its clicks.
+                    z: -1
                     anchors.fill: parent
                     hoverEnabled: true
                     enabled: block.webUrl !== ""
