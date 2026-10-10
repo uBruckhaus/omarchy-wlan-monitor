@@ -5,9 +5,8 @@ import Quickshell.Io
 import qs.Commons
 import qs.Ui as Ui
 
-// Bar indicator for the local WLAN. Dim radar icon while disconnected; coloured
-// radar chip plus online device count while connected, with a thin signal-quality
-// bar underneath. Pulses while scanning the subnet. Left click opens the panel;
+// Bar indicator for the local WLAN. Dim radar icon while disconnected; green radar
+// icon (theme green) while connected, with a thin signal-quality bar underneath. Pulses while scanning the subnet. Left click opens the panel;
 // right click triggers an immediate rescan. Commands (rescan, panel open/closed,
 // trust/untrust network) go to the collector over stdin.
 Ui.BarWidget {
@@ -65,10 +64,7 @@ Ui.BarWidget {
     function onAccentChanged() { themeColors.reload() }
   }
 
-  readonly property string barText: {
-    if (!active) return "󰐻"
-    return "󰐻 " + onlineCount
-  }
+  readonly property string barText: "󰐻"
 
   readonly property string summary: {
     if (!active || !stats.link) return "WLAN Monitor\nNot connected to a local network"
@@ -166,7 +162,12 @@ Ui.BarWidget {
     text: root.barText
     dimmed: !root.active
     readonly property color base: root.bar ? root.bar.barForeground : Color.foreground
-    foreground: root.active ? Qt.tint(root.linkColor, Qt.rgba(base.r, base.g, base.b, root.glow * 0.75)) : base
+    // Theme green when it really is green (hue ~75-165°); some themes map "green"
+    // to teal, so fall back to a fixed green there.
+    readonly property color themeGreen: root.levelPalette.green
+    readonly property color iconColor: themeGreen.hslHue >= 0.21 && themeGreen.hslHue <= 0.46
+      && themeGreen.hslSaturation > 0.2 ? themeGreen : "#5fb760"
+    foreground: root.active ? Qt.tint(iconColor, Qt.rgba(base.r, base.g, base.b, root.glow * 0.75)) : base
     tooltipText: root.opened ? "" : root.summary
     onPressed: function(code) {
       if (code === Qt.LeftButton) root.toggle()
