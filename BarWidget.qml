@@ -96,16 +96,6 @@ Ui.BarWidget {
   }
   function setTrusted(trust) { send(trust ? "trust" : "untrust") }
 
-  // Open a device's web UI. The collector only builds http(s) URLs for private IPv4
-  // literals; re-check the shape here and hand it to xdg-open as a single argv entry.
-  readonly property var webUrlPattern: /^https?:\/\/(\d{1,3}\.){3}\d{1,3}(:\d{1,5})?\/[A-Za-z0-9._~\/-]{0,100}$/
-  function openUrl(url) {
-    var target = String(url || "")
-    if (!webUrlPattern.test(target)) return false
-    Quickshell.execDetached(["xdg-open", target])
-    return true
-  }
-
   // Background collector streaming a JSON snapshot every 3 s (panel open) / 6 s (closed).
   Process {
     id: collector

@@ -69,8 +69,15 @@ Panel {
     if (!dev.online) return web + (dev.state === "idle" ? "idle · " : "sleeping · ") + dev.ip
     return web + dev.ip
   }
+  // Open a device's web UI in the default browser (omarchy-launch-browser reads
+  // xdg-settings). The collector only builds http(s) URLs for private IPv4 literals;
+  // re-check the shape here and pass it as a single argv entry, never through a shell.
+  readonly property var webUrlPattern: /^https?:\/\/(\d{1,3}\.){3}\d{1,3}(:\d{1,5})?\/[A-Za-z0-9._~\/-]{0,100}$/
   function openWeb(url) {
-    if (root.hostWidget && root.hostWidget.openUrl(url)) root.close()
+    var target = String(url || "")
+    if (!webUrlPattern.test(target)) return
+    root.close()
+    Quickshell.execDetached(["omarchy-launch-browser", target])
   }
   function deviceSubtitle(dev) {
     var parts = []
@@ -171,9 +178,7 @@ Panel {
                 + (root.link.band ? " · " + root.link.band : "")
                 + (root.link.width_mhz ? " (" + root.link.width_mhz + " MHz)" : "")
               : "Not connected"
-            detail: root.scanning
-              ? "scanning"
-              : (root.stats.active ? root.onlineCount + " online" : "")
+            detail: root.stats.active ? root.onlineCount + " online" : ""
             iconComponent: Component {
               Text {
                 textFormat: Text.PlainText
@@ -372,8 +377,9 @@ Panel {
             width: parent.width
             spacing: Style.space(8)
             Button {
-              text: root.scanning ? "Scanning…" : "Rescan"
-              iconText: "󰑐"
+              // Same label while scanning so the button row keeps its size.
+              text: "Rescan"
+              iconText: root.scanning ? "󰦖" : "󰑐"
               bordered: true
               foreground: root.fg
               fontFamily: root.font

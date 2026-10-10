@@ -13,7 +13,7 @@ WLAN Monitor is a lightweight Omarchy bar widget and popup panel that discovers 
     - Solid accent dot (`●`) for devices confirmed online (the kernel verified them, or they answered a probe within the last 45 s).
     - Outlined dot (`○`) and **idle** for devices still in the kernel's neighbor cache that have not been confirmed recently, and **sleeping** for devices that went away or are only known from mDNS / router reverse DNS (e.g. phones in Wi-Fi sleep). Gone devices are dropped after 10 minutes.
     - Friendly device name (from mDNS / Zeroconf or router reverse DNS), IP address, hardware manufacturer (from the local IEEE OUI database), device model and MAC address.
-  - **Open web interfaces:** devices with a web UI show a `󰖟` mark. Click the row to open it in your browser. This covers the router (e.g. the FRITZ!Box at `http://192.168.178.1/`), devices announcing `_http._tcp` / `_https._tcp` over mDNS, and printer/scanner admin pages (`adminurl`). The **Router** button opens the router directly.
+  - **Open web interfaces:** devices with a web UI show a `󰖟` mark. Click the row to open it in your default browser. This covers the router (e.g. the FRITZ!Box at `http://192.168.178.1/`), devices announcing `_http._tcp` / `_https._tcp` over mDNS, and printer/scanner admin pages (`adminurl`). The **Router** button opens the router directly.
   - **Rescan**, **Trust / Untrust** (see below) and a **Network** shortcut.
 - **Right click:** triggers an immediate WLAN rescan.
 
@@ -51,7 +51,7 @@ A collector (`scripts/wlan-monitor.py`) runs while the widget is loaded and stre
   - Maps MAC prefixes against the system's local IEEE OUI database (`/usr/lib/udev/hwdb.d/20-OUI.hwdb` or `/usr/share/hwdata/oui.txt`).
 - **Network changes:** everything learned (devices, names, caches) is cleared when the interface, gateway, subnet, SSID or router MAC changes, so devices from your home network never appear on another one.
 - **Sanitized untrusted text:** All SSIDs, hostnames, mDNS strings and vendor names are stripped of `<`, `>`, `&` and control characters before output, and all QML `Text` items render in `Text.PlainText` mode.
-- **Safe web links:** web UI URLs are built only from the device's private IPv4 address inside the local subnet, a numeric port and a plain path (`[A-Za-z0-9._~/-]`, no `..`). Advertised services are offered only after a TCP connect check succeeds. The widget checks the URL shape again and opens it with `xdg-open` as a single argument, with no shell.
+- **Safe web links:** web UI URLs are built only from the device's private IPv4 address inside the local subnet, a numeric port and a plain path (`[A-Za-z0-9._~/-]`, no `..`). Advertised services are offered only after a TCP connect check succeeds. The panel checks the URL shape again and opens it in your default browser with `omarchy-launch-browser` as a single argument, with no shell.
 
 ## Update or remove
 
