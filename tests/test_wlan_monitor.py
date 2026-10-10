@@ -347,5 +347,39 @@ class SweepBudgetTests(unittest.TestCase):
         self.assertEqual(wlan_monitor.prune_reachable(state, 120.0, keep), {"192.168.178.5": 100.0})
 
 
+class WebCacheBoundTests(unittest.TestCase):
+    NET = ipaddress.IPv4Network("192.168.178.0/24")
+
+    def advert(self, path, ip="192.168.178.50", n=0):
+        return ('=;wlan0;IPv4;Dev%d;_http._tcp;local;dev.local;%s;8080;"path=/%s"' % (n, ip, path))
+
+    def test_fresh_paths_are_capped_per_host(self):
+        lines = [self.advert("p%d" % i, n=i) for i in range(500)]
+        hosts = wlan_monitor.parse_mdns_lines(lines, "wlan0", self.NET)
+        entry = hosts["192.168.178.50"]
+        self.assertEqual(len(entry["web"]), wlan_monitor.MDNS_MAX_WEB)
+        self.assertLessEqual(len(entry["names"]), wlan_monitor.MDNS_MAX_NAMES)
+        self.assertLessEqual(len(entry["services"]), wlan_monitor.MDNS_MAX_SERVICES)
+
+    def test_rotating_adverts_do_not_grow_cache(self):
+        cache = {}
+        now = 1000.0
+        for round_no in range(200):
+            lines = [self.advert("r%d-%d" % (round_no, i)) for i in range(wlan_monitor.MDNS_MAX_WEB)]
+            hosts = wlan_monitor.parse_mdns_lines(lines, "wlan0", self.NET)
+            for url in hosts["192.168.178.50"]["web"]:
+                cache[url] = (now + wlan_monitor.WEB_FAIL_TTL, False)  # closed port
+            cache = wlan_monitor.prune_web_cache(cache, hosts, now)
+            now += 15
+        self.assertLessEqual(len(cache), wlan_monitor.MDNS_MAX_WEB)
+
+    def test_expired_and_overflow_entries_dropped(self):
+        hosts = {"192.168.178.%d" % i: {"web": ["http://192.168.178.%d:80/" % i]} for i in range(1, 200)}
+        cache = {"http://192.168.178.%d:80/" % i: (100.0 + i, False) for i in range(1, 200)}
+        pruned = wlan_monitor.prune_web_cache(cache, hosts, 150.0, limit=20)
+        self.assertEqual(len(pruned), 20)
+        self.assertTrue(all(v[0] > 150.0 for v in pruned.values()))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -59,6 +59,13 @@ SWEEP_MAX_SECONDS = 6.0  # hard time budget for one sweep, including draining re
 SWEEP_MAX_REPLIES = 4    # replies read per probe sent (ICMP and DNS each), plus a small allowance
 DNS_TTL = 60.0
 DNS_NEGATIVE_TTL = 300.0
+WEB_OK_TTL = 600.0       # re-check an advertised web UI after this long
+WEB_FAIL_TTL = 120.0     # ... or after this long if it refused the connection
+WEB_CHECKS_PER_SNAPSHOT = 6   # TCP checks of newly advertised web UIs per snapshot
+MAX_WEB_CACHE = 256
+MDNS_MAX_NAMES = 8       # per host, from service names and TXT fn/name
+MDNS_MAX_SERVICES = 24   # per host
+MDNS_MAX_WEB = 4         # advertised web UIs kept per host
 
 ACTIVE_NEIGH_STATES = {"REACHABLE", "DELAY", "PROBE", "PERMANENT", "NOARP"}
 DEFAULT_DOMAINS = ("home.arpa", "fritz.box", "speedport.ip", "localdomain", "local", "lan", "home", "internal")
@@ -674,6 +681,15 @@ def parse_neighbors(out):
     return neighbors
 
 
+def prune_web_cache(web_ok, mdns_hosts, now, limit=MAX_WEB_CACHE):
+    """Keep only unexpired results for web UIs that are still advertised, at most `limit`."""
+    advertised = {url for entry in mdns_hosts.values() for url in entry.get("web", [])[:MDNS_MAX_WEB]}
+    kept = {url: v for url, v in web_ok.items() if url in advertised and v[0] > now}
+    if len(kept) > limit:
+        kept = dict(sorted(kept.items(), key=lambda item: item[1][0], reverse=True)[:limit])
+    return kept
+
+
 def prune_reachable(last_reachable, now, keep_ip, grace=ONLINE_GRACE):
     """Drop entries that are too old to matter or outside the local subnet."""
     return {ip: t for ip, t in last_reachable.items() if now - t <= grace and keep_ip(ip)}
@@ -811,7 +827,7 @@ def parse_mdns_lines(lines, iface, subnet_net):
                 entry["host"] = host_clean
 
         svc_label = friendly_mdns_label(raw_service)
-        if svc_label and svc_label not in entry["names"]:
+        if svc_label and svc_label not in entry["names"] and len(entry["names"]) < MDNS_MAX_NAMES:
             entry["names"].append(svc_label)
 
         txt = {}
@@ -823,6 +839,7 @@ def parse_mdns_lines(lines, iface, subnet_net):
             value = txt.get(key, "")
             if value and not UUID_RE.match(value) and value not in entry["names"]:
                 entry["names"].insert(0, value)
+                del entry["names"][MDNS_MAX_NAMES:]
         if not entry["model"]:
             for key in ("md", "model", "am", "modelid", "device type"):
                 if txt.get(key):
@@ -842,10 +859,10 @@ def parse_mdns_lines(lines, iface, subnet_net):
             web = parse_admin_url(txt["adminurl"], address, host_clean)
         if web:
             url = make_web_url(web[0], address, web[1], web[2], subnet=subnet_net)
-            if url and url not in entry["web"]:
+            if url and url not in entry["web"] and len(entry["web"]) < MDNS_MAX_WEB:
                 entry["web"].append(url)
 
-        if stype_clean and stype_clean not in entry["services"]:
+        if stype_clean and stype_clean not in entry["services"] and len(entry["services"]) < MDNS_MAX_SERVICES:
             entry["services"].append(stype_clean)
     return hosts
 
@@ -1063,7 +1080,7 @@ class Monitor:
         self.last_known_scan = -math.inf
         self.domain = ""
         self.gateway_web = None  # None: not probed yet
-        self.web_ok = {}  # advertised web UI url -> reachable (checked once per network)
+        self.web_ok = {}  # advertised web UI url -> (expires, reachable); pruned every snapshot
         self.iw_info = {}
         self.iw_time = -math.inf
         self.traffic_prev = None
@@ -1251,6 +1268,7 @@ class Monitor:
             all_ips.add(gateway_ip)
 
         devices = []
+        web_checks = WEB_CHECKS_PER_SNAPSHOT
         for ip in all_ips:
             if subnet_net is not None:
                 try:
@@ -1302,10 +1320,16 @@ class Monitor:
             if is_gateway and self.gateway_web:
                 web_url = make_web_url(self.gateway_web, ip, subnet=subnet_net)
             elif not is_self and online:
-                for url in mdns.get("web", []):
-                    if url not in self.web_ok:
-                        self.web_ok[url] = url_reachable(url)
-                    if self.web_ok[url]:
+                for url in mdns.get("web", [])[:MDNS_MAX_WEB]:
+                    cached = self.web_ok.get(url)
+                    if cached is None or cached[0] <= now:
+                        if web_checks <= 0:
+                            continue  # checked in a later snapshot
+                        web_checks -= 1
+                        ok = url_reachable(url)
+                        cached = (now + (WEB_OK_TTL if ok else WEB_FAIL_TTL), ok)
+                        self.web_ok[url] = cached
+                    if cached[1]:
                         web_url = url
                         break
 
@@ -1324,6 +1348,9 @@ class Monitor:
             }
             self.known[ip] = dict(dev, last_seen=last_seen)
             devices.append(dev)
+
+        self.web_ok = prune_web_cache(self.web_ok, self.mdns_hosts, now)
+        self.dns_cache = {ip: entry for ip, entry in self.dns_cache.items() if entry[0] > now}
 
         # Keep recently seen devices listed as sleeping; forget them after SLEEPING_KEEP.
         for ip, prev in list(self.known.items()):
