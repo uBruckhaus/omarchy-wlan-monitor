@@ -1,8 +1,8 @@
 # WLAN Monitor
 
-**See who is on your Wi-Fi from the Omarchy bar: every device with a type icon, name, maker and model, names you choose yourself, an alert when a new device joins, one click to your router's and devices' web pages, plus signal and live traffic in plain words.**
+**See who is on your Wi-Fi from the Omarchy bar, in plain words: every device with a type icon, name, maker and status, names you choose yourself, an alert when a new device joins, collapsible groups (Apple, Android, TV & audio, smart home, …), mesh details for FRITZ!Box (which access point, band, speed and signal), one click to your router's and devices' web pages, plus signal and live traffic.**
 
-![WLAN Monitor panel and bar icon](preview.png)
+![WLAN Monitor: devices in groups with a new-device alert, device details, FRITZ!Box mesh login](preview.png)
 
 WLAN Monitor is a lightweight Omarchy bar widget and popup panel that discovers and lists devices on your local WLAN without requiring root privileges or extra packages.
 

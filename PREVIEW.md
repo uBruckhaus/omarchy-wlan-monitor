@@ -1,3 +1,11 @@
 # Preview
 
-`preview.png` is composed from real screenshots of the WLAN Monitor panel and bar icon (version 0.2.0, Omarchy shell). To keep personal data out of the listing, the collector was temporarily replaced by a demo script that emits the same JSON with fictional devices: generic names (e.g. "MacBook Air", "Pixel 9", "Brother HL-L2350DW") and made-up MAC addresses. Everything else, including layout, colours, icons and the bar, is the plugin as it renders. Only the panel and the bar section were cropped from the screen, taken on an empty workspace; no other desktop content, personal data or third-party logos are included.
+`preview.png` is composed from real screenshots of the WLAN Monitor 0.3.0 panel on the author's home network (Omarchy shell, empty workspace). Only the panel was cropped from the screen; no other desktop content is included.
+
+For the screenshots, three things were set up temporarily and undone afterwards:
+
+- The owner's first name was removed from three device names (e.g. "iPad Pro Uwe" is shown as "iPad Pro") by a display-only filter in the collector.
+- One device was marked as new and one pinned, to show the new-device notice and the Favourites group.
+- For panel 3 the saved FRITZ!Box login was moved aside, so the panel shows the real connect form with its help text. No user name or password is visible.
+
+Layout, colours, icons, device types, groups and mesh details are the plugin as it renders. The page around the panels is a small HTML composite rendered with headless Chromium.
