@@ -412,6 +412,7 @@ class NamingTests(unittest.TestCase):
         self.assertEqual(kind("Hue Bridge", "", "", "Philips Hue (Signify)", []), "light")
         self.assertEqual(kind("x", "", "", "", [], is_gateway=True), "router")
         self.assertEqual(kind("something", "", "", "Apple", []), "unknown")
+        self.assertEqual(kind("Mac", "", "", "Private MAC", []), "computer")
 
     def test_vendor_only_names_say_what_the_device_is(self):
         choose = wlan_monitor.choose_device_name
@@ -605,6 +606,7 @@ class GroupTests(unittest.TestCase):
         self.assertEqual(parse('{"cmd":"view","mode":"type","collapsed":["apple","apple","aa:bb:cc:dd:ee:ff","$(x)",5]}'),
                          {"cmd": "view", "mode": "type", "collapsed": ["apple", "aa:bb:cc:dd:ee:ff"]})
         self.assertEqual(parse('{"cmd":"view","mode":"tree","collapsed":[]}'), "")
+        self.assertEqual(parse('{"cmd":"view","mode":"band","collapsed":["gsix"]}'), {"cmd": "view", "mode": "band", "collapsed": ["gsix"]})
 
 
 class FritzTests(unittest.TestCase):

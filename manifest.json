@@ -2,9 +2,9 @@
   "schemaVersion": 1,
   "id": "ubruckhaus.wlan-monitor",
   "name": "WLAN Monitor",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "author": "uBruckhaus",
-  "description": "See who is on your Wi-Fi from the bar: every device with a type icon and plain-language status, your own names, alerts when a new device joins, collapsible groups (Apple, Android, TV & audio, smart home), FRITZ!Box mesh details, plus signal, traffic and one-click router pages. Active scans only on networks you trust.",
+  "description": "See who is on your Wi-Fi from the bar: every device with a type icon and plain-language status, your own names, alerts when a new device joins, groups by platform, type or Wi-Fi band, a network map (router, bands, repeaters, devices) and FRITZ!Box mesh details. Active scans only on networks you trust.",
   "kinds": [
     "bar-widget"
   ],

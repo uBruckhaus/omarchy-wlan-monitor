@@ -90,7 +90,7 @@ ADMIN_URL_SERVICE_TYPES = {"_ipp._tcp", "_ipps._tcp", "_printer._tcp", "_pdl-dat
 COMMANDS = {"rescan", "open", "closed", "trust", "untrust", "known_all", "fritz_logout"}
 JSON_COMMANDS = {"rename", "pin", "hide", "known", "alerts", "view", "fritz_login"}
 MAX_COMMAND_BYTES = 1024
-VIEW_MODES = ("list", "platform", "type", "ap")
+VIEW_MODES = ("list", "platform", "type", "band", "ap")
 GROUP_ID_RE = re.compile(r"^([a-z]{2,12}|([0-9a-f]{2}:){5}[0-9a-f]{2})$")
 MAX_COLLAPSED = 32
 FRITZ_FILE = "fritzbox.json"
@@ -1226,7 +1226,7 @@ KIND_NAME_RULES = (
     ("tablet", r"ipad|tablet|kindle|fire ?hd"),
     ("watch", r"watch"),
     ("laptop", r"macbook|laptop|notebook|thinkpad|surface|chromebook"),
-    ("computer", r"imac|mac ?mini|mac ?studio|mac ?pro|desktop|\bpc\b|workstation|omarchy|raspberry"),
+    ("computer", r"imac|\bmac\b|mac ?mini|mac ?studio|mac ?pro|desktop|\bpc\b|workstation|omarchy|raspberry"),
     ("tv", r"\btv\b|webos|bravia|fire ?tv|chromecast|roku|television|tizen|android ?tv|shield"),
     ("speaker", r"soundbar|speaker|sonos|homepod|\becho\b|alexa|ambeo|\bbose\b|nest (audio|mini)|google home"),
     ("printer", r"printer|drucker|laserjet|officejet|deskjet|\bepson|\bbrother|\bcanon|\bhl-|\bmfc-"),

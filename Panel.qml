@@ -47,6 +47,141 @@ Panel {
   readonly property int namedCount: Number(stats.named_count || 0)
   readonly property bool alertsOn: stats.alerts !== false
   readonly property var fritz: stats.fritz || ({})
+  // Second page: network map. Remembered like the group states ("mappage" in the saved list).
+  readonly property bool mapPage: (root.view.collapsed || []).indexOf("mappage") !== -1
+  function showPage(map) { if (root.mapPage !== map) root.toggleGroup("mappage") }
+  // From the map: back to the Devices page, open the device's group, expand and show it.
+  function groupIdOf(dev) {
+    if (dev.is_gateway || dev.is_self) return ""
+    if (root.viewMode === "ap") return dev.mesh && dev.mesh.via_mac ? dev.mesh.via_mac : "none"
+    return root.groupOf(dev)
+  }
+  // The one grouping rule both pages use (list and access-point views have no groups here).
+  function bandOf(dev) {
+    if (dev.mesh && dev.mesh.band) return dev.mesh.band
+    if (dev.is_self && root.link.via_band) return root.link.via_band
+    return ""
+  }
+  function groupOf(dev) {
+    if (dev.pinned) return "favourites"
+    if (root.viewMode === "platform") return dev.group || "other"
+    if (root.viewMode === "type") return root.kindGroups[dev.kind] || "other"
+    if (root.viewMode === "band") {
+      var band = root.bandOf(dev)
+      if (band) return root.bandIds[band] || "gother"
+      return dev.online ? "gother" : "gsleep"
+    }
+    return ""
+  }
+  function orderFor(mode) {
+    return mode === "band" ? root.bandGroupOrder : mode === "type" ? root.typeOrder : root.platformOrder
+  }
+  function openDevice(dev) {
+    var drop = ["mappage", groupIdOf(dev)]
+    var collapsed = (root.view.collapsed || []).filter(function(id) { return drop.indexOf(id) === -1 })
+    root.saveView(root.viewMode, collapsed)
+    if (dev.hidden) root.showHidden = true
+    root.filterText = ""
+    root.expandedKey = root.deviceKey(dev)
+    Qt.callLater(function() { Qt.callLater(function() { root.scrollToKey(root.expandedKey) }) })
+  }
+  function scrollToKey(key) {
+    for (var i = 0; i < deviceColumn.children.length; i++) {
+      var loader = deviceColumn.children[i]
+      if (loader.item && loader.item.dev && root.deviceKey(loader.item.dev) === key) {
+        root.ensureVisible(loader)
+        return
+      }
+    }
+  }
+  readonly property var bandOrder: ["6 GHz", "5 GHz", "2.4 GHz", "LAN"]
+  readonly property var bandIds: ({ "6 GHz": "gsix", "5 GHz": "gfive", "2.4 GHz": "gtwo", "LAN": "glan" })
+  readonly property var bandGroupOrder: ["favourites", "gsix", "gfive", "gtwo", "glan", "gother", "gsleep"]
+  readonly property var typeOrder: ["favourites", "mobile", "computers", "media", "smarthome", "office", "network", "other"]
+  function signalQuality(dbm) {
+    if (dbm === null || dbm === undefined) return -1
+    return Math.max(0, Math.min(100, 2 * (Number(dbm) + 100)))
+  }
+  // Tree rows for the map: {depth, guides[], last, type, ...}. guides[i] says whether the
+  // ancestor at depth i+1 has siblings below, i.e. whether its vertical connector continues.
+  readonly property var mapRows: {
+    var devs = root.devices.filter(function(d) { return !d.hidden })
+    var collapsed = root.view.collapsed || []
+    var gateway = null
+    devs.forEach(function(d) { if (d.is_gateway) gateway = d })
+    var link = root.link
+    // Children per access point MAC; devices without mesh data go to fallback buckets.
+    var apMacs = {}
+    var aps = (root.fritz && root.fritz.aps) || []
+    aps.forEach(function(ap) { apMacs[ap.mac] = ap })
+    function parentOf(dev) {
+      if (dev.mesh && dev.mesh.via_mac && apMacs[dev.mesh.via_mac]) return dev.mesh.via_mac
+      return gateway ? gateway.mac : ""
+    }
+    function isRepeater(d) { return d.kind === "router" && !d.is_gateway && d.mesh && d.mesh.role === "slave" }
+    // Under each router / repeater: its devices in the groups chosen on either page,
+    // then the repeaters connected to it as their own branches.
+    function apNode(mac, dev, title) {
+      var node = { type: "ap", id: mac, dev: dev, title: title, children: [] }
+      var members = devs.filter(function(d) { return d !== dev && !d.is_gateway && !isRepeater(d) && parentOf(d) === mac })
+      if (root.viewMode === "list" || root.viewMode === "ap") {
+        members.forEach(function(d) { node.children.push({ type: "device", dev: d }) })
+      } else {
+        var buckets = {}
+        members.forEach(function(d) {
+          var id = root.groupOf(d)
+          if (!buckets[id]) buckets[id] = []
+          buckets[id].push(d)
+        })
+        root.orderFor(root.viewMode).forEach(function(id) {
+          if (!buckets[id]) return
+          var info = root.groupInfo[id] || root.groupInfo.other
+          node.children.push({ type: "group", id: id, title: info.title, icon: info.icon, devs: buckets[id] })
+        })
+      }
+      devs.forEach(function(d) {
+        if (isRepeater(d) && d.mesh.via_mac === mac) node.children.push(apNode(d.mac, d, d.name))
+      })
+      return node
+    }
+    var rootNode = { type: "internet", children: [] }
+    if (gateway) rootNode.children.push(apNode(gateway.mac, gateway, gateway.name))
+    var rows = []
+    function walk(node, depth, guides, last) {
+      var row = { depth: depth, guides: guides, last: last, type: node.type, node: node }
+      if (node.type === "group") {
+        row.id = node.id
+        row.collapsed = collapsed.indexOf(node.id) !== -1
+        row.count = node.devs.length
+        row.online = node.devs.filter(function(d) { return d.online }).length
+      } else if (node.type === "ap") {
+        row.id = node.id
+        row.collapsed = node.dev && !node.dev.is_gateway && collapsed.indexOf(node.id) !== -1
+      }
+      rows.push(row)
+      var kids = []
+      if (node.type === "group") kids = row.collapsed ? [] : node.devs.map(function(d) { return { type: "device", dev: d } })
+      else if (!row.collapsed) kids = node.children || []
+      var childGuides = depth > 0 ? guides.concat([!last]) : []
+      kids.forEach(function(child, i) {
+        if (child.type === "device") {
+          rows.push({ depth: depth + 1, guides: childGuides, last: i === kids.length - 1, type: "device", dev: child.dev })
+        } else {
+          walk(child, depth + 1, childGuides, i === kids.length - 1)
+        }
+      })
+    }
+    walk(rootNode, 0, [], true)
+    return rows
+  }
+  readonly property string mapSummary: {
+    var n = root.devices.filter(function(d) { return !d.hidden && !d.is_gateway }).length
+    return n + (n === 1 ? " device" : " devices")
+  }
+
+
+  // The network info lines are open while "showinfo" is in the saved view list.
+  readonly property bool infoOpen: (root.view.collapsed || []).indexOf("showinfo") !== -1
   property bool fritzFormOpen: false
   property bool fritzHelpOpen: false
   property bool showPassword: false
@@ -87,16 +222,40 @@ Panel {
   property var localView: null
   readonly property var view: localView || stats.view || ({ mode: "list", collapsed: [] })
   readonly property bool meshActive: stats.mesh_active === true
-  readonly property string viewMode: view.mode === "ap" && !meshActive ? "platform" : String(view.mode || "list")
-  readonly property var viewModes: meshActive ? ["list", "platform", "type", "ap"] : ["list", "platform", "type"]
-  readonly property var viewLabels: ({ list: "List", platform: "Groups by platform", type: "Groups by type", ap: "Groups by access point" })
+  readonly property string viewMode: (view.mode === "ap" || view.mode === "band") && !meshActive ? "platform" : String(view.mode || "list")
+  readonly property var viewModes: meshActive ? ["list", "platform", "type", "band", "ap"] : ["list", "platform", "type"]
+  readonly property var viewLabels: ({ list: "List", platform: "Groups by platform", type: "Groups by type",
+    band: "Groups by band", ap: "Groups by access point" })
   function saveView(mode, collapsed) {
     root.localView = { mode: mode, collapsed: collapsed }
     if (root.hostWidget) root.hostWidget.sendJson({ cmd: "view", mode: mode, collapsed: collapsed })
   }
-  function cycleView() {
-    var i = root.viewModes.indexOf(root.viewMode)
-    root.saveView(root.viewModes[(i + 1) % root.viewModes.length], root.view.collapsed || [])
+  readonly property var viewOptions: root.viewModes.map(function(m) { return { value: m, label: root.viewShortLabels[m] } })
+  readonly property var viewShortLabels: ({ list: "No groups", platform: "By platform", type: "By type", band: "By band", ap: "By access point" })
+  function setViewMode(mode) {
+    if (root.viewModes.indexOf(mode) !== -1 && mode !== root.viewMode) root.saveView(mode, root.view.collapsed || [])
+  }
+  // Every foldable branch of the map in the current grouping: groups and repeaters.
+  readonly property var mapFoldIds: {
+    var ids = root.orderFor(root.viewMode).slice()
+    var aps = (root.fritz && root.fritz.aps) || []
+    aps.forEach(function(ap) { if (ap.role !== "master") ids.push(ap.mac) })
+    return ids
+  }
+  // Groups of the Devices page in the current grouping (access-point mode groups by MAC).
+  readonly property var listFoldIds: {
+    if (root.viewMode === "ap") {
+      var ids = ((root.fritz && root.fritz.aps) || []).map(function(ap) { return ap.mac })
+      ids.push("none")
+      return ids
+    }
+    return root.viewMode === "list" ? [] : root.orderFor(root.viewMode).slice()
+  }
+  function foldAll(fold, ids) {
+    ids = ids || root.mapFoldIds
+    var collapsed = (root.view.collapsed || []).filter(function(id) { return ids.indexOf(id) === -1 })
+    if (fold) collapsed = collapsed.concat(ids)
+    root.saveView(root.viewMode, collapsed.slice(0, 32))
   }
   function toggleGroup(id) {
     var collapsed = (root.view.collapsed || []).slice()
@@ -117,7 +276,13 @@ Panel {
     office: { title: "Printers & storage", icon: 0xF042A },
     network: { title: "Network & mesh", icon: 0xF0003 },
     other: { title: "Other devices", icon: 0xF0625 },
-    none: { title: "Not reported by the FRITZ!Box", icon: 0xF0625 }
+    none: { title: "Not reported by the FRITZ!Box", icon: 0xF0625 },
+    gsix: { title: "6 GHz", icon: 0xF05A9 },
+    gfive: { title: "5 GHz", icon: 0xF05A9 },
+    gtwo: { title: "2.4 GHz", icon: 0xF05A9 },
+    glan: { title: "LAN (cable)", icon: 0xF0200 },
+    gother: { title: "Band not reported", icon: 0xF0625 },
+    gsleep: { title: "Sleeping", icon: 0xF04B2 }
   })
   readonly property var platformOrder: ["favourites", "apple", "android", "mobile", "computers", "media", "smarthome", "office", "network", "other"]
   readonly property var kindGroups: ({
@@ -141,15 +306,13 @@ Panel {
       })
       order.push("none")
     } else {
-      order = root.platformOrder
+      order = root.orderFor(root.viewMode)
     }
     devs.forEach(function(dev) {
       if (dev.is_gateway || (dev.is_self && root.viewMode !== "ap")) { top.push(dev); return }
       var id
       if (root.viewMode === "ap") id = dev.mesh && buckets[dev.mesh.via_mac] ? dev.mesh.via_mac : "none"
-      else if (dev.pinned) id = "favourites"
-      else if (root.viewMode === "platform") id = dev.group || "other"
-      else id = root.kindGroups[dev.kind] || "other"
+      else id = root.groupOf(dev)
       if (!buckets[id]) {
         var info = root.groupInfo[id] || root.groupInfo.other
         buckets[id] = { title: info.title, icon: info.icon, detail: "", devs: [] }
@@ -265,7 +428,8 @@ Panel {
     var label = deviceKindLabel(dev)
     var parts = dev.name.indexOf(label) === 0 ? [] : [label]
     if (dev.is_gateway && dev.model && dev.name.indexOf(dev.model) === -1) parts.push("model " + dev.model)
-    if (meshText(dev)) parts.push(meshText(dev))
+    // The band is already the group heading when grouping by band.
+    if (meshText(dev) && !(root.viewMode === "band" && !dev.is_self)) parts.push(meshText(dev))
     if (dev.vendor && dev.vendor !== "Private MAC" && dev.name.indexOf(dev.vendor) === -1) parts.push(dev.vendor)
     if (dev.custom_name && dev.auto_name) parts.push(dev.auto_name)
     return parts.join("  ·  ")
@@ -798,6 +962,260 @@ Panel {
       onClicked: root.toggleGroup(header.group.id)
     }
   }
+  // Four signal bars coloured like the bar widget's signal levels; -1 hides them.
+  component SignalBars: Row {
+    id: bars
+    property real quality: -1
+    visible: quality >= 0
+    spacing: Style.space(2)
+    Repeater {
+      model: 4
+      delegate: Rectangle {
+        required property int index
+        y: Style.space(13) - height  // bottom-aligned without anchoring before a parent exists
+        width: Style.space(3)
+        height: Style.space(4 + index * 3)
+        radius: 1
+        readonly property bool lit: bars.quality > [0, 30, 50, 70][index] || (index === 0 && bars.quality >= 0)
+        color: lit ? root.signalColor(bars.quality / 100) : Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.18)
+      }
+    }
+  }
+
+  // One row of the network map with its tree connectors.
+  component MapRow: Item {
+    id: mapRow
+    property var row: ({})
+    readonly property real indent: Style.space(22)
+    readonly property int depth: row.depth || 0
+    readonly property var dev: row.type === "device" ? row.dev : (row.node && row.node.dev ? row.node.dev : null)
+    readonly property bool online: row.type === "device" ? (dev && dev.online === true)
+      : row.type === "group" ? row.online > 0 : true
+    readonly property color lineColor: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.28)
+    height: Style.space(row.type === "group" || row.type === "device" ? 26 : 32)
+
+    // Vertical connectors of the ancestors that still have siblings below.
+    Repeater {
+      model: mapRow.row.guides || []
+      delegate: Rectangle {
+        required property var modelData
+        required property int index
+        visible: modelData === true
+        x: index * mapRow.indent + mapRow.indent / 2
+        width: 1
+        height: mapRow.height
+        color: mapRow.lineColor
+      }
+    }
+    // Own elbow: down from the parent, then across to the node.
+    Rectangle {
+      visible: mapRow.depth > 0
+      x: (mapRow.depth - 1) * mapRow.indent + mapRow.indent / 2
+      width: 1
+      height: mapRow.row.last ? mapRow.height / 2 : mapRow.height
+      color: mapRow.lineColor
+    }
+    Rectangle {
+      visible: mapRow.depth > 0
+      x: (mapRow.depth - 1) * mapRow.indent + mapRow.indent / 2
+      y: mapRow.height / 2
+      width: mapRow.indent / 2 + Style.space(2)
+      height: 1
+      color: mapRow.lineColor
+    }
+
+    Rectangle {
+      id: nodeHover
+      x: mapRow.depth * mapRow.indent
+      width: parent.width - x
+      height: parent.height
+      radius: Style.space(6)
+      color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.07)
+      visible: nodeMouse.containsMouse
+    }
+    Rectangle {
+      id: nodeIcon
+      x: mapRow.depth * mapRow.indent + Style.space(2)
+      anchors.verticalCenter: parent.verticalCenter
+      readonly property bool big: mapRow.row.type === "internet" || mapRow.row.type === "ap"
+      width: Style.space(big ? 24 : 20)
+      height: width
+      radius: width / 2
+      color: big ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.16) : "transparent"
+      border.width: 1
+      border.color: mapRow.online ? Color.accent : Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.3)
+      Text {
+        anchors.centerIn: parent
+        textFormat: Text.PlainText
+        text: {
+          var r = mapRow.row
+          if (r.type === "internet") return root.glyph(0xF059F)
+          if (r.type === "ap") return root.kindIcon("router")
+          if (r.type === "group") return root.glyph(r.node.icon || 0xF0625)
+          return root.kindIcon(mapRow.dev ? mapRow.dev.kind : "unknown")
+        }
+        color: mapRow.online ? Color.accent : root.dim
+        font.family: root.font
+        font.pixelSize: nodeIcon.big ? Style.font.body : Style.font.caption
+      }
+    }
+    Text {
+      id: nodeLabel
+      textFormat: Text.PlainText
+      anchors.left: nodeIcon.right
+      anchors.leftMargin: Style.space(6)
+      anchors.right: nodeRight.left
+      anchors.rightMargin: Style.space(8)
+      anchors.verticalCenter: parent.verticalCenter
+      elide: Text.ElideRight
+      text: {
+        var r = mapRow.row
+        if (r.type === "internet") return "Internet"
+        if (r.type === "ap") return (r.node.title || "Router")
+          + (r.node.dev && r.node.dev.is_gateway && r.node.dev.model ? "  ·  " + r.node.dev.model : "")
+        if (r.type === "group") return r.node.title + "  ·  " + r.count
+          + (r.count === 1 ? " device" : " devices")
+        return mapRow.dev ? mapRow.dev.name : ""
+      }
+      color: mapRow.online ? root.fg : root.dim
+      font.family: root.font
+      font.pixelSize: mapRow.row.type === "device" ? Style.font.caption : Style.font.bodySmall
+      font.bold: mapRow.row.type !== "device" || (mapRow.dev && mapRow.dev.is_self)
+    }
+    Row {
+      id: nodeRight
+      z: 1  // above the row's click area, so the copy icon gets its own clicks
+      anchors.right: parent.right
+      anchors.rightMargin: Style.space(4)
+      anchors.verticalCenter: parent.verticalCenter
+      spacing: Style.space(6)
+      Text {
+        textFormat: Text.PlainText
+        anchors.verticalCenter: parent.verticalCenter
+        visible: text !== ""
+        text: {
+          var d = mapRow.dev
+          if (mapRow.row.type === "device" && d && d.new) return "NEW"
+          return ""
+        }
+        color: Color.accent
+        font.family: root.font
+        font.pixelSize: Style.font.caption
+        font.bold: true
+      }
+      Text {
+        textFormat: Text.PlainText
+        anchors.verticalCenter: parent.verticalCenter
+        visible: text !== ""
+        text: {
+          var d = mapRow.dev
+          if (mapRow.row.type !== "device" || !d) return ""
+          if (d.mesh && d.mesh.rate_mbps) return d.mesh.rate_mbps + " Mbit/s"
+          if (!d.online) return root.statusWord(d)
+          return ""
+        }
+        color: root.dim
+        font.family: root.font
+        font.pixelSize: Style.font.caption
+      }
+      SignalBars {
+        anchors.verticalCenter: parent.verticalCenter
+        quality: mapRow.row.type === "device" && mapRow.dev && mapRow.dev.mesh ? root.signalQuality(mapRow.dev.mesh.signal_dbm) : -1
+      }
+      // Copy the IP address, as on the Devices page (wl-copy, fixed argv).
+      Text {
+        id: mapCopy
+        textFormat: Text.PlainText
+        anchors.verticalCenter: parent.verticalCenter
+        visible: mapRow.dev !== null && String(mapRow.dev.ip || "") !== "" && mapRow.row.type !== "group"
+        property bool copied: false
+        text: root.glyph(copied ? 0xF012C : 0xF018F)
+        color: copied || mapCopyMouse.containsMouse ? Color.accent : root.dim
+        font.family: root.font
+        font.pixelSize: Style.font.caption
+        Timer { id: mapCopyTimer; interval: 1400; onTriggered: mapCopy.copied = false }
+        MouseArea {
+          id: mapCopyMouse
+          anchors.fill: parent
+          anchors.margins: -Style.space(4)
+          hoverEnabled: true
+          cursorShape: Qt.PointingHandCursor
+          onClicked: if (root.copyIp(mapRow.dev.ip)) { mapCopy.copied = true; mapCopyTimer.restart() }
+        }
+        PanelToolTip {
+          visible: mapCopyMouse.containsMouse
+          text: mapCopy.copied ? "Copied" : "Copy IP address " + (mapRow.dev ? mapRow.dev.ip : "")
+          fontFamily: root.font
+        }
+      }
+      Text {
+        textFormat: Text.PlainText
+        anchors.verticalCenter: parent.verticalCenter
+        visible: mapRow.row.type === "group" || (mapRow.row.type === "ap" && mapRow.dev && !mapRow.dev.is_gateway)
+        text: root.glyph(mapRow.row.collapsed ? 0xF0142 : 0xF0140)
+        color: root.dim
+        font.family: root.font
+        font.pixelSize: Style.font.caption
+      }
+    }
+    MouseArea {
+      id: nodeMouse
+      anchors.fill: nodeHover
+      hoverEnabled: true
+      enabled: mapRow.row.type !== "internet"
+      cursorShape: Qt.PointingHandCursor
+      onClicked: {
+        var r = mapRow.row
+        if (r.type === "device" && mapRow.dev) root.openDevice(mapRow.dev)
+        else if (r.type === "group" || (r.type === "ap" && mapRow.dev && !mapRow.dev.is_gateway)) root.toggleGroup(r.id)
+        else if (r.type === "ap" && mapRow.dev) root.openDevice(mapRow.dev)
+      }
+    }
+    PanelToolTip {
+      visible: nodeMouse.containsMouse && mapRow.row.type === "device" && mapRow.dev !== null
+      fontFamily: root.font
+      text: mapRow.dev ? mapRow.dev.name + "\n" + root.deviceKindLabel(mapRow.dev) + "  ·  " + mapRow.dev.ip
+        + (root.meshDetail(mapRow.dev) ? "\n" + root.meshDetail(mapRow.dev) : "") + "\nClick for details" : ""
+    }
+  }
+
+  // Page switch under the title: Devices | Network map.
+  component PageTab: Item {
+    id: tab
+    property string label: ""
+    property int icon: 0
+    property bool active: false
+    signal activated()
+    implicitWidth: tabText.implicitWidth + Style.space(16)
+    implicitHeight: tabText.implicitHeight + Style.space(10)
+    Text {
+      id: tabText
+      anchors.centerIn: parent
+      textFormat: Text.PlainText
+      text: root.glyph(tab.icon) + "  " + tab.label
+      color: tab.active ? Color.accent : (tabMouse.containsMouse ? root.fg : root.dim)
+      font.family: root.font
+      font.pixelSize: Style.font.bodySmall
+      font.bold: tab.active
+    }
+    Rectangle {
+      anchors.bottom: parent.bottom
+      anchors.horizontalCenter: parent.horizontalCenter
+      width: parent.width - Style.space(8)
+      height: Style.space(2)
+      radius: 1
+      color: Color.accent
+      visible: tab.active
+    }
+    MouseArea {
+      id: tabMouse
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onClicked: tab.activated()
+    }
+  }
+
   Component { id: groupHeaderComponent; GroupHeader {} }
   Component { id: deviceRowComponent; DeviceRow {} }
 
@@ -816,6 +1234,7 @@ Panel {
       anchors.fill: parent
       // Text fields need every key while they have focus.
       blocked: searchField.activeFocus || root.editingKey !== "" || fritzUser.activeFocus || fritzPassword.activeFocus
+        || devicesViewDrop.popupOpen || mapViewDrop.popupOpen
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(t) {
@@ -857,443 +1276,640 @@ Panel {
             }
           }
 
-          PanelSeparator { width: parent.width; foreground: root.fg }
-          PanelSectionHeader { text: "CONNECTION"; foreground: root.fg; fontFamily: root.font }
-
-          Item {
-            width: parent.width
-            height: ipText.height
-            Text {
-              textFormat: Text.PlainText
-              id: ipText
-              text: "This PC  " + (root.link.ip || "—")
-              color: root.fg
-              font.family: root.font
-              font.pixelSize: Style.font.body
-              font.bold: true
+          Row {
+            spacing: Style.space(6)
+            PageTab {
+              label: "Devices"
+              icon: 0xF0279
+              active: !root.mapPage
+              onActivated: root.showPage(false)
             }
+            PageTab {
+              label: "Network map"
+              icon: 0xF0003
+              active: root.mapPage
+              onActivated: root.showPage(true)
+            }
+          }
+
+          Column {
+            id: devicesPage
+            visible: !root.mapPage
+            width: parent.width
+            spacing: column.spacing
+
+            PanelSeparator { width: parent.width; foreground: root.fg }
+            PanelSectionHeader { text: "CONNECTION"; foreground: root.fg; fontFamily: root.font }
+
+            Item {
+              width: parent.width
+              height: ipText.height
+              Text {
+                textFormat: Text.PlainText
+                id: ipText
+                text: "This PC  " + (root.link.ip || "—")
+                color: root.fg
+                font.family: root.font
+                font.pixelSize: Style.font.body
+                font.bold: true
+              }
+              Text {
+                textFormat: Text.PlainText
+                anchors.right: parent.right
+                anchors.baseline: ipText.baseline
+                text: root.link.gateway ? "Router  " + root.link.gateway : ""
+                color: root.dim
+                font.family: root.font
+                font.pixelSize: Style.font.caption
+              }
+              MouseArea { id: ipMouse; anchors.fill: parent; hoverEnabled: true; acceptedButtons: Qt.NoButton }
+              PanelToolTip {
+                visible: ipMouse.containsMouse && root.stats.active === true
+                fontFamily: root.font
+                text: "Address " + (root.link.cidr || root.link.ip || "—") + " on " + (root.link.iface || "?")
+                  + (root.link.mac ? "\nMAC " + root.link.mac : "")
+                  + (root.link.domain ? "\nLocal domain " + root.link.domain : "")
+              }
+            }
+
+            Meter {
+              visible: root.link.quality !== null && root.link.quality !== undefined
+              readonly property real sigFrac: Math.max(0, Math.min(1, Number(root.link.quality || 0) / 100))
+              label: "Signal  ·  " + root.signalWord(root.link.quality)
+              value: (root.link.quality || 0) + " %"
+              fraction: sigFrac
+              fillColor: root.signalColor(sigFrac)
+              tip: (root.link.signal_dbm !== null && root.link.signal_dbm !== undefined ? root.link.signal_dbm + " dBm" : "")
+                + (root.link.channel ? "  ·  channel " + root.link.channel : "")
+                + (root.link.tx_mbps ? "  ·  link " + root.link.tx_mbps + (root.link.rx_mbps ? " / " + root.link.rx_mbps : "") + " Mbit/s" : "")
+                + "\nExcellent 70 %+, Good 50 %+, Fair 30 %+, Weak below 30 %."
+                + "\nWeak? Move closer to the router or remove obstacles between you."
+            }
+
+            Meter {
+              label: "Traffic now"
+              value: "↓ " + root.formatRate(root.traffic.rx_rate) + "  ·  ↑ " + root.formatRate(root.traffic.tx_rate)
+              // Logarithmic-like visual activity bar up to ~10 MB/s
+              fraction: {
+                var totalRate = Number(root.traffic.rx_rate || 0) + Number(root.traffic.tx_rate || 0)
+                if (totalRate <= 0) return 0
+                return Math.min(1, Math.log10(1 + totalRate / 1024) / 4)
+              }
+              fillColor: Color.accent
+              tip: "↓ download, ↑ upload of this PC.\nSince connecting: " + root.formatBytes(root.traffic.rx_bytes)
+                + " down, " + root.formatBytes(root.traffic.tx_bytes) + " up."
+            }
+
+            // One summary line; the explanations, "connected via" and the FRITZ!Box login
+            // open on click, so the device list keeps the space. The choice is remembered.
+            Item {
+              visible: root.stats.active === true
+              width: parent.width
+              height: infoSummary.implicitHeight + Style.space(6)
+              Rectangle {
+                anchors.fill: parent
+                anchors.leftMargin: -Style.space(4)
+                anchors.rightMargin: -Style.space(4)
+                radius: Style.space(6)
+                color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.06)
+                visible: infoMouse.containsMouse
+              }
+              Text {
+                id: infoSummary
+                textFormat: Text.PlainText
+                anchors.left: parent.left
+                anchors.right: infoChevron.left
+                anchors.rightMargin: Style.space(8)
+                anchors.verticalCenter: parent.verticalCenter
+                elide: Text.ElideRight
+                text: root.glyph(root.trusted ? 0xF0565 : 0xF099C) + "  "
+                  + (root.trusted ? "Your network" : "Not your network (passive)")
+                  + (root.link.via ? "  ·  via " + String(root.link.via).replace(/^Router \((.*)\)$/, "$1")
+                    + (root.link.via_band ? " · " + root.link.via_band : "") : "")
+                color: root.dim
+                font.family: root.font
+                font.pixelSize: Style.font.caption
+              }
+              Text {
+                id: infoChevron
+                textFormat: Text.PlainText
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                text: root.glyph(root.infoOpen ? 0xF0140 : 0xF0142)
+                color: root.dim
+                font.family: root.font
+                font.pixelSize: Style.font.caption
+              }
+              MouseArea {
+                id: infoMouse
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.toggleGroup("showinfo")
+              }
+            }
+
+            Column {
+              visible: root.infoOpen || root.fritzFormOpen || root.fritz.state === "error" || root.fritz.state === "connecting"
+              width: parent.width
+              spacing: Style.space(8)
+
+              Text {
+                textFormat: Text.PlainText
+                visible: root.stats.active === true
+                width: parent.width
+                wrapMode: Text.WordWrap
+                text: root.trusted
+                  ? "Your network (trusted): looks for devices every 2 minutes"
+                    + (root.alertsOn ? " and tells you when a new one joins." : ". New-device alerts are off.")
+                  : "Not marked as your network, so only devices that announce themselves are shown. "
+                    + "If this is your home network, click Trust to find every device and get alerts about new ones."
+                color: root.dim
+                font.family: root.font
+                font.pixelSize: Style.font.caption
+              }
+
+              // Optional FRITZ!Box login for mesh details (which access point, band and speed).
+              Column {
+                visible: root.fritz.available === true
+                width: parent.width
+                spacing: Style.space(6)
+
+                Flow {
+                  width: parent.width
+                  spacing: Style.space(12)
+                  Text {
+                    textFormat: Text.PlainText
+                    visible: root.fritz.state === "connected"
+                    text: root.glyph(0xF0003) + "  FRITZ!Box connected · " + (root.fritz.aps || []).length + " access point"
+                      + ((root.fritz.aps || []).length === 1 ? "" : "s")
+                    color: root.dim
+                    font.family: root.font
+                    font.pixelSize: Style.font.caption
+                  }
+                  LinkAction {
+                    visible: root.fritz.state !== "connected" && root.fritz.state !== "connecting" && !root.fritzFormOpen
+                    icon: root.glyph(0xF0306)
+                    label: root.fritz.state === "error" && root.fritz.user ? "Connect FRITZ!Box again" : "Show mesh details from the FRITZ!Box"
+                    baseColor: root.dim
+                    onActivated: {
+                      root.fritzFormOpen = true
+                      if (root.fritz.user && fritzUser.text === "") fritzUser.text = root.fritz.user
+                      Qt.callLater(function() { (fritzUser.text === "" ? fritzUser : fritzPassword).forceActiveFocus() })
+                    }
+                  }
+                  LinkAction {
+                    visible: root.fritz.user !== undefined && root.fritz.user !== "" && !root.fritzFormOpen
+                    icon: root.glyph(0xF0209)
+                    label: "Disconnect"
+                    baseColor: root.dim
+                    onActivated: if (root.hostWidget) root.hostWidget.send("fritz_logout")
+                  }
+                }
+                Text {
+                  textFormat: Text.PlainText
+                  visible: (root.fritz.state === "error" || root.fritz.state === "connecting") && String(root.fritz.message || "") !== ""
+                  width: parent.width
+                  wrapMode: Text.WordWrap
+                  text: String(root.fritz.message || "")
+                  color: root.fritz.state === "error" ? Color.accent : root.dim
+                  font.family: root.font
+                  font.pixelSize: Style.font.caption
+                }
+                Column {
+                  visible: root.fritzFormOpen
+                  width: parent.width
+                  spacing: Style.space(6)
+                  Text {
+                    textFormat: Text.PlainText
+                    width: parent.width
+                    wrapMode: Text.WordWrap
+                    text: "Shows which access point, band and speed every device uses, and the names from your FRITZ!Box. "
+                      + "Use a FRITZ!Box user with the right \u201cFRITZ!Box settings\u201d (System \u203a FRITZ!Box Users). "
+                      + "The password is stored only on this PC (readable by you alone) and used only with this FRITZ!Box."
+                    color: root.dim
+                    font.family: root.font
+                    font.pixelSize: Style.font.caption
+                  }
+                  KeyTextField {
+                    id: fritzUser
+                    width: parent.width
+                    maximumLength: 64
+                    placeholderText: "User name, e.g. fritz1234"
+                    foreground: root.fg
+                    font: Qt.font({ family: root.font, pixelSize: Style.font.caption })
+                    Keys.onPressed: function(event) {
+                      if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Tab) {
+                        fritzPassword.forceActiveFocus(); event.accepted = true
+                      } else if (event.key === Qt.Key_Escape) {
+                        root.fritzFormOpen = false; keyCatcher.forceActiveFocus(); event.accepted = true
+                      }
+                    }
+                  }
+                  LinkAction {
+                    icon: root.glyph(root.fritzHelpOpen ? 0xF0140 : 0xF0142)
+                    label: "Where do I find user name and password?"
+                    baseColor: root.dim
+                    onActivated: root.fritzHelpOpen = !root.fritzHelpOpen
+                  }
+                  Text {
+                    textFormat: Text.PlainText
+                    visible: root.fritzHelpOpen
+                    width: parent.width
+                    leftPadding: Style.space(12)
+                    wrapMode: Text.WordWrap
+                    text: "• There is no fixed default user name.\n"
+                      + "• FRITZ!OS before 7.24: the FRITZ!Box asks only for a password. Leave the user name empty.\n"
+                      + "• FRITZ!OS 7.24 and newer: if you never created a user, an update created one named \u201cfritz\u201d "
+                      + "plus four random digits (for example fritz1234). Log in at http://fritz.box and look under "
+                      + "System \u203a FRITZ!Box Users.\n"
+                      + "• Password: unless you changed it, it is printed on the label on the bottom or back of the "
+                      + "FRITZ!Box (4 to 6 lowercase letters followed by 4 digits)."
+                    color: root.dim
+                    font.family: root.font
+                    font.pixelSize: Style.font.caption
+                  }
+                  KeyTextField {
+                    id: fritzPassword
+                    width: parent.width
+                    password: !root.showPassword
+                    maximumLength: 128
+                    placeholderText: "Password"
+                    foreground: root.fg
+                    font: Qt.font({ family: root.font, pixelSize: Style.font.caption })
+                    onAccepted: root.fritzConnect()
+                    Keys.onPressed: function(event) {
+                      if (event.key === Qt.Key_Escape) {
+                        fritzPassword.clear(); root.fritzFormOpen = false; root.showPassword = false
+                        keyCatcher.forceActiveFocus(); event.accepted = true
+                      }
+                    }
+                    // Eye icon: show or hide the typed password.
+                    Text {
+                      id: eyeIcon
+                      textFormat: Text.PlainText
+                      anchors.right: parent.right
+                      anchors.rightMargin: Style.space(8)
+                      anchors.verticalCenter: parent.verticalCenter
+                      text: root.glyph(root.showPassword ? 0xF0209 : 0xF0208)
+                      color: eyeMouse.containsMouse ? Color.accent : root.dim
+                      font.family: root.font
+                      font.pixelSize: Style.font.body
+                      MouseArea {
+                        id: eyeMouse
+                        anchors.fill: parent
+                        anchors.margins: -Style.space(4)
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: {
+                          root.showPassword = !root.showPassword
+                          fritzPassword.forceActiveFocus()
+                        }
+                      }
+                      PanelToolTip {
+                        visible: eyeMouse.containsMouse
+                        text: root.showPassword ? "Hide password" : "Show password"
+                        fontFamily: root.font
+                      }
+                    }
+                  }
+                  Flow {
+                    width: parent.width
+                    spacing: Style.space(8)
+                    Button {
+                      text: "Connect"
+                      iconText: root.glyph(0xF0306)
+                      bordered: true
+                      foreground: root.fg
+                      fontFamily: root.font
+                      enabled: fritzPassword.text !== ""
+                      onClicked: root.fritzConnect()
+                    }
+                    Button {
+                      text: "Cancel"
+                      bordered: true
+                      foreground: root.fg
+                      fontFamily: root.font
+                      onClicked: {
+                        fritzPassword.clear()
+                        root.fritzFormOpen = false
+                        root.showPassword = false
+                        keyCatcher.forceActiveFocus()
+                      }
+                    }
+                  }
+                }
+              }
+            }
+
+            PanelSeparator { width: parent.width; foreground: root.fg }
+            Item {
+              width: parent.width
+              height: Math.max(devicesHeader.implicitHeight, devicesViewDrop.implicitHeight, listFoldButtons.implicitHeight)
+              PanelSectionHeader {
+                id: devicesHeader
+                anchors.left: parent.left
+                anchors.right: devicesViewDrop.left
+                anchors.verticalCenter: parent.verticalCenter
+                anchors.rightMargin: Style.space(8)
+                // Online / idle / sleeping counts are in the title chip and the bar tooltip.
+                text: "DEVICES (" + root.totalCount + ")"
+                foreground: root.fg
+                fontFamily: root.font
+              }
+              // Grouping, shared with the Network map.
+              Dropdown {
+                id: devicesViewDrop
+                anchors.right: listFoldButtons.left
+                anchors.rightMargin: Style.space(6)
+                anchors.verticalCenter: parent.verticalCenter
+                width: Style.space(150)
+                showLabel: false
+                fontFamily: root.font
+                options: root.viewOptions
+                value: root.viewMode
+                onChanged: function(value) { root.setViewMode(value) }
+              }
+              Row {
+                id: listFoldButtons
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Style.space(4)
+                Button {
+                  iconText: root.glyph(0xF084F)
+                  bordered: true
+                  enabled: root.viewMode !== "list" && root.filterText === ""
+                  foreground: root.fg
+                  fontFamily: root.font
+                  tooltipText: "Expand all"
+                  onClicked: root.foldAll(false, root.listFoldIds)
+                }
+                Button {
+                  iconText: root.glyph(0xF084D)
+                  bordered: true
+                  enabled: root.viewMode !== "list" && root.filterText === ""
+                  foreground: root.fg
+                  fontFamily: root.font
+                  tooltipText: "Collapse all"
+                  onClicked: root.foldAll(true, root.listFoldIds)
+                }
+              }
+            }
+
+            // New devices since the user last checked (trusted networks only).
+            Rectangle {
+              visible: root.newCount > 0
+              width: parent.width
+              height: newRow.implicitHeight + Style.space(12)
+              radius: Style.space(6)
+              color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.14)
+              border.width: 1
+              border.color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.5)
+              Item {
+                id: newRow
+                anchors.fill: parent
+                anchors.margins: Style.space(6)
+                implicitHeight: newText.implicitHeight
+                Text {
+                  id: newText
+                  textFormat: Text.PlainText
+                  anchors.left: parent.left
+                  anchors.right: newAction.left
+                  anchors.rightMargin: Style.space(8)
+                  anchors.verticalCenter: parent.verticalCenter
+                  wrapMode: Text.WordWrap
+                  text: root.glyph(0xF009A) + "  " + (root.newCount === 1 ? "1 new device joined" : root.newCount + " new devices joined")
+                    + ". Not yours? Change your Wi-Fi password in the router."
+                  color: root.fg
+                  font.family: root.font
+                  font.pixelSize: Style.font.caption
+                }
+                LinkAction {
+                  id: newAction
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  icon: root.glyph(0xF05E0)
+                  label: "All known"
+                  onActivated: if (root.hostWidget) root.hostWidget.send("known_all")
+                }
+              }
+            }
+
             Text {
               textFormat: Text.PlainText
-              anchors.right: parent.right
-              anchors.baseline: ipText.baseline
-              text: root.link.gateway ? "Router  " + root.link.gateway : ""
+              visible: root.namedCount === 0 && root.devices.length > 1 && root.newCount === 0
+              width: parent.width
+              wrapMode: Text.WordWrap
+              text: "Tip: click a device to see what it is, give it a name you recognise, pin it to the top or open its web page."
               color: root.dim
               font.family: root.font
               font.pixelSize: Style.font.caption
             }
-            MouseArea { id: ipMouse; anchors.fill: parent; hoverEnabled: true; acceptedButtons: Qt.NoButton }
-            PanelToolTip {
-              visible: ipMouse.containsMouse && root.stats.active === true
-              fontFamily: root.font
-              text: "Address " + (root.link.cidr || root.link.ip || "—") + " on " + (root.link.iface || "?")
-                + (root.link.mac ? "\nMAC " + root.link.mac : "")
-                + (root.link.domain ? "\nLocal domain " + root.link.domain : "")
+
+            KeyTextField {
+              id: searchField
+              visible: root.showSearch
+              width: parent.width
+              placeholderText: root.glyph(0xF0349) + "  Search devices (/)"
+              maximumLength: 40
+              foreground: root.fg
+              font: Qt.font({ family: root.font, pixelSize: Style.font.caption })
+              onTextChanged: root.filterText = text
+              Keys.onPressed: function(event) {
+                if (event.key === Qt.Key_Escape) {
+                  searchField.clear()
+                  keyCatcher.forceActiveFocus()
+                  event.accepted = true
+                }
+              }
             }
-          }
 
-          Meter {
-            visible: root.link.quality !== null && root.link.quality !== undefined
-            readonly property real sigFrac: Math.max(0, Math.min(1, Number(root.link.quality || 0) / 100))
-            label: "Signal  ·  " + root.signalWord(root.link.quality)
-            value: (root.link.quality || 0) + " %"
-            fraction: sigFrac
-            fillColor: root.signalColor(sigFrac)
-            tip: (root.link.signal_dbm !== null && root.link.signal_dbm !== undefined ? root.link.signal_dbm + " dBm" : "")
-              + (root.link.channel ? "  ·  channel " + root.link.channel : "")
-              + (root.link.tx_mbps ? "  ·  link " + root.link.tx_mbps + (root.link.rx_mbps ? " / " + root.link.rx_mbps : "") + " Mbit/s" : "")
-              + "\nExcellent 70 %+, Good 50 %+, Fair 30 %+, Weak below 30 %."
-              + "\nWeak? Move closer to the router or remove obstacles between you."
-          }
-
-          Meter {
-            label: "Traffic now"
-            value: "↓ " + root.formatRate(root.traffic.rx_rate) + "  ·  ↑ " + root.formatRate(root.traffic.tx_rate)
-            // Logarithmic-like visual activity bar up to ~10 MB/s
-            fraction: {
-              var totalRate = Number(root.traffic.rx_rate || 0) + Number(root.traffic.tx_rate || 0)
-              if (totalRate <= 0) return 0
-              return Math.min(1, Math.log10(1 + totalRate / 1024) / 4)
+            Text {
+              textFormat: Text.PlainText
+              visible: root.stats.active === true && !root.trusted && root.totalCount <= 3
+              width: parent.width
+              wrapMode: Text.WordWrap
+              text: "Only a few devices visible. Click Rescan to look for more."
+              color: root.dim
+              font.family: root.font
+              font.pixelSize: Style.font.caption
             }
-            fillColor: Color.accent
-            tip: "↓ download, ↑ upload of this PC.\nSince connecting: " + root.formatBytes(root.traffic.rx_bytes)
-              + " down, " + root.formatBytes(root.traffic.tx_bytes) + " up."
-          }
 
-          Text {
-            textFormat: Text.PlainText
-            visible: root.stats.active === true
-            width: parent.width
-            wrapMode: Text.WordWrap
-            text: root.trusted
-              ? "Your network (trusted): looks for devices every 2 minutes"
-                + (root.alertsOn ? " and tells you when a new one joins." : ". New-device alerts are off.")
-              : "Not marked as your network, so only devices that announce themselves are shown. "
-                + "If this is your home network, click Trust to find every device and get alerts about new ones."
-            color: root.dim
-            font.family: root.font
-            font.pixelSize: Style.font.caption
-          }
+            // Only the device list scrolls, so the link info and buttons stay visible.
+            Flickable {
+              id: deviceScroller
+              width: parent.width
+              height: Math.min(deviceColumn.implicitHeight, root.maxDeviceListHeight)
+              contentWidth: width
+              contentHeight: deviceColumn.implicitHeight
+              clip: true
+              boundsBehavior: Flickable.StopAtBounds
+              interactive: contentHeight > height
 
-          Text {
-            textFormat: Text.PlainText
-            visible: String(root.link.via || "") !== ""
-            width: parent.width
-            elide: Text.ElideRight
-            text: root.glyph(0xF0003) + "  Connected via " + root.link.via + (root.link.via_band ? " · " + root.link.via_band : "")
-            color: root.dim
-            font.family: root.font
-            font.pixelSize: Style.font.caption
-          }
+              Column {
+                id: deviceColumn
+                width: deviceScroller.width
+                spacing: Style.space(8)
 
-          // Optional FRITZ!Box login for mesh details (which access point, band and speed).
-          Column {
-            visible: root.fritz.available === true
-            width: parent.width
-            spacing: Style.space(6)
+                Repeater {
+                  model: root.listEntries
+                  delegate: Loader {
+                    id: entry
+                    required property var modelData
+                    x: modelData.inGroup ? Style.space(10) : 0
+                    width: deviceColumn.width - x
+                    sourceComponent: modelData.type === "header" ? groupHeaderComponent : deviceRowComponent
+                    onLoaded: {
+                      item.width = Qt.binding(function() { return entry.width })
+                      if (modelData.type === "header") item.group = modelData
+                      else item.dev = modelData.dev
+                    }
+                  }
+                }
+
+                Text {
+                  visible: root.listEntries.length === 0 && root.filterText !== ""
+                  textFormat: Text.PlainText
+                  text: "No device matches “" + root.filterText + "”."
+                  color: root.dim
+                  font.family: root.font
+                  font.pixelSize: Style.font.caption
+                }
+              }
+            }
 
             Flow {
               width: parent.width
-              spacing: Style.space(12)
+              spacing: Style.space(16)
+              LinkAction {
+                visible: root.devices.length > 0
+                icon: root.glyph(root.listCopied ? 0xF012C : 0xF014D)
+                label: root.listCopied ? "Copied" : "Copy list"
+                baseColor: root.dim
+                onActivated: root.copyList()
+              }
+              LinkAction {
+                visible: root.trusted
+                icon: root.glyph(root.alertsOn ? 0xF009A : 0xF009B)
+                label: root.alertsOn ? "Alerts on" : "Alerts off"
+                baseColor: root.dim
+                onActivated: if (root.hostWidget) root.hostWidget.sendJson({ cmd: "alerts", on: !root.alertsOn })
+              }
+              LinkAction {
+                visible: root.hiddenCount > 0
+                icon: root.glyph(root.showHidden ? 0xF0209 : 0xF0208)
+                label: (root.showHidden ? "Hide " : "Show ") + root.hiddenCount + " hidden"
+                baseColor: root.dim
+                onActivated: root.showHidden = !root.showHidden
+              }
+            }
+          }
+
+          // Network map: Internet → router → bands / access points → devices.
+          Column {
+            id: mapPageColumn
+            visible: root.mapPage
+            width: parent.width
+            spacing: Style.space(8)
+
+            PanelSeparator { width: parent.width; foreground: root.fg }
+            Item {
+              width: parent.width
+              height: Math.max(mapSummaryText.implicitHeight, mapViewDrop.implicitHeight, mapFoldButtons.implicitHeight)
               Text {
+                id: mapSummaryText
                 textFormat: Text.PlainText
-                visible: root.fritz.state === "connected"
-                text: root.glyph(0xF0003) + "  FRITZ!Box connected · " + (root.fritz.aps || []).length + " access point"
-                  + ((root.fritz.aps || []).length === 1 ? "" : "s")
+                anchors.left: parent.left
+                anchors.right: mapViewDrop.left
+                anchors.rightMargin: Style.space(8)
+                anchors.verticalCenter: parent.verticalCenter
+                elide: Text.ElideRight
+                text: root.mapSummary
                 color: root.dim
                 font.family: root.font
                 font.pixelSize: Style.font.caption
               }
-              LinkAction {
-                visible: root.fritz.state !== "connected" && root.fritz.state !== "connecting" && !root.fritzFormOpen
-                icon: root.glyph(0xF0306)
-                label: root.fritz.state === "error" && root.fritz.user ? "Connect FRITZ!Box again" : "Show mesh details from the FRITZ!Box"
-                baseColor: root.dim
-                onActivated: {
-                  root.fritzFormOpen = true
-                  if (root.fritz.user && fritzUser.text === "") fritzUser.text = root.fritz.user
-                  Qt.callLater(function() { (fritzUser.text === "" ? fritzUser : fritzPassword).forceActiveFocus() })
+              // Same grouping as on the Devices page.
+              Dropdown {
+                id: mapViewDrop
+                anchors.right: mapFoldButtons.left
+                anchors.rightMargin: Style.space(6)
+                anchors.verticalCenter: parent.verticalCenter
+                width: Style.space(150)
+                showLabel: false
+                fontFamily: root.font
+                options: root.viewOptions
+                value: root.viewMode
+                onChanged: function(value) { root.setViewMode(value) }
+              }
+              Row {
+                id: mapFoldButtons
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Style.space(4)
+                readonly property bool usable: root.viewMode !== "list" && root.viewMode !== "ap"
+                Button {
+                  iconText: root.glyph(0xF084F)
+                  bordered: true
+                  enabled: mapFoldButtons.usable
+                  foreground: root.fg
+                  fontFamily: root.font
+                  tooltipText: "Expand all"
+                  onClicked: root.foldAll(false)
+                }
+                Button {
+                  iconText: root.glyph(0xF084D)
+                  bordered: true
+                  enabled: mapFoldButtons.usable
+                  foreground: root.fg
+                  fontFamily: root.font
+                  tooltipText: "Collapse all"
+                  onClicked: root.foldAll(true)
                 }
               }
-              LinkAction {
-                visible: root.fritz.user !== undefined && root.fritz.user !== "" && !root.fritzFormOpen
-                icon: root.glyph(0xF0209)
-                label: "Disconnect"
-                baseColor: root.dim
-                onActivated: if (root.hostWidget) root.hostWidget.send("fritz_logout")
+            }
+            Flickable {
+              id: mapScroller
+              width: parent.width
+              height: Math.min(mapColumn.implicitHeight, Style.space(470))
+              contentWidth: width
+              contentHeight: mapColumn.implicitHeight
+              clip: true
+              boundsBehavior: Flickable.StopAtBounds
+              interactive: contentHeight > height
+              Column {
+                id: mapColumn
+                width: mapScroller.width
+                Repeater {
+                  model: root.mapRows
+                  delegate: MapRow {
+                    required property var modelData
+                    width: mapColumn.width
+                    row: modelData
+                  }
+                }
               }
             }
             Text {
               textFormat: Text.PlainText
-              visible: (root.fritz.state === "error" || root.fritz.state === "connecting") && String(root.fritz.message || "") !== ""
+              visible: !root.meshActive
               width: parent.width
               wrapMode: Text.WordWrap
-              text: String(root.fritz.message || "")
-              color: root.fritz.state === "error" ? Color.accent : root.dim
+              text: root.fritz.available === true
+                ? "Connect your FRITZ!Box (Devices page, click the network line) to see the band, speed and signal of every device."
+                : "Band, speed and signal per device are shown for FRITZ!Box routers after an optional login."
+              color: root.dim
               font.family: root.font
               font.pixelSize: Style.font.caption
             }
-            Column {
-              visible: root.fritzFormOpen
+            Text {
+              textFormat: Text.PlainText
               width: parent.width
-              spacing: Style.space(6)
-              Text {
-                textFormat: Text.PlainText
-                width: parent.width
-                wrapMode: Text.WordWrap
-                text: "Shows which access point, band and speed every device uses, and the names from your FRITZ!Box. "
-                  + "Use a FRITZ!Box user with the right \u201cFRITZ!Box settings\u201d (System \u203a FRITZ!Box Users). "
-                  + "The password is stored only on this PC (readable by you alone) and used only with this FRITZ!Box."
-                color: root.dim
-                font.family: root.font
-                font.pixelSize: Style.font.caption
-              }
-              KeyTextField {
-                id: fritzUser
-                width: parent.width
-                maximumLength: 64
-                placeholderText: "User name, e.g. fritz1234"
-                foreground: root.fg
-                font: Qt.font({ family: root.font, pixelSize: Style.font.caption })
-                Keys.onPressed: function(event) {
-                  if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Tab) {
-                    fritzPassword.forceActiveFocus(); event.accepted = true
-                  } else if (event.key === Qt.Key_Escape) {
-                    root.fritzFormOpen = false; keyCatcher.forceActiveFocus(); event.accepted = true
-                  }
-                }
-              }
-              LinkAction {
-                icon: root.glyph(root.fritzHelpOpen ? 0xF0140 : 0xF0142)
-                label: "Where do I find user name and password?"
-                baseColor: root.dim
-                onActivated: root.fritzHelpOpen = !root.fritzHelpOpen
-              }
-              Text {
-                textFormat: Text.PlainText
-                visible: root.fritzHelpOpen
-                width: parent.width
-                leftPadding: Style.space(12)
-                wrapMode: Text.WordWrap
-                text: "• There is no fixed default user name.\n"
-                  + "• FRITZ!OS before 7.24: the FRITZ!Box asks only for a password. Leave the user name empty.\n"
-                  + "• FRITZ!OS 7.24 and newer: if you never created a user, an update created one named \u201cfritz\u201d "
-                  + "plus four random digits (for example fritz1234). Log in at http://fritz.box and look under "
-                  + "System \u203a FRITZ!Box Users.\n"
-                  + "• Password: unless you changed it, it is printed on the label on the bottom or back of the "
-                  + "FRITZ!Box (4 to 6 lowercase letters followed by 4 digits)."
-                color: root.dim
-                font.family: root.font
-                font.pixelSize: Style.font.caption
-              }
-              KeyTextField {
-                id: fritzPassword
-                width: parent.width
-                password: !root.showPassword
-                maximumLength: 128
-                placeholderText: "Password"
-                foreground: root.fg
-                font: Qt.font({ family: root.font, pixelSize: Style.font.caption })
-                onAccepted: root.fritzConnect()
-                Keys.onPressed: function(event) {
-                  if (event.key === Qt.Key_Escape) {
-                    fritzPassword.clear(); root.fritzFormOpen = false; root.showPassword = false
-                    keyCatcher.forceActiveFocus(); event.accepted = true
-                  }
-                }
-                // Eye icon: show or hide the typed password.
-                Text {
-                  id: eyeIcon
-                  textFormat: Text.PlainText
-                  anchors.right: parent.right
-                  anchors.rightMargin: Style.space(8)
-                  anchors.verticalCenter: parent.verticalCenter
-                  text: root.glyph(root.showPassword ? 0xF0209 : 0xF0208)
-                  color: eyeMouse.containsMouse ? Color.accent : root.dim
-                  font.family: root.font
-                  font.pixelSize: Style.font.body
-                  MouseArea {
-                    id: eyeMouse
-                    anchors.fill: parent
-                    anchors.margins: -Style.space(4)
-                    hoverEnabled: true
-                    cursorShape: Qt.PointingHandCursor
-                    onClicked: {
-                      root.showPassword = !root.showPassword
-                      fritzPassword.forceActiveFocus()
-                    }
-                  }
-                  PanelToolTip {
-                    visible: eyeMouse.containsMouse
-                    text: root.showPassword ? "Hide password" : "Show password"
-                    fontFamily: root.font
-                  }
-                }
-              }
-              Flow {
-                width: parent.width
-                spacing: Style.space(8)
-                Button {
-                  text: "Connect"
-                  iconText: root.glyph(0xF0306)
-                  bordered: true
-                  foreground: root.fg
-                  fontFamily: root.font
-                  enabled: fritzPassword.text !== ""
-                  onClicked: root.fritzConnect()
-                }
-                Button {
-                  text: "Cancel"
-                  bordered: true
-                  foreground: root.fg
-                  fontFamily: root.font
-                  onClicked: {
-                    fritzPassword.clear()
-                    root.fritzFormOpen = false
-                    root.showPassword = false
-                    keyCatcher.forceActiveFocus()
-                  }
-                }
-              }
-            }
-          }
-
-          PanelSeparator { width: parent.width; foreground: root.fg }
-          Item {
-            width: parent.width
-            height: devicesHeader.implicitHeight
-            PanelSectionHeader {
-              id: devicesHeader
-              anchors.left: parent.left
-              anchors.right: viewSwitch.left
-              anchors.rightMargin: Style.space(8)
-              text: "DEVICES (" + root.onlineCount + " ONLINE"
-                + (root.idleCount > 0 ? " · " + root.idleCount + " IDLE" : "")
-                + (root.sleepingCount > 0 ? " · " + root.sleepingCount + " SLEEPING" : "") + ")"
-              foreground: root.fg
-              fontFamily: root.font
-            }
-            LinkAction {
-              id: viewSwitch
-              anchors.right: parent.right
-              anchors.verticalCenter: devicesHeader.verticalCenter
-              icon: root.glyph(root.viewMode === "list" ? 0xF0279 : 0xF0570)
-              label: root.viewLabels[root.viewMode] || "List"
-              baseColor: root.dim
-              onActivated: root.cycleView()
-              MouseArea { id: viewTipMouse; anchors.fill: parent; hoverEnabled: true; acceptedButtons: Qt.NoButton }
-              PanelToolTip {
-                visible: viewTipMouse.containsMouse
-                fontFamily: root.font
-                text: "Switch between list and groups"
-              }
-            }
-          }
-
-          // New devices since the user last checked (trusted networks only).
-          Rectangle {
-            visible: root.newCount > 0
-            width: parent.width
-            height: newRow.implicitHeight + Style.space(12)
-            radius: Style.space(6)
-            color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.14)
-            border.width: 1
-            border.color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.5)
-            Item {
-              id: newRow
-              anchors.fill: parent
-              anchors.margins: Style.space(6)
-              implicitHeight: newText.implicitHeight
-              Text {
-                id: newText
-                textFormat: Text.PlainText
-                anchors.left: parent.left
-                anchors.right: newAction.left
-                anchors.rightMargin: Style.space(8)
-                anchors.verticalCenter: parent.verticalCenter
-                wrapMode: Text.WordWrap
-                text: root.glyph(0xF009A) + "  " + (root.newCount === 1 ? "1 new device joined" : root.newCount + " new devices joined")
-                  + ". Not yours? Change your Wi-Fi password in the router."
-                color: root.fg
-                font.family: root.font
-                font.pixelSize: Style.font.caption
-              }
-              LinkAction {
-                id: newAction
-                anchors.right: parent.right
-                anchors.verticalCenter: parent.verticalCenter
-                icon: root.glyph(0xF05E0)
-                label: "All known"
-                onActivated: if (root.hostWidget) root.hostWidget.send("known_all")
-              }
-            }
-          }
-
-          Text {
-            textFormat: Text.PlainText
-            visible: root.namedCount === 0 && root.devices.length > 1 && root.newCount === 0
-            width: parent.width
-            wrapMode: Text.WordWrap
-            text: "Tip: click a device to see what it is, give it a name you recognise, pin it to the top or open its web page."
-            color: root.dim
-            font.family: root.font
-            font.pixelSize: Style.font.caption
-          }
-
-          KeyTextField {
-            id: searchField
-            visible: root.showSearch
-            width: parent.width
-            placeholderText: root.glyph(0xF0349) + "  Search devices (/)"
-            maximumLength: 40
-            foreground: root.fg
-            font: Qt.font({ family: root.font, pixelSize: Style.font.caption })
-            onTextChanged: root.filterText = text
-            Keys.onPressed: function(event) {
-              if (event.key === Qt.Key_Escape) {
-                searchField.clear()
-                keyCatcher.forceActiveFocus()
-                event.accepted = true
-              }
-            }
-          }
-
-          Text {
-            textFormat: Text.PlainText
-            visible: root.stats.active === true && !root.trusted && root.totalCount <= 3
-            width: parent.width
-            wrapMode: Text.WordWrap
-            text: "Only a few devices visible. Click Rescan to look for more."
-            color: root.dim
-            font.family: root.font
-            font.pixelSize: Style.font.caption
-          }
-
-          // Only the device list scrolls, so the link info and buttons stay visible.
-          Flickable {
-            id: deviceScroller
-            width: parent.width
-            height: Math.min(deviceColumn.implicitHeight, root.maxDeviceListHeight)
-            contentWidth: width
-            contentHeight: deviceColumn.implicitHeight
-            clip: true
-            boundsBehavior: Flickable.StopAtBounds
-            interactive: contentHeight > height
-
-            Column {
-              id: deviceColumn
-              width: deviceScroller.width
-              spacing: Style.space(8)
-
-              Repeater {
-                model: root.listEntries
-                delegate: Loader {
-                  id: entry
-                  required property var modelData
-                  x: modelData.inGroup ? Style.space(10) : 0
-                  width: deviceColumn.width - x
-                  sourceComponent: modelData.type === "header" ? groupHeaderComponent : deviceRowComponent
-                  onLoaded: {
-                    item.width = Qt.binding(function() { return entry.width })
-                    if (modelData.type === "header") item.group = modelData
-                    else item.dev = modelData.dev
-                  }
-                }
-              }
-
-              Text {
-                visible: root.listEntries.length === 0 && root.filterText !== ""
-                textFormat: Text.PlainText
-                text: "No device matches “" + root.filterText + "”."
-                color: root.dim
-                font.family: root.font
-                font.pixelSize: Style.font.caption
-              }
-            }
-          }
-
-          Flow {
-            width: parent.width
-            spacing: Style.space(16)
-            LinkAction {
-              visible: root.devices.length > 0
-              icon: root.glyph(root.listCopied ? 0xF012C : 0xF014D)
-              label: root.listCopied ? "Copied" : "Copy list"
-              baseColor: root.dim
-              onActivated: root.copyList()
-            }
-            LinkAction {
-              visible: root.trusted
-              icon: root.glyph(root.alertsOn ? 0xF009A : 0xF009B)
-              label: root.alertsOn ? "Alerts on" : "Alerts off"
-              baseColor: root.dim
-              onActivated: if (root.hostWidget) root.hostWidget.sendJson({ cmd: "alerts", on: !root.alertsOn })
-            }
-            LinkAction {
-              visible: root.hiddenCount > 0
-              icon: root.glyph(root.showHidden ? 0xF0209 : 0xF0208)
-              label: (root.showHidden ? "Hide " : "Show ") + root.hiddenCount + " hidden"
-              baseColor: root.dim
-              onActivated: root.showHidden = !root.showHidden
+              wrapMode: Text.WordWrap
+              text: "Click a group or repeater to fold it, a device to see its details. The grouping is shared with the Devices page."
+              color: root.dim
+              font.family: root.font
+              font.pixelSize: Style.font.caption
             }
           }
 
