@@ -1,6 +1,7 @@
 pragma ComponentBehavior: Bound
 import QtQuick
 import Quickshell
+import Quickshell.Io
 import qs.Commons
 import qs.Ui
 
@@ -445,16 +446,53 @@ Panel {
     root.close()
     Quickshell.execDetached(["omarchy-launch-browser", target])
   }
-  // Copy a device IP via wl-copy (fixed argv, no shell); only plain IPv4 literals.
+  // All clipboard writes go to `wl-copy` through stdin, never as an argument: wl-copy stays
+  // alive as the clipboard owner, and its command line is readable by other local users
+  // in /proc/<pid>/cmdline. Closing stdin (stdinEnabled = false) ends the text.
+  property string clipboardQueue: ""
+  property bool clipboardQueued: false
+  Process {
+    id: clipboardWriter
+    command: ["wl-copy"]
+    stdinEnabled: true
+    property string text: ""
+    onStarted: {
+      clipboardWriter.write(clipboardWriter.text)
+      clipboardWriter.text = ""
+      clipboardWriter.stdinEnabled = false
+    }
+    onExited: {
+      clipboardWriter.stdinEnabled = true
+      if (root.clipboardQueued) {
+        root.clipboardQueued = false
+        var next = root.clipboardQueue
+        root.clipboardQueue = ""
+        root.copyText(next)
+      }
+    }
+  }
+  function copyText(text) {
+    var value = String(text || "").slice(0, 262144)
+    if (value === "") return false
+    if (clipboardWriter.running) {  // a copy is still being handed over: send this one next
+      root.clipboardQueue = value
+      root.clipboardQueued = true
+      return true
+    }
+    clipboardWriter.text = value
+    clipboardWriter.stdinEnabled = true
+    clipboardWriter.running = true
+    return true
+  }
+  // Copy a device IP; only plain IPv4 literals.
   readonly property var ipPattern: /^(\d{1,3}\.){3}\d{1,3}$/
   function copyIp(ip) {
     var text = String(ip || "")
     if (!ipPattern.test(text)) return false
-    Quickshell.execDetached(["wl-copy", text])
-    return true
+    return root.copyText(text)
   }
   // The device list as a Markdown table on the clipboard (text from the collector is
-  // already sanitized; `|` is replaced so cells stay intact). One argv entry, no shell.
+  // already sanitized; `|` is replaced so cells stay intact). Sent through stdin, see copyText().
   property bool listCopied: false
   Timer { id: listCopiedTimer; interval: 1600; onTriggered: root.listCopied = false }
   function copyList() {
@@ -469,7 +507,7 @@ Panel {
       lines.push("| " + [dev.name, root.kindLabel(dev.kind), root.statusWord(dev) + (dev.hidden ? " (hidden)" : ""),
         dev.ip, dev.vendor, dev.model, dev.mac].map(cell).join(" | ") + " |")
     })
-    Quickshell.execDetached(["wl-copy", "--", lines.join("\n") + "\n"])
+    if (!root.copyText(lines.join("\n") + "\n")) return
     root.listCopied = true
     listCopiedTimer.restart()
   }
@@ -1122,7 +1160,7 @@ Panel {
         anchors.verticalCenter: parent.verticalCenter
         quality: mapRow.row.type === "device" && mapRow.dev && mapRow.dev.mesh ? root.signalQuality(mapRow.dev.mesh.signal_dbm) : -1
       }
-      // Copy the IP address, as on the Devices page (wl-copy, fixed argv).
+      // Copy the IP address, as on the Devices page (copyIp(): wl-copy through stdin).
       Text {
         id: mapCopy
         textFormat: Text.PlainText
