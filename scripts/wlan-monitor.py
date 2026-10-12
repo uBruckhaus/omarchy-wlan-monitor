@@ -964,6 +964,70 @@ def query_mdns(iface, subnet_net):
     return parse_mdns_lines(lines, iface, subnet_net)
 
 
+# --- VPN detection ------------------------------------------------------------------
+
+# Interface name prefixes of common VPN clients -> name shown to the user, and the hint
+# for letting the VPN reach the local network.
+VPN_NAMES = (
+    ("nordlynx", "NordVPN"), ("nordtun", "NordVPN"), ("tailscale", "Tailscale"),
+    ("proton", "Proton VPN"), ("pvpn", "Proton VPN"), ("wg-mullvad", "Mullvad"), ("mullvad", "Mullvad"),
+    ("zt", "ZeroTier"), ("wg", "WireGuard"), ("tun", "VPN"), ("tap", "VPN"), ("ppp", "VPN"),
+    ("ipsec", "IPsec VPN"), ("vti", "IPsec VPN"),
+)
+VPN_HINTS = {
+    "NordVPN": "Allow it with: nordvpn set lan-discovery enable",
+    "Mullvad": "Allow it with: mullvad lan set allow",
+    "Proton VPN": "Turn on \u201cAllow LAN connections\u201d in Proton VPN.",
+}
+VPN_LINK_TYPES = {"65534", "512"}  # ARPHRD_NONE (tun, WireGuard), ARPHRD_PPP
+LAN_CHECK_EVERY = 30.0   # router check while a VPN lets the home network through
+LAN_CHECK_BLOCKED = 8.0  # ... and while it blocks it, so a fix shows up quickly
+
+
+def detect_vpn(active_iface, base="/sys/class/net"):
+    """The first VPN-like interface that is up (other than the Wi-Fi/LAN one), or None."""
+    try:
+        names = sorted(os.listdir(base))[:256]
+    except OSError:
+        return None
+    for name in names:
+        if name in ("lo", active_iface) or not re.fullmatch(r"[A-Za-z0-9._-]{1,15}", name):
+            continue
+        try:
+            flags = int(read(os.path.join(base, name, "flags"), "0", 32).strip() or "0", 16)
+        except ValueError:
+            continue
+        if not flags & 0x1:  # IFF_UP
+            continue
+        label = next((label for prefix, label in VPN_NAMES if name.startswith(prefix)), "")
+        if label or read(os.path.join(base, name, "type"), "", 32).strip() in VPN_LINK_TYPES:
+            label = label or "VPN"
+            return {"iface": name, "name": label, "hint": VPN_HINTS.get(label, "Allow local network (LAN) access in your VPN settings.")}
+    return None
+
+
+def gateway_reachable(ip, ports=(80, 53, 443), timeout=0.4):
+    """True if the router answers on any usual port; a refusal counts as an answer.
+
+    VPN firewalls that block the home network silently drop these packets (timeouts).
+    Only a private gateway address is ever contacted.
+    """
+    try:
+        if not ipaddress.IPv4Address(ip).is_private:
+            return True  # not a home router; nothing to check
+    except ValueError:
+        return True
+    for port in ports:
+        try:
+            with socket.create_connection((ip, port), timeout=timeout):
+                return True
+        except ConnectionRefusedError:
+            return True
+        except OSError:
+            continue
+    return False
+
+
 def tcp_open(ip, port, timeout=0.35):
     try:
         with socket.create_connection((ip, port), timeout=timeout):
@@ -1813,6 +1877,8 @@ class Monitor:
         self.gateway_web = None  # None: not probed yet
         self.web_ok = {}  # advertised web UI url -> (expires, reachable); pruned every snapshot
         self.iw_info = {}
+        self.lan_check = (None, -math.inf, True)  # (vpn iface, checked at, router reachable)
+        self.lan_recheck = False
         self.iw_time = -math.inf
         self.traffic_prev = None
 
@@ -1841,6 +1907,7 @@ class Monitor:
             return True
         if command == "open":
             self.panel_open = True
+            self.lan_recheck = True  # show the current VPN state when the panel opens
             return True
         if command == "closed":
             self.panel_open = False
@@ -2015,9 +2082,31 @@ class Monitor:
             "gateway_mac": self.identity["gateway_mac"],
         }
         trusted = is_trusted(self.trust_identity, self.trusted)
+
+        # A VPN that blocks the home network makes every device look idle: say so instead.
+        vpn = detect_vpn(iface)
+        lan_blocked = False
+        if vpn and gateway_ip:
+            checked_iface, checked_at, reachable = self.lan_check
+            every = LAN_CHECK_EVERY if reachable else LAN_CHECK_BLOCKED
+            if checked_iface != vpn["iface"] or now - checked_at >= every or force_scan or self.lan_recheck:
+                reachable = gateway_reachable(gateway_ip)
+                if reachable and not self.lan_check[2]:
+                    self.last_full_scan = -math.inf  # just unblocked: look for devices right away
+                self.lan_check = (vpn["iface"], now, reachable)
+            lan_blocked = not reachable
+        else:
+            self.lan_check = (None, -math.inf, True)
+        self.lan_recheck = False
+
         gateway_vendor = lookup_vendor(self.identity["gateway_mac"])
-        self.fritz.set_network(gateway_ip, self.identity["gateway_mac"], is_fritz_vendor(gateway_vendor), self.panel_open)
+        self.fritz.set_network(None if lan_blocked else gateway_ip, self.identity["gateway_mac"],
+                               is_fritz_vendor(gateway_vendor), self.panel_open)
         fritz_info, mesh = self.fritz.snapshot()
+        if lan_blocked:
+            mesh = {}
+            fritz_info = dict(fritz_info, aps=[], state="paused" if fritz_info["user"] else fritz_info["state"],
+                              message="Paused while the VPN blocks the home network.")
 
         # Active scans only on trusted networks, unless the user explicitly asked for one.
         since_full = now - self.last_full_scan
@@ -2025,6 +2114,8 @@ class Monitor:
             trusted and (since_full >= FULL_SCAN_EVERY or (self.panel_open and since_full >= FULL_SCAN_ON_OPEN))
         )
         do_known = not do_full and trusted and self.known and now - self.last_known_scan >= KNOWN_SCAN_EVERY
+        if lan_blocked:  # probes would only be dropped by the VPN firewall
+            do_full = do_known = False
 
         mdns_every = MDNS_EVERY_OPEN if self.panel_open else MDNS_EVERY_CLOSED
         if do_full or now - self.mdns_time >= mdns_every:
@@ -2256,7 +2347,9 @@ class Monitor:
                 "trusted": trusted,
                 "can_trust": bool(self.trust_identity["gateway_mac"]),
                 "scan_mode": "active" if trusted else "passive",
-                "via": clean(via, 64),
+                "via": clean(via, 64) if not lan_blocked else "",
+                "vpn": dict(vpn, name=clean(vpn["name"], 32), iface=clean(vpn["iface"], 16), lan_blocked=lan_blocked)
+                if vpn else None,
                 "via_band": via_band,
             },
             "traffic": traffic,

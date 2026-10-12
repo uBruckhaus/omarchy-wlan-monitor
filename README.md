@@ -1,6 +1,6 @@
 # WLAN Monitor
 
-**See who is on your Wi-Fi from the Omarchy bar, in plain words: every device with a type icon, name, maker and status, names you choose yourself, an alert when a new device joins, collapsible groups (by platform, type or Wi-Fi band), a network map as a tree (router › bands › devices, with repeaters), mesh details for FRITZ!Box (which access point, band, speed and signal), one click to your router's and devices' web pages, plus signal and live traffic.**
+**See who is on your Wi-Fi from the Omarchy bar, in plain words: every device with a type icon, name, maker and status, names you choose yourself, an alert when a new device joins, collapsible groups (by platform, type or Wi-Fi band), a network map as a tree (router › bands › devices, with repeaters), mesh details for FRITZ!Box (which access point, band, speed and signal), VPN detection (blue icon, and a clear note when the VPN blocks your home network), one click to your router's and devices' web pages, plus signal and live traffic.**
 
 ![WLAN Monitor: devices grouped by Wi-Fi band, the network map, device details](preview.png)
 
@@ -25,6 +25,10 @@ WLAN Monitor is a lightweight Omarchy bar widget and popup panel that discovers 
   - **Copy IP / Copy list:** the copy icon copies a device's IP; **Copy list** copies all devices as a Markdown table. Both go to `wl-copy` through its standard input, never as a command-line argument, so the copied text (e.g. your device names) cannot be read by other local users from the process list while `wl-copy` holds the clipboard.
   - **Rescan**, **Router** (your router's settings page), **Trust / Untrust** (see below) and a Wi-Fi button that opens Omarchy's built-in Network panel.
 - **Right click:** triggers an immediate WLAN rescan.
+
+## VPNs
+
+While a VPN is active (NordVPN, WireGuard, Proton VPN, Mullvad, Tailscale, OpenVPN and other tunnel interfaces), the bar icon turns **blue**, the panel shows a line such as "NordVPN is on · home network reachable" under the traffic meter, and the network map labels the top node "Internet via NordVPN". Many VPNs block the home network: devices then look idle or asleep, and the router page, names from the network and FRITZ!Box details are unavailable. WLAN Monitor checks the router about every 30 s while a VPN is up (a TCP connect to ports 80, 53 or 443). If the router does not answer, the panel shows which VPN blocks the home network and how to allow it (for NordVPN: `nordvpn set lan-discovery enable`, with a button to copy the command). It also pauses its own scans and the FRITZ!Box reading until the network is reachable again.
 
 ## Trusted networks and scanning
 

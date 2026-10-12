@@ -6,7 +6,7 @@ import qs.Commons
 import qs.Ui as Ui
 
 // Bar indicator for the local WLAN. Dim radar icon while disconnected; green radar
-// icon (theme green) while connected, with a thin signal-quality bar underneath. Pulses while scanning the subnet. Left click opens the panel;
+// icon (theme green) while connected, blue (theme blue) while a VPN is active, with a thin signal-quality bar underneath. Pulses while scanning the subnet. Left click opens the panel;
 // right click triggers an immediate rescan. A small dot marks devices that joined
 // recently. Commands (rescan, panel open/closed, trust/untrust network, per-device
 // rename / pin / hide as one-line JSON) go to the collector over stdin.
@@ -25,6 +25,10 @@ Ui.BarWidget {
   property bool rescanPending: false  // user asked for a rescan, waiting for the result
   readonly property bool scanning: scanBusy || rescanPending
   readonly property bool trusted: active && stats.link && stats.link.trusted === true
+  // A VPN is up (blue icon); lanBlocked: it also blocks the home network.
+  readonly property var vpn: active && stats.link && stats.link.vpn ? stats.link.vpn : null
+  readonly property bool lanBlocked: vpn !== null && vpn.lan_blocked === true
+  readonly property color vpnBlue: button.vpnColor  // shared with the panel's VPN notice
   readonly property string scriptDir: Qt.resolvedUrl("scripts").toString().replace(/^file:\/\//, "")
 
   // Signal quality fraction in 0..1, or -1 when unknown (e.g. Ethernet fallback).
@@ -35,7 +39,7 @@ Ui.BarWidget {
   }
 
   // Signal level in the theme's named colours: green >= 70%, yellow >= 50%, orange >= 30%, red < 30%.
-  property var levelPalette: ({ green: "#9cba64", yellow: "#d9ab5e", orange: "#e09355", red: "#db6c4f" })
+  property var levelPalette: ({ green: "#9cba64", yellow: "#d9ab5e", orange: "#e09355", red: "#db6c4f", blue: "#6fa3d8" })
   function signalColor(fraction) {
     return fraction < 0 ? Color.accent
       : fraction >= 0.7 ? levelPalette.green
@@ -53,7 +57,7 @@ Ui.BarWidget {
       var found = {}
       var lines = text().split("\n")
       for (var i = 0; i < lines.length; i++) {
-        var match = lines[i].match(/^\s*(green|yellow|orange|red)\s*=\s*["']?(#[0-9A-Fa-f]{6})["']?/)
+        var match = lines[i].match(/^\s*(green|yellow|orange|red|blue)\s*=\s*["']?(#[0-9A-Fa-f]{6})["']?/)
         if (match) found[match[1]] = match[2]
       }
       var merged = {}
@@ -81,6 +85,9 @@ Ui.BarWidget {
       + (idle > 0 ? ", " + idle + " idle" : "") + (sleeping > 0 ? ", " + sleeping + " sleeping" : "")
       + (root.newCount > 0 ? " · " + root.newCount + " new" : "")
     var mode = root.trusted ? "" : "\nNot marked as your network: only devices that announce themselves"
+    if (root.vpn) mode = "\n" + root.vpn.name + " is on" + (root.lanBlocked
+      ? " and blocks your home network: devices cannot be reached. " + root.vpn.hint
+      : " (home network still reachable)") + mode
     var names = (stats.devices || []).filter(function(d) { return d.online && !d.hidden }).slice(0, 6).map(function(d) {
       return "• " + d.name + (d.new ? "  (new)" : "")
     }).join("\n")
@@ -172,8 +179,13 @@ Ui.BarWidget {
     // Theme green when it really is green (hue ~75-165°); some themes map "green"
     // to teal, so fall back to a fixed green there.
     readonly property color themeGreen: root.levelPalette.green
-    readonly property color iconColor: themeGreen.hslHue >= 0.21 && themeGreen.hslHue <= 0.46
+    readonly property color connectedColor: themeGreen.hslHue >= 0.21 && themeGreen.hslHue <= 0.46
       && themeGreen.hslSaturation > 0.2 ? themeGreen : "#5fb760"
+    // Blue while a VPN is active (theme blue when it really is blue, hue ~190-260°).
+    readonly property color themeBlue: root.levelPalette.blue
+    readonly property color vpnColor: themeBlue.hslHue >= 0.52 && themeBlue.hslHue <= 0.73
+      && themeBlue.hslSaturation > 0.2 ? themeBlue : "#5b9bd5"
+    readonly property color iconColor: root.vpn ? vpnColor : connectedColor
     foreground: root.active ? Qt.tint(iconColor, Qt.rgba(base.r, base.g, base.b, root.glow * 0.75)) : base
     tooltipText: root.opened ? "" : root.summary
     onPressed: function(code) {

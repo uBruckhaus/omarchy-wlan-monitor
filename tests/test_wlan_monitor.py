@@ -821,3 +821,37 @@ class PrivateWriteTests(unittest.TestCase):
             self.assertTrue(wlan_monitor.save_private_json(wlan_monitor.FRITZ_FILE, {"a": 1}))
             self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
             self.assertEqual(sorted(os.listdir(wlan_monitor.config_dir())), [wlan_monitor.FRITZ_FILE])
+
+
+class VpnTests(unittest.TestCase):
+    def make_iface(self, base, name, flags="0x1003", typ="1"):
+        os.makedirs(os.path.join(base, name))
+        with open(os.path.join(base, name, "flags"), "w") as handle:
+            handle.write(flags + "\n")
+        with open(os.path.join(base, name, "type"), "w") as handle:
+            handle.write(typ + "\n")
+
+    def test_detect_vpn(self):
+        with tempfile.TemporaryDirectory() as base:
+            self.make_iface(base, "lo", typ="772")
+            self.make_iface(base, "wlp15s0")
+            self.make_iface(base, "docker0")
+            self.assertIsNone(wlan_monitor.detect_vpn("wlp15s0", base))
+            self.make_iface(base, "nordlynx", flags="0x91", typ="65534")
+            vpn = wlan_monitor.detect_vpn("wlp15s0", base)
+            self.assertEqual((vpn["iface"], vpn["name"]), ("nordlynx", "NordVPN"))
+            self.assertIn("nordvpn set lan-discovery enable", vpn["hint"])
+        with tempfile.TemporaryDirectory() as base:
+            self.make_iface(base, "wlp15s0")
+            self.make_iface(base, "wg0", flags="0x90", typ="65534")  # down: ignored
+            self.assertIsNone(wlan_monitor.detect_vpn("wlp15s0", base))
+            self.make_iface(base, "corpvpn", flags="0x91", typ="65534")  # unknown name, tunnel type
+            self.assertEqual(wlan_monitor.detect_vpn("wlp15s0", base)["name"], "VPN")
+
+    def test_gateway_reachable(self):
+        with mock.patch.object(wlan_monitor.socket, "create_connection", side_effect=ConnectionRefusedError):
+            self.assertTrue(wlan_monitor.gateway_reachable("192.168.1.1"))
+        with mock.patch.object(wlan_monitor.socket, "create_connection", side_effect=wlan_monitor.socket.timeout):
+            self.assertFalse(wlan_monitor.gateway_reachable("192.168.1.1"))
+        with mock.patch.object(wlan_monitor.socket, "create_connection", side_effect=AssertionError("must not connect")):
+            self.assertTrue(wlan_monitor.gateway_reachable("8.8.8.8"))

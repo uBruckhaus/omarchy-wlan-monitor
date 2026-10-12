@@ -48,6 +48,15 @@ Panel {
   readonly property int namedCount: Number(stats.named_count || 0)
   readonly property bool alertsOn: stats.alerts !== false
   readonly property var fritz: stats.fritz || ({})
+  readonly property var vpn: root.link.vpn || null
+  readonly property bool lanBlocked: root.vpn !== null && root.vpn.lan_blocked === true
+  // "Allow it with: <command>" hints carry a command the user can copy.
+  readonly property string vpnCommand: {
+    var hint = root.vpn ? String(root.vpn.hint || "") : ""
+    return hint.indexOf("Allow it with: ") === 0 ? hint.slice(15) : ""
+  }
+  property bool vpnCopied: false
+  Timer { id: vpnCopiedTimer; interval: 1600; onTriggered: root.vpnCopied = false }
   // Second page: network map. Remembered like the group states ("mappage" in the saved list).
   readonly property bool mapPage: (root.view.collapsed || []).indexOf("mappage") !== -1
   function showPage(map) { if (root.mapPage !== map) root.toggleGroup("mappage") }
@@ -1108,7 +1117,7 @@ Panel {
       elide: Text.ElideRight
       text: {
         var r = mapRow.row
-        if (r.type === "internet") return "Internet"
+        if (r.type === "internet") return "Internet" + (root.vpn ? "  ·  via " + root.vpn.name : "")
         if (r.type === "ap") return (r.node.title || "Router")
           + (r.node.dev && r.node.dev.is_gateway && r.node.dev.model ? "  ·  " + r.node.dev.model : "")
         if (r.type === "group") return r.node.title + "  ·  " + r.count
@@ -1330,6 +1339,53 @@ Panel {
             }
           }
 
+          // A VPN blocks the home network: explain why everything looks idle, and how to fix it.
+          Rectangle {
+            visible: root.lanBlocked
+            width: parent.width
+            height: vpnColumn.implicitHeight + Style.space(14)
+            radius: Style.space(6)
+            readonly property color tint: root.hostWidget && root.hostWidget.vpnBlue ? root.hostWidget.vpnBlue : Color.accent
+            color: Qt.rgba(tint.r, tint.g, tint.b, 0.14)
+            border.width: 1
+            border.color: Qt.rgba(tint.r, tint.g, tint.b, 0.6)
+            Column {
+              id: vpnColumn
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              anchors.margins: Style.space(8)
+              spacing: Style.space(4)
+              Text {
+                textFormat: Text.PlainText
+                width: parent.width
+                wrapMode: Text.WordWrap
+                text: root.glyph(0xF099D) + "  " + (root.vpn ? root.vpn.name : "A VPN") + " is on and blocks your home network"
+                color: root.fg
+                font.family: root.font
+                font.pixelSize: Style.font.bodySmall
+                font.bold: true
+              }
+              Text {
+                textFormat: Text.PlainText
+                width: parent.width
+                wrapMode: Text.WordWrap
+                text: "Devices can't be reached, so they show as idle or sleeping, and the router page, "
+                  + "names from the network and FRITZ!Box details are unavailable. "
+                  + (root.vpn ? String(root.vpn.hint || "").replace(/([^.])$/, "$1.") : "") + " Or disconnect the VPN."
+                color: root.dim
+                font.family: root.font
+                font.pixelSize: Style.font.caption
+              }
+              LinkAction {
+                visible: root.vpnCommand !== ""
+                icon: root.glyph(root.vpnCopied ? 0xF012C : 0xF018F)
+                label: root.vpnCopied ? "Copied" : "Copy command: " + root.vpnCommand
+                onActivated: if (root.copyText(root.vpnCommand)) { root.vpnCopied = true; vpnCopiedTimer.restart() }
+              }
+            }
+          }
+
           Column {
             id: devicesPage
             visible: !root.mapPage
@@ -1396,6 +1452,33 @@ Panel {
               fillColor: Color.accent
               tip: "↓ download, ↑ upload of this PC.\nSince connecting: " + root.formatBytes(root.traffic.rx_bytes)
                 + " down, " + root.formatBytes(root.traffic.tx_bytes) + " up."
+            }
+
+            // Always say when a VPN is on, also when it lets the home network through.
+            Item {
+              visible: root.vpn !== null
+              width: parent.width
+              height: vpnLine.implicitHeight
+              readonly property color tint: root.hostWidget && root.hostWidget.vpnBlue ? root.hostWidget.vpnBlue : Color.accent
+              Text {
+                id: vpnLine
+                textFormat: Text.PlainText
+                width: parent.width
+                elide: Text.ElideRight
+                text: root.glyph(0xF099D) + "  " + (root.vpn ? root.vpn.name : "") + " is on"
+                  + (root.lanBlocked ? "  ·  blocks your home network" : "  ·  home network reachable")
+                color: parent.tint
+                font.family: root.font
+                font.pixelSize: Style.font.caption
+                font.bold: true
+              }
+              MouseArea { id: vpnMouse; anchors.fill: parent; hoverEnabled: true; acceptedButtons: Qt.NoButton }
+              PanelToolTip {
+                visible: vpnMouse.containsMouse
+                fontFamily: root.font
+                text: root.vpn ? "VPN interface " + root.vpn.iface + ". Internet traffic goes through " + root.vpn.name + "."
+                  + (root.lanBlocked ? "\n" + root.vpn.hint : "\nDevices at home are still reachable.") : ""
+              }
             }
 
             // One summary line; the explanations, "connected via" and the FRITZ!Box login
