@@ -165,9 +165,10 @@ Panel {
       out.push({
         type: "header", id: id, title: bucket.title, icon: bucket.icon, detail: bucket.detail,
         count: bucket.devs.length, online: bucket.devs.filter(function(d) { return d.online }).length,
-        hasNew: hasNew, collapsed: isCollapsed && !hasNew
+        hasNew: hasNew, collapsed: isCollapsed
       })
-      if (!isCollapsed || hasNew) bucket.devs.forEach(function(dev) { out.push({ type: "device", dev: dev, inGroup: true }) })
+      // The user's choice always wins; a collapsed group with a new device shows NEW on its header.
+      if (!isCollapsed) bucket.devs.forEach(function(dev) { out.push({ type: "device", dev: dev, inGroup: true }) })
     })
     return out
   }
@@ -175,7 +176,7 @@ Panel {
   function glyph(code) { return String.fromCodePoint(code) }
   readonly property var kindIcons: ({
     router: 0xF0469, computer: 0xF0379, laptop: 0xF0322, phone: 0xF011C, tablet: 0xF04F6,
-    watch: 0xF0597, tv: 0xF07F4, speaker: 0xF04C3, printer: 0xF042A, console: 0xF0297,
+    watch: 0xF0897, tv: 0xF07F4, speaker: 0xF04C3, printer: 0xF042A, console: 0xF0297,
     camera: 0xF07AE, light: 0xF0335, nas: 0xF048B, appliance: 0xF0176, smarthome: 0xF07D0,
     unknown: 0xF0625
   })
