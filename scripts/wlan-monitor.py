@@ -16,9 +16,22 @@ privileges:
   `/usr/share/hwdata/oui.txt`) for manufacturer identification.
 
 Commands are read from stdin, one per line: `rescan`, `open` / `closed` (panel
-state), `trust` / `untrust` (the current network).
+state), `trust` / `untrust` (the current network), `known_all`, or a JSON object for
+per-device settings: `{"cmd": "rename" | "pin" | "hide" | "known", "mac": ..., "name" | "on": ...}`
+and `{"cmd": "alerts", "on": true | false}`.
+
+Friendly names, pins and hidden flags are stored per network (router MAC + SSID) in
+`~/.config/ubruckhaus-wlan-monitor/devices.json`. On trusted networks the MAC addresses
+seen there are remembered too, so devices joining later can be flagged as new.
+
+FRITZ!Box routers: the model name comes from the unauthenticated TR-064 description
+(`http://<router>:49000/tr64desc.xml`). With an optional login (`fritz_login` command,
+stored owner-only and bound to that router's MAC) a background thread reads the mesh
+list over TR-064 HTTPS (port 49443, certificate pinned at login) to show which access
+point, band and speed each device uses.
 """
 import hashlib
+import http.client
 import ipaddress
 import json
 import math
@@ -29,10 +42,13 @@ import re
 import select
 import shutil
 import socket
+import ssl
 import stat
 import struct
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 import urllib.parse
 
@@ -71,9 +87,34 @@ ACTIVE_NEIGH_STATES = {"REACHABLE", "DELAY", "PROBE", "PERMANENT", "NOARP"}
 DEFAULT_DOMAINS = ("home.arpa", "fritz.box", "speedport.ip", "localdomain", "local", "lan", "home", "internal")
 WEB_SERVICE_TYPES = {"_http._tcp": "http", "_https._tcp": "https"}
 ADMIN_URL_SERVICE_TYPES = {"_ipp._tcp", "_ipps._tcp", "_printer._tcp", "_pdl-datastream._tcp", "_uscan._tcp"}
-COMMANDS = {"rescan", "open", "closed", "trust", "untrust"}
+COMMANDS = {"rescan", "open", "closed", "trust", "untrust", "known_all", "fritz_logout"}
+JSON_COMMANDS = {"rename", "pin", "hide", "known", "alerts", "view", "fritz_login"}
+MAX_COMMAND_BYTES = 1024
+VIEW_MODES = ("list", "platform", "type", "ap")
+GROUP_ID_RE = re.compile(r"^([a-z]{2,12}|([0-9a-f]{2}:){5}[0-9a-f]{2})$")
+MAX_COLLAPSED = 32
+FRITZ_FILE = "fritzbox.json"
+FRITZ_USER_RE = re.compile(r"^[A-Za-z0-9._@-]{0,64}$")
+FRITZ_PASSWORD_MAX = 128
+FRITZ_DESC_PORT = 49000
+FRITZ_TLS_PORT = 49443
+FRITZ_TIMEOUT = 4.0
+FRITZ_POLL_OPEN = 30.0
+FRITZ_POLL_CLOSED = 300.0
+FRITZ_RETRY_ERROR = 120.0
+FRITZ_MAX_SOAP = 65536
+FRITZ_MAX_MESH = 2 * 1048576
+FRITZ_MAX_NODES = 512
+MESH_PATH_RE = re.compile(r"^/meshlist\.lua\?sid=[0-9a-f]{16}$")
 TRUST_FILE = "trusted-networks.json"
 MAX_TRUSTED = 64
+DEVICES_FILE = "devices.json"
+MAX_STORE_BYTES = 262144
+MAX_STORE_NETWORKS = 32
+MAX_STORE_DEVICES = 512  # per network
+NAME_MAX = 40
+BASELINE_SECONDS = 600   # devices first seen this soon after tracking starts are not "new"
+ALERT_MAX_NAMES = 3
 
 UUID_RE = re.compile(
     r"^[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}$",
@@ -842,7 +883,8 @@ def parse_mdns_lines(lines, iface, subnet_net):
                 del entry["names"][MDNS_MAX_NAMES:]
         if not entry["model"]:
             for key in ("md", "model", "am", "modelid", "device type"):
-                if txt.get(key):
+                # Some services put flags such as "0,1,2" here; a model name has letters.
+                if re.search(r"[A-Za-z]{2}", txt.get(key, "")):
                     entry["model"] = clean(txt[key], 48)
                     break
         if not entry["mac"]:
@@ -955,22 +997,56 @@ def config_dir():
     return os.path.join(base, "ubruckhaus-wlan-monitor")
 
 
-def load_trusted():
-    """Read the trusted network list; refuses symlinks, foreign or oversized files."""
-    path = os.path.join(config_dir(), TRUST_FILE)
+def load_private_json(filename, max_bytes=65536):
+    """Read a JSON file from the config directory; refuses symlinks, foreign or oversized files."""
+    path = os.path.join(config_dir(), filename)
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     except OSError:
-        return []
+        return None
     try:
         info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_size > 65536:
-            return []
-        data = json.loads(os.read(fd, 65536).decode("utf-8", "replace"))
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_size > max_bytes:
+            return None
+        return json.loads(os.read(fd, max_bytes).decode("utf-8", "replace"))
     except (OSError, ValueError):
-        return []
+        return None
     finally:
         os.close(fd)
+
+
+def save_private_json(filename, data):
+    """Atomically write a JSON file into the private (0700) config directory as 0600."""
+    directory = config_dir()
+    tmp = None
+    try:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        info = os.lstat(directory)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            return False
+        if info.st_mode & 0o077:
+            os.chmod(directory, 0o700)
+        # Exclusive, unpredictable temp file, private before anything is written (credentials too).
+        fd, tmp = tempfile.mkstemp(prefix=f".{filename}.", suffix=".tmp", dir=directory)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, os.path.join(directory, filename))
+        return True
+    except OSError:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        return False
+
+
+def load_trusted():
+    """Read the trusted network list, keeping only well-formed entries."""
+    data = load_private_json(TRUST_FILE)
     networks = []
     items = data.get("networks") if isinstance(data, dict) else None
     for item in items if isinstance(items, list) else []:
@@ -984,29 +1060,7 @@ def load_trusted():
 
 
 def save_trusted(networks):
-    """Atomically write the trusted network list into a private (0700) config directory."""
-    directory = config_dir()
-    tmp = None
-    try:
-        os.makedirs(directory, mode=0o700, exist_ok=True)
-        info = os.lstat(directory)
-        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
-            return False
-        if info.st_mode & 0o077:
-            os.chmod(directory, 0o700)
-        tmp = os.path.join(directory, f".{TRUST_FILE}.{os.getpid()}.{random.randrange(1 << 30)}.tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump({"networks": networks[:MAX_TRUSTED]}, handle, indent=2)
-        os.replace(tmp, os.path.join(directory, TRUST_FILE))
-        return True
-    except OSError:
-        if tmp:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-        return False
+    return save_private_json(TRUST_FILE, {"networks": networks[:MAX_TRUSTED]})
 
 
 def is_trusted(identity, trusted):
@@ -1023,30 +1077,246 @@ def same_network(old, new):
     return all(not (old[key] and new[key] and old[key] != new[key]) for key in ("ssid", "gateway_mac"))
 
 
+def clean_name(value):
+    """A user-chosen device name: plain printable text, single spaces, at most NAME_MAX chars."""
+    if not isinstance(value, str):
+        return ""
+    return re.sub(r"\s+", " ", clean(value, 200))[:NAME_MAX].strip()
+
+
 def parse_command(line):
-    command = line.strip().lower()
-    return command if command in COMMANDS else ""
+    """A plain command word, a validated per-device command dict, or "" when invalid."""
+    text = line.strip()
+    if not text.startswith("{"):
+        command = text.lower()
+        return command if command in COMMANDS else ""
+    if len(text) > MAX_COMMAND_BYTES:
+        return ""
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return ""
+    if not isinstance(data, dict) or data.get("cmd") not in JSON_COMMANDS:
+        return ""
+    cmd = data["cmd"]
+    if cmd == "alerts":
+        return {"cmd": cmd, "on": data.get("on") is True}
+    if cmd == "view":
+        mode = data.get("mode")
+        collapsed = data.get("collapsed")
+        if mode not in VIEW_MODES or not isinstance(collapsed, list):
+            return ""
+        ids = [g for g in collapsed if isinstance(g, str) and GROUP_ID_RE.match(g)]
+        return {"cmd": cmd, "mode": mode, "collapsed": list(dict.fromkeys(ids))[:MAX_COLLAPSED]}
+    if cmd == "fritz_login":
+        user, password = data.get("user", ""), data.get("password")
+        if not isinstance(user, str) or not FRITZ_USER_RE.match(user):
+            return ""
+        if not isinstance(password, str) or not 0 < len(password) <= FRITZ_PASSWORD_MAX or not password.isprintable():
+            return ""
+        return {"cmd": cmd, "user": user, "password": password}
+    mac = data.get("mac")
+    if not isinstance(mac, str) or not MAC_RE.match(mac):
+        return ""
+    if cmd == "rename":
+        return {"cmd": cmd, "mac": mac.lower(), "name": clean_name(data.get("name", ""))}
+    return {"cmd": cmd, "mac": mac.lower(), "on": data.get("on") is True}
+
+
+# --- Per-network device store (names, pins, hidden, seen devices) ------------------
+
+def network_key(identity):
+    mac = identity.get("gateway_mac", "")
+    return f"{mac}|{identity.get('ssid', '')}" if mac else ""
+
+
+def load_store():
+    """Read devices.json, keeping only well-formed networks and device records (bounded)."""
+    data = load_private_json(DEVICES_FILE, MAX_STORE_BYTES)
+    store = {"alerts": True, "view": {"mode": "list", "collapsed": []}, "networks": {}}
+    if not isinstance(data, dict):
+        return store
+    store["alerts"] = data.get("alerts", True) is not False
+    view = data.get("view")
+    if isinstance(view, dict) and view.get("mode") in VIEW_MODES:
+        collapsed = view.get("collapsed") if isinstance(view.get("collapsed"), list) else []
+        store["view"] = {
+            "mode": view["mode"],
+            "collapsed": [g for g in collapsed if isinstance(g, str) and GROUP_ID_RE.match(g)][:MAX_COLLAPSED],
+        }
+    networks = data.get("networks")
+    for key, net in list(networks.items() if isinstance(networks, dict) else [])[:MAX_STORE_NETWORKS]:
+        if not isinstance(key, str) or not isinstance(net, dict) or "|" not in key:
+            continue
+        mac, ssid = key.split("|", 1)
+        if not MAC_RE.match(mac) or ssid != clean(ssid, 64):
+            continue
+        since = net.get("since")
+        entry = {"since": since if isinstance(since, (int, float)) and not isinstance(since, bool) else None, "devices": {}}
+        devices = net.get("devices")
+        for dev_mac, rec in list(devices.items() if isinstance(devices, dict) else [])[:MAX_STORE_DEVICES]:
+            if not isinstance(dev_mac, str) or not MAC_RE.match(dev_mac) or not isinstance(rec, dict):
+                continue
+            first = rec.get("first")
+            entry["devices"][dev_mac.lower()] = {
+                "name": clean_name(rec.get("name", "")),
+                "pinned": rec.get("pinned") is True,
+                "hidden": rec.get("hidden") is True,
+                "new": rec.get("new") is True,
+                "first": first if isinstance(first, (int, float)) and not isinstance(first, bool) else 0,
+            }
+        store["networks"][mac.lower() + "|" + ssid] = entry
+    return store
+
+
+def save_store(store):
+    return save_private_json(DEVICES_FILE, store)
+
+
+def store_network(store, key, create=True):
+    """The store entry for one network, created on demand (oldest network dropped when full)."""
+    nets = store["networks"]
+    if key not in nets:
+        if not create:
+            return None
+        while len(nets) >= MAX_STORE_NETWORKS:
+            oldest = min(nets, key=lambda k: nets[k].get("since") or 0)
+            del nets[oldest]
+        nets[key] = {"since": None, "devices": {}}
+    return nets[key]
+
+
+def store_device(net, mac, now_wall):
+    """The record for one device, created on demand; evicts the oldest plain records when full."""
+    devices = net["devices"]
+    if mac not in devices:
+        if len(devices) >= MAX_STORE_DEVICES:
+            plain = [m for m, r in devices.items() if not (r["name"] or r["pinned"] or r["hidden"])]
+            victims = sorted(plain or devices, key=lambda m: devices[m]["first"])
+            for victim in victims[: len(devices) - MAX_STORE_DEVICES + 1]:
+                del devices[victim]
+        devices[mac] = {"name": "", "pinned": False, "hidden": False, "new": False, "first": now_wall}
+    return devices[mac]
+
+
+def notify_new_devices(ssid, names):
+    """Desktop notification for devices that joined a trusted network (fixed argv, no shell)."""
+    if not names or not shutil.which("notify-send"):
+        return
+    shown = names[:ALERT_MAX_NAMES]
+    more = len(names) - len(shown)
+    body = ", ".join(shown) + (f" and {more} more" if more > 0 else "")
+    title = "New device on " + (clean(ssid, 40) or "your network") if len(names) == 1 else f"{len(names)} new devices on " + (clean(ssid, 40) or "your network")
+    run_cmd(["notify-send", "-a", "WLAN Monitor", "-i", "network-wireless", "--", title, clean(body, 200)], timeout=2)
 
 
 # --- Device Discovery & Merging -----------------------------------------------
+
+KIND_LABELS = {
+    "router": "Router", "computer": "Computer", "laptop": "Laptop", "phone": "Phone",
+    "tablet": "Tablet", "watch": "Watch", "tv": "TV", "speaker": "Speaker",
+    "printer": "Printer", "console": "Game console", "camera": "Camera", "light": "Lighting",
+    "nas": "Storage / server", "appliance": "Appliance", "smarthome": "Smart-home device",
+    "unknown": "Device",
+}
+# Checked in order against the device's name, hostname and model.
+KIND_NAME_RULES = (
+    ("router", r"repeater|fritz!?box|fritz!?repeater|mesh|access ?point|router"),
+    ("phone", r"iphone|android|galaxy|pixel|smartphone|handy|phone"),
+    ("tablet", r"ipad|tablet|kindle|fire ?hd"),
+    ("watch", r"watch"),
+    ("laptop", r"macbook|laptop|notebook|thinkpad|surface|chromebook"),
+    ("computer", r"imac|mac ?mini|mac ?studio|mac ?pro|desktop|\bpc\b|workstation|omarchy|raspberry"),
+    ("tv", r"\btv\b|webos|bravia|fire ?tv|chromecast|roku|television|tizen|android ?tv|shield"),
+    ("speaker", r"soundbar|speaker|sonos|homepod|\becho\b|alexa|ambeo|\bbose\b|nest (audio|mini)|google home"),
+    ("printer", r"printer|drucker|laserjet|officejet|deskjet|\bepson|\bbrother|\bcanon|\bhl-|\bmfc-"),
+    ("console", r"playstation|\bps[345]\b|xbox|nintendo"),
+    ("camera", r"camera|\bcam\b|doorbell|reolink|eufy|arlo|hikvision"),
+    ("light", r"\bhue\b|tradfri|nanoleaf|\bwiz\b|lamp|light|bulb"),
+    ("nas", r"\bnas\b|synology|diskstation|qnap|truenas|unraid|server"),
+    ("appliance", r"coffee|kaffee|espresso|\bep\d{4}|washer|dryer|dishwasher|fridge|oven|vacuum|roborock|roomba|stove|ofen"),
+)
+KIND_SERVICE_RULES = (
+    ("printer", {"_ipp._tcp", "_ipps._tcp", "_printer._tcp", "_pdl-datastream._tcp", "_uscan._tcp", "_scanner._tcp"}),
+    ("light", {"_hue._tcp"}),
+    ("tv", {"_googlecast._tcp", "_androidtvremote2._tcp", "_lgwebos._tcp"}),
+    ("speaker", {"_spotify-connect._tcp", "_raop._tcp", "_sonos._tcp", "_airplay._tcp"}),
+    ("smarthome", {"_hap._tcp", "_matter._tcp", "_matterc._udp", "_esphomelib._tcp", "_shelly._tcp", "_miio._udp"}),
+    ("nas", {"_smb._tcp", "_afpovertcp._tcp", "_adisk._tcp", "_nfs._tcp"}),
+    ("computer", {"_workstation._tcp", "_ssh._tcp", "_sftp-ssh._tcp"}),
+)
+KIND_VENDOR_RULES = (
+    ("smarthome", r"espressif|tuya|shelly|allterco|microchip|silicon lab|itead|sonoff|meross|particle|texas instruments|nordic|beken|bouffalo"),
+    ("light", r"signify|philips hue|lumi united|nanoleaf"),
+    ("speaker", r"sonos|sennheiser|sonova|bose|harman|denon|yamaha|bang|bluesound"),
+    ("console", r"nintendo|sony interactive"),
+    ("printer", r"brother|epson|canon|hewlett|hp inc|kyocera|lexmark|xerox"),
+    ("nas", r"synology|qnap|western digital"),
+    ("appliance", r"versuni|miele|bsh|irobot|roborock|dreame|ecovacs"),
+    ("router", r"\bavm\b|fritz|ubiquiti|netgear|linksys|ruckus|eero|zyxel|mikrotik"),
+    ("computer", r"raspberry|intel|foxconn|mediatek|liteon|azurewave|framework"),
+)
+
+
+def device_kind(name, hostname, model, vendor, services, is_gateway=False, is_self=False):
+    """Guess what kind of device this is (for the icon and vendor-only names)."""
+    if is_gateway:
+        return "router"
+    if is_self:
+        return "computer"
+    text = " ".join((name or "", hostname or "", model or "")).lower().replace("_", " ").replace("-", " ")
+    for kind, pattern in KIND_NAME_RULES:
+        if re.search(pattern, text):
+            return kind
+    found = set(services or [])
+    for kind, types in KIND_SERVICE_RULES:
+        if found & types:
+            return kind
+    vendor_text = (vendor or "").lower()
+    for kind, pattern in KIND_VENDOR_RULES:
+        if re.search(pattern, vendor_text):
+            return kind
+    return "unknown"
+
+
+def tidy_name(name):
+    """Make machine-style names readable: `PHILIPS_EP8757_20_392985` -> `Philips EP8757`,
+    `MacBook-Pro-von-Uwe` -> `MacBook Pro von Uwe`, `Hue Bridge - C9B46D` -> `Hue Bridge`."""
+    text = re.sub(r"\s+-\s+[0-9A-Fa-f]{6}$", "", name or "").strip()
+    if " " in text or IP_DASH_RE.match(text) or BARE_MAC_RE.match(text):
+        return text or name
+    if "_" in text:
+        tokens = [t for t in text.split("_") if t]
+        kept = [t for t in tokens if not (t.isdigit() or (len(t) >= 6 and re.fullmatch(r"[0-9A-Fa-f]+", t) and re.search(r"\d", t)))]
+        kept = [t.title() if t.isalpha() and t.isupper() and len(t) > 3 else t for t in kept]
+        return " ".join(kept) or text
+    if "-" in text and re.search(r"[A-Za-z]{2}", text):
+        tokens = [t for t in text.split("-") if t]
+        if len(tokens) > 1 and re.fullmatch(r"[0-9A-F]{6}", tokens[-1]) and re.search(r"\d", tokens[-1]):
+            tokens.pop()  # serial suffix such as SwitchBot-HubMiniMatter-47DBEC
+        return " ".join(tokens)
+    return text
+
 
 def choose_device_name(ip, is_self, is_gateway, dns_name, mdns_info, vendor):
     """Pick the clearest display name for a device on the WLAN."""
     if is_self:
         return clean(socket.gethostname(), 48) or "This PC"
+    if is_gateway:
+        return "Router"
     if mdns_info:
         for candidate in mdns_info.get("names", []):
             if candidate and not UUID_RE.match(candidate) and not BARE_MAC_RE.match(candidate):
-                return candidate
+                return tidy_name(candidate)
         host = mdns_info.get("host", "")
         if host and not BARE_MAC_RE.match(host):
-            return host
+            return tidy_name(host)
     if dns_name and not BARE_MAC_RE.match(dns_name):
-        return dns_name
-    if is_gateway:
-        return dns_name or "Router / Gateway"
+        return tidy_name(dns_name)
     if vendor and vendor != "Private MAC":
-        return f"{vendor} device"
+        kind = device_kind("", "", mdns_info.get("model", "") if mdns_info else "", vendor,
+                           mdns_info.get("services", []) if mdns_info else [])
+        return f"{KIND_LABELS[kind]} ({vendor})" if kind != "unknown" else f"{vendor} device"
     if dns_name:
         return dns_name
     return ip
@@ -1057,9 +1327,470 @@ def devices_revision(devices):
     return hashlib.sha1(json.dumps(devices, sort_keys=True).encode()).hexdigest()[:12]
 
 
+APPLE_SERVICES = {"_companion-link._tcp", "_apple-mobdev2._tcp", "_rdlink._tcp", "_sleep-proxy._udp", "_apple-pairable._tcp"}
+ANDROID_SERVICES = {"_adb-tls-connect._tcp", "_adb-tls-pairing._tcp"}
+ANDROID_NAME_RE = re.compile(r"android|galaxy|pixel|oneplus|xiaomi|redmi|huawei|\boppo|motorola|\bsm-[a-z]\d", re.I)
+ANDROID_VENDOR_RE = re.compile(r"samsung|google|xiaomi|huawei|oneplus|oppo|vivo|motorola|realme|nothing tech", re.I)
+APPLE_NAME_RE = re.compile(r"^(iphone|ipad|macbook|imac|mac|apple|homepod|airport|watch)\b|apple ?tv|\bmacbook|\biphone|\bipad", re.I)
+KIND_GROUPS = {
+    "router": "network", "phone": "mobile", "tablet": "mobile", "watch": "mobile",
+    "computer": "computers", "laptop": "computers", "tv": "media", "speaker": "media",
+    "console": "media", "smarthome": "smarthome", "light": "smarthome", "appliance": "smarthome",
+    "camera": "smarthome", "printer": "office", "nas": "office",
+}
+
+
+def device_group(kind, vendor, name, hostname, services):
+    """Platform group for the grouped view: apple, android, then by type (mobile, computers, ...)."""
+    if kind == "router":
+        return "network"
+    found = set(services or [])
+    text = f"{name or ''} {hostname or ''}"
+    if vendor == "Apple" or found & APPLE_SERVICES or APPLE_NAME_RE.search(text):
+        return "apple"
+    if found & ANDROID_SERVICES or ANDROID_NAME_RE.search(text) or (
+            ANDROID_VENDOR_RE.search(vendor or "") and kind in ("phone", "tablet", "watch", "unknown")):
+        return "android"
+    return KIND_GROUPS.get(kind, "other")
+
+
+def generic_name(name, ip, vendor):
+    """True for names that only say what the device is made of (vendor fallback or bare IP)."""
+    return not name or name == ip or name.endswith(" device") or bool(vendor and name.endswith(f"({vendor})"))
+
+
+def bssid_owner(bssid, devices):
+    """The router or mesh node whose MAC shares the middle four bytes with the Wi-Fi BSSID.
+
+    Access points derive their BSSIDs from the device MAC (first byte with the local bit,
+    last byte counting up), so this finds which node this PC is connected to without login.
+    """
+    if not bssid or not MAC_RE.match(bssid):
+        return None
+    middle = bssid.lower().split(":")[1:5]
+    for dev in devices:
+        mac = (dev.get("mac") or "").lower()
+        if MAC_RE.match(mac) and (dev.get("is_gateway") or dev.get("kind") == "router") and mac.split(":")[1:5] == middle:
+            return dev
+    return None
+
+
+# --- FRITZ!Box TR-064 (optional mesh details) ----------------------------------------
+
+def is_fritz_vendor(vendor):
+    return bool(re.search(r"fritz|\bavm\b", vendor or "", re.I))
+
+
+def bounded_http(ip, port, method, path, body=None, headers=None, tls=False, pin=None,
+                 max_body=FRITZ_MAX_SOAP, timeout=FRITZ_TIMEOUT):
+    """One HTTP(S) request to the router with an overall deadline and a body size cap.
+
+    Returns (status, headers, body_bytes, cert_sha256). With `pin`, the TLS certificate
+    must match it before anything is sent (FRITZ!Box certificates are self-signed).
+    """
+    if tls:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE  # self-signed; pinned below instead
+        conn = http.client.HTTPSConnection(ip, port, timeout=timeout, context=ctx)
+    else:
+        conn = http.client.HTTPConnection(ip, port, timeout=timeout)
+    expired = threading.Event()
+
+    def cut():
+        expired.set()
+        sock = conn.sock
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+    watchdog = threading.Timer(timeout, cut)
+    watchdog.daemon = True
+    watchdog.start()
+    try:
+        conn.connect()
+        cert = ""
+        if tls:
+            cert = hashlib.sha256(conn.sock.getpeercert(binary_form=True) or b"").hexdigest()
+            if pin is not None and cert != pin:
+                raise PermissionError("certificate changed")
+        conn.request(method, path, body=body, headers=headers or {})
+        resp = conn.getresponse()
+        length = resp.getheader("Content-Length")
+        if length is not None and (not length.strip().isdigit() or int(length) > max_body):
+            raise OSError("reply too large")
+        chunks, size = [], 0
+        while size <= max_body:
+            chunk = resp.read1(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+        if size > max_body:
+            raise OSError("reply too large")
+        if expired.is_set():
+            raise OSError("timed out")
+        return resp.status, {k.lower(): v for k, v in resp.getheaders()}, b"".join(chunks), cert
+    finally:
+        watchdog.cancel()
+        conn.close()
+
+
+def fritz_model(ip):
+    """Model name from the unauthenticated TR-064 description, e.g. "FRITZ!Box 5690 Pro"."""
+    try:
+        status, _, body, _ = bounded_http(ip, FRITZ_DESC_PORT, "GET", "/tr64desc.xml", timeout=2.0)
+    except (OSError, http.client.HTTPException, ValueError):
+        return ""
+    if status != 200:
+        return ""
+    match = re.search(r"<modelName>([^<]{1,60})</modelName>", body.decode("utf-8", "replace"))
+    model = clean(match.group(1), 48) if match else ""
+    return model if is_fritz_vendor(model) else ""
+
+
+def parse_digest_challenge(header):
+    if not header or not header.lower().startswith("digest "):
+        return None
+    fields = dict(re.findall(r'(\w+)="?([^",]*)"?', header[7:]))
+    if not fields.get("nonce") or not fields.get("realm"):
+        return None
+    return fields
+
+
+def digest_authorization(user, password, method, uri, challenge, cnonce, nc=1):
+    """RFC 2617 Digest (MD5, qop=auth) as used by TR-064."""
+    def md5(text):
+        return hashlib.md5(text.encode("utf-8")).hexdigest()
+    realm, nonce = challenge["realm"], challenge["nonce"]
+    ha1 = md5(f"{user}:{realm}:{password}")
+    ha2 = md5(f"{method}:{uri}")
+    nc_text = f"{nc:08x}"
+    if "auth" in challenge.get("qop", ""):
+        response = md5(f"{ha1}:{nonce}:{nc_text}:{cnonce}:auth:{ha2}")
+        extra = f', qop=auth, nc={nc_text}, cnonce="{cnonce}"'
+    else:
+        response = md5(f"{ha1}:{nonce}:{ha2}")
+        extra = ""
+    opaque = f', opaque="{challenge["opaque"]}"' if challenge.get("opaque") else ""
+    return (f'Digest username="{user}", realm="{realm}", nonce="{nonce}", uri="{uri}", '
+            f'response="{response}", algorithm=MD5{extra}{opaque}')
+
+
+class FritzError(Exception):
+    """A user-facing reason the FRITZ!Box could not be read."""
+
+
+def fritz_soap(ip, user, password, pin, service, control, action):
+    """Call one TR-064 action with Digest auth over pinned HTTPS; returns (body_text, cert)."""
+    envelope = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<s:Envelope s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/" '
+        'xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body>'
+        f'<u:{action} xmlns:u="{service}"></u:{action}></s:Body></s:Envelope>'
+    ).encode()
+    headers = {"Content-Type": 'text/xml; charset="utf-8"', "SOAPAction": f'"{service}#{action}"'}
+    try:
+        status, hdrs, body, cert = bounded_http(ip, FRITZ_TLS_PORT, "POST", control, envelope, headers, tls=True, pin=pin)
+        if status == 401:
+            challenge = parse_digest_challenge(hdrs.get("www-authenticate", ""))
+            if not challenge:
+                raise FritzError("The FRITZ!Box asked for an unsupported login method.")
+            auth = dict(headers, Authorization=digest_authorization(
+                user, password, "POST", control, challenge, os.urandom(8).hex()))
+            status, hdrs, body, cert = bounded_http(ip, FRITZ_TLS_PORT, "POST", control, envelope, auth, tls=True, pin=cert)
+    except PermissionError:
+        raise FritzError("The FRITZ!Box certificate changed. Connect again to trust the new one.")
+    except ConnectionRefusedError:
+        raise FritzError("The FRITZ!Box does not accept app access. Turn on “Allow access for applications” "
+                         "under Home Network › Network › Network Settings.")
+    except (OSError, http.client.HTTPException, ValueError):
+        raise FritzError("The FRITZ!Box did not answer.")
+    text = body.decode("utf-8", "replace")
+    if status == 401:
+        raise FritzError("Wrong user name or password.")
+    if status != 200:
+        code = re.search(r"<errorCode>(\d{1,4})</errorCode>", text)
+        if code and code.group(1) == "606":
+            raise FritzError("This FRITZ!Box user may not read the home network. Give it the right “FRITZ!Box settings”.")
+        raise FritzError(f"The FRITZ!Box refused the request (error {code.group(1) if code else status}).")
+    return text, cert
+
+
+def fritz_band(iface_name):
+    name = (iface_name or "").upper()
+    for tag, band in (("6G", "6 GHz"), ("5G", "5 GHz"), ("2G", "2.4 GHz")):
+        if f":{tag}" in name:
+            return band
+    if name.startswith("LAN"):
+        return "LAN"
+    return ""
+
+
+def rcpi_dbm(value):
+    """Link signal: newer FRITZ!OS reports dBm directly, older ones RCPI (0..220); 255 = unknown."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    if -110 <= value < 0:
+        return round(value)
+    if 0 < value <= 220:
+        return round(value / 2 - 110)
+    return None
+
+
+def parse_mesh(data):
+    """Mesh list JSON -> ({mac: info}, [access points]); bounded and defensive.
+
+    info: {"box_name", "via", "via_mac", "band", "rate_mbps", "signal_dbm", "role"}.
+    """
+    nodes = data.get("nodes") if isinstance(data, dict) else None
+    if not isinstance(nodes, list):
+        return {}, []
+    by_uid, iface_owner = {}, {}
+    for node in nodes[:FRITZ_MAX_NODES]:
+        if not isinstance(node, dict) or not isinstance(node.get("uid"), str):
+            continue
+        by_uid[node["uid"]] = node
+        for iface in node.get("node_interfaces") or []:
+            if isinstance(iface, dict) and isinstance(iface.get("uid"), str):
+                iface_owner[iface["uid"]] = (node["uid"], iface)
+
+    def is_ap(node):
+        return node.get("mesh_role") in ("master", "slave")
+
+    def node_name(node):
+        return clean(node.get("device_friendly_name") or node.get("device_name"), 48)
+
+    def node_mac(node):
+        mac = str(node.get("device_mac_address") or "").lower()
+        return mac if MAC_RE.match(mac) else ""
+
+    info = {}
+    aps = []
+    for uid, node in by_uid.items():
+        mac = node_mac(node)
+        if not mac:
+            continue
+        entry = {"box_name": node_name(node), "via": "", "via_mac": "", "band": "",
+                 "rate_mbps": None, "signal_dbm": None, "role": node.get("mesh_role") if is_ap(node) else "client"}
+        best = None
+        for iface in node.get("node_interfaces") or []:
+            if not isinstance(iface, dict):
+                continue
+            for link in iface.get("node_links") or []:
+                if not isinstance(link, dict) or link.get("state") != "CONNECTED":
+                    continue
+                if link.get("node_1_uid") == uid:
+                    other_uid, other_iface_uid = link.get("node_2_uid"), link.get("node_interface_2_uid")
+                else:
+                    other_uid, other_iface_uid = link.get("node_1_uid"), link.get("node_interface_1_uid")
+                other = by_uid.get(other_uid)
+                if not other or not is_ap(other):
+                    continue
+                # A repeater's uplink goes to the master; a client's link to any access point.
+                if entry["role"] == "master" or (entry["role"] == "slave" and other.get("mesh_role") != "master"):
+                    continue
+                _, other_iface = iface_owner.get(other_iface_uid, (None, {}))
+                band = fritz_band(other_iface.get("name")) or ("LAN" if iface.get("type") == "LAN" else "")
+                rates = [r for r in (link.get("cur_data_rate_rx"), link.get("cur_data_rate_tx"))
+                         if isinstance(r, (int, float)) and 0 < r < 100000000]
+                candidate = {
+                    "via": node_name(other), "via_mac": node_mac(other), "band": band,
+                    "rate_mbps": round(max(rates) / 1000) if rates else None,
+                    "signal_dbm": rcpi_dbm(link.get("rx_rcpi")),
+                }
+                if best is None or (candidate["rate_mbps"] or 0) > (best["rate_mbps"] or 0):
+                    best = candidate
+        if best:
+            entry.update(best)
+        if entry["role"] == "client" and not best:
+            continue  # known to the box but not connected now
+        info[mac] = entry
+        if is_ap(node):
+            aps.append({"mac": mac, "name": entry["box_name"], "role": entry["role"], "via": entry["via"],
+                        "via_mac": entry["via_mac"],
+                        "band": entry["band"], "model": clean(node.get("device_model"), 48)})
+    counts = {}
+    for entry in info.values():
+        if entry["role"] == "client" and entry["via_mac"]:
+            counts[entry["via_mac"]] = counts.get(entry["via_mac"], 0) + 1
+    for ap in aps:
+        ap["clients"] = counts.get(ap["mac"], 0)
+    aps.sort(key=lambda ap: (ap["role"] != "master", ap["name"].lower()))
+    return info, aps
+
+
+def load_fritz():
+    data = load_private_json(FRITZ_FILE, 4096)
+    if not isinstance(data, dict):
+        return None
+    mac, user, password, pin = (data.get(k) for k in ("gateway_mac", "user", "password", "pin"))
+    if not (isinstance(mac, str) and MAC_RE.match(mac) and isinstance(user, str) and FRITZ_USER_RE.match(user)
+            and isinstance(password, str) and 0 < len(password) <= FRITZ_PASSWORD_MAX
+            and isinstance(pin, str) and re.fullmatch(r"[0-9a-f]{64}", pin)):
+        return None
+    return {"gateway_mac": mac.lower(), "user": user, "password": password, "pin": pin}
+
+
+def remove_fritz():
+    try:
+        os.unlink(os.path.join(config_dir(), FRITZ_FILE))
+    except OSError:
+        pass
+
+
+class FritzMesh:
+    """Background reader for the FRITZ!Box: model name always, mesh list only after login."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.wake = threading.Event()
+        self.creds = load_fritz()
+        self.network = (None, "", False)  # (gateway ip, gateway mac, looks like a FRITZ!Box)
+        self.panel_open = False
+        self.model = ""
+        self.model_for = None
+        self.state = "off"
+        self.message = ""
+        self.clients = {}
+        self.aps = []
+        self.updated = 0.0
+        self.pending_login = None
+        self.thread = None
+
+    def start(self):
+        self.thread = threading.Thread(target=self.worker, daemon=True)
+        self.thread.start()
+
+    def set_network(self, ip, mac, is_fritz, panel_open):
+        # Only a private gateway address is ever contacted.
+        try:
+            if not ip or not ipaddress.IPv4Address(ip).is_private:
+                ip = None
+        except ValueError:
+            ip = None
+        with self.lock:
+            if (ip, mac) != self.network[:2]:
+                self.clients, self.aps, self.updated = {}, [], 0.0
+                self.state, self.message = "off", ""
+            self.network = (ip, mac, is_fritz)
+            wake = panel_open and not self.panel_open
+            self.panel_open = panel_open
+        if wake:
+            self.wake.set()
+
+    def login(self, user, password):
+        with self.lock:
+            self.pending_login = (user, password)
+            self.state, self.message = "connecting", "Connecting to the FRITZ!Box…"
+        self.wake.set()
+
+    def logout(self):
+        with self.lock:
+            self.creds = None
+            self.pending_login = None
+            self.clients, self.aps, self.updated = {}, [], 0.0
+            self.state, self.message = "off", ""
+        remove_fritz()
+
+    def snapshot(self):
+        with self.lock:
+            ip, mac, is_fritz = self.network
+            bound = bool(self.creds and self.creds["gateway_mac"] == mac)
+            return {
+                "available": bool(is_fritz or self.model),
+                "model": self.model if self.model_for == (ip, mac) else "",
+                "state": self.state if (bound or self.state in ("connecting", "error")) else "off",
+                "message": self.message,
+                "user": self.creds["user"] if bound else "",
+                "aps": list(self.aps),
+                "updated": int(self.updated),
+            }, dict(self.clients)
+
+    def refresh(self, ip, creds):
+        text, _ = fritz_soap(ip, creds["user"], creds["password"], creds["pin"],
+                             "urn:dslforum-org:service:Hosts:1", "/upnp/control/hosts", "X_AVM-DE_GetMeshListPath")
+        match = re.search(r"<NewX_AVM-DE_MeshListPath>([^<]{1,200})</NewX_AVM-DE_MeshListPath>", text)
+        path = match.group(1).replace("&amp;", "&") if match else ""
+        if not MESH_PATH_RE.match(path):
+            raise FritzError("The FRITZ!Box sent no mesh list.")
+        try:
+            status, _, body, _ = bounded_http(ip, FRITZ_TLS_PORT, "GET", path, tls=True, pin=creds["pin"],
+                                              max_body=FRITZ_MAX_MESH)
+            data = json.loads(body.decode("utf-8", "replace")) if status == 200 else None
+        except PermissionError:
+            raise FritzError("The FRITZ!Box certificate changed. Connect again to trust the new one.")
+        except (OSError, http.client.HTTPException, ValueError):
+            raise FritzError("The FRITZ!Box mesh list could not be read.")
+        clients, aps = parse_mesh(data)
+        if not clients:
+            raise FritzError("The FRITZ!Box mesh list was empty.")
+        return clients, aps
+
+    def step(self):
+        """One unit of work; returns seconds until the next one is due."""
+        with self.lock:
+            ip, mac, is_fritz = self.network
+            pending, self.pending_login = self.pending_login, None
+            creds = self.creds
+            interval = FRITZ_POLL_OPEN if self.panel_open else FRITZ_POLL_CLOSED
+            age = time.time() - self.updated
+            state = self.state
+        if not ip or not mac:
+            return 5.0
+        if is_fritz and self.model_for != (ip, mac):
+            model = fritz_model(ip)
+            with self.lock:
+                self.model, self.model_for = model, (ip, mac)
+        if pending:
+            try:
+                # Trust on first use: remember the certificate seen while the user logs in.
+                _, cert = fritz_soap(ip, pending[0], pending[1], None, "urn:dslforum-org:service:Hosts:1",
+                                     "/upnp/control/hosts", "X_AVM-DE_GetMeshListPath")
+                creds = {"gateway_mac": mac, "user": pending[0], "password": pending[1], "pin": cert}
+                clients, aps = self.refresh(ip, creds)
+            except FritzError as exc:
+                with self.lock:
+                    self.state, self.message = "error", str(exc)
+                return 5.0
+            save_private_json(FRITZ_FILE, creds)
+            with self.lock:
+                self.creds = creds
+                self.clients, self.aps, self.updated = clients, aps, time.time()
+                self.state, self.message = "connected", ""
+            return interval
+        if not creds or creds["gateway_mac"] != mac:
+            return 5.0
+        due = interval if state != "error" else FRITZ_RETRY_ERROR
+        if age < due:
+            return min(5.0, due - age)
+        try:
+            clients, aps = self.refresh(ip, creds)
+        except FritzError as exc:
+            with self.lock:
+                self.state, self.message, self.updated = "error", str(exc), time.time()
+            return 5.0
+        with self.lock:
+            self.clients, self.aps, self.updated = clients, aps, time.time()
+            self.state, self.message = "connected", ""
+        return interval
+
+    def worker(self):
+        while True:
+            try:
+                wait = self.step()
+            except Exception:  # never let the reader thread die
+                wait = 30.0
+            self.wake.wait(max(0.5, wait))
+            self.wake.clear()
+
+
 class Monitor:
     def __init__(self):
         self.trusted = load_trusted()
+        self.store = load_store()
+        self.fritz = FritzMesh()
         self.panel_open = False
         self.force_next = False
         self.iface_cache = {}
@@ -1088,6 +1819,26 @@ class Monitor:
     # -- commands from the bar widget --
     def handle(self, command):
         """Apply a stdin command; returns True when a fresh snapshot should be sent right away."""
+        if isinstance(command, dict):
+            if command["cmd"] == "view":
+                self.store["view"] = {"mode": command["mode"], "collapsed": command["collapsed"]}
+                save_store(self.store)
+                return True
+            if command["cmd"] == "fritz_login":
+                self.fritz.login(command["user"], command["password"])
+                return True
+            return self.handle_device(command)
+        if command == "fritz_logout":
+            self.fritz.logout()
+            return True
+        if command == "known_all":
+            net = self.store["networks"].get(network_key(self.trust_identity))
+            if not net:
+                return False
+            for rec in net["devices"].values():
+                rec["new"] = False
+            save_store(self.store)
+            return True
         if command == "open":
             self.panel_open = True
             return True
@@ -1112,6 +1863,66 @@ class Monitor:
             save_trusted(self.trusted)
             return True
         return False
+
+    def handle_device(self, command):
+        """Rename, pin, hide or acknowledge one device on the current network, or toggle alerts."""
+        if command["cmd"] == "alerts":
+            self.store["alerts"] = command["on"]
+            save_store(self.store)
+            return True
+        key = network_key(self.trust_identity)
+        # Only devices currently listed on this network can be changed.
+        if not key or command["mac"] not in {dev.get("mac") for dev in self.known.values()}:
+            return False
+        rec = store_device(store_network(self.store, key), command["mac"], time.time())
+        if command["cmd"] == "rename":
+            rec["name"] = command["name"]
+        elif command["cmd"] == "pin":
+            rec["pinned"] = command["on"]
+            if command["on"]:
+                rec["hidden"] = False
+        elif command["cmd"] == "hide":
+            rec["hidden"] = command["on"]
+            if command["on"]:
+                rec["pinned"] = False
+        elif command["cmd"] == "known":
+            rec["new"] = not command["on"]
+        save_store(self.store)
+        return True
+
+    def apply_store(self, devices, trusted, ssid):
+        """Overlay saved names / pins / hidden flags; on trusted networks remember MACs and flag new ones."""
+        key = network_key(self.trust_identity)
+        tracking = bool(trusted and key)
+        now_wall = time.time()
+        changed = False
+        net = store_network(self.store, key, create=tracking) if key else None
+        if tracking and net["since"] is None:
+            net["since"] = now_wall
+            changed = True
+        new_names = []
+        for dev in devices:
+            mac = dev["mac"] if MAC_RE.match(dev.get("mac") or "") else ""
+            rec = net["devices"].get(mac) if net and mac else None
+            if tracking and mac and rec is None and not dev["is_self"]:
+                rec = store_device(net, mac, now_wall)
+                if now_wall - net["since"] > BASELINE_SECONDS:
+                    rec["new"] = True
+                    new_names.append(dev["name"])
+                changed = True
+            dev["auto_name"] = dev["name"]
+            dev["custom_name"] = bool(rec and rec["name"])
+            if dev["custom_name"]:
+                dev["name"] = rec["name"]
+            dev["pinned"] = bool(rec and rec["pinned"])
+            dev["hidden"] = bool(rec and rec["hidden"])
+            dev["new"] = bool(rec and rec["new"])
+            dev["can_edit"] = bool(mac and key)
+        if changed:
+            save_store(self.store)
+        if new_names and self.store["alerts"]:
+            notify_new_devices(ssid, new_names)
+        return tracking
 
     def domains(self):
         found = list(DEFAULT_DOMAINS) + resolv_search_domains()
@@ -1204,6 +2015,9 @@ class Monitor:
             "gateway_mac": self.identity["gateway_mac"],
         }
         trusted = is_trusted(self.trust_identity, self.trusted)
+        gateway_vendor = lookup_vendor(self.identity["gateway_mac"])
+        self.fritz.set_network(gateway_ip, self.identity["gateway_mac"], is_fritz_vendor(gateway_vendor), self.panel_open)
+        fritz_info, mesh = self.fritz.snapshot()
 
         # Active scans only on trusted networks, unless the user explicitly asked for one.
         since_full = now - self.last_full_scan
@@ -1291,6 +2105,7 @@ class Monitor:
                 dns_name = self.hostname_for(ip, gateway_ip, now, allow_lookup=bool(neigh) or is_gateway)
                 dns_name = dns_name or prev.get("hostname") or ""
             model = mdns.get("model") or prev.get("model") or ""
+            real_model = model if model != wlan.get("ssid") else ""
             if is_gateway and wlan.get("ssid") and not model:
                 model = wlan["ssid"]
 
@@ -1311,8 +2126,25 @@ class Monitor:
                 state = "sleeping"
 
             name = choose_device_name(ip, is_self, is_gateway, dns_name, mdns, vendor)
+            mesh_entry = mesh.get(mac.lower()) if mac else None
+            box_name = mesh_entry["box_name"] if mesh_entry else ""
+            if box_name and not is_self and not is_gateway and generic_name(name, ip, vendor) \
+                    and not re.match(r"^PC(-\d{1,3}){4}$", box_name):
+                name = tidy_name(box_name)  # the name given in the FRITZ!Box
+            router_model = fritz_info["model"] or real_model
+            if is_gateway:
+                # The Wi-Fi name is what people see in their Wi-Fi settings (e.g. "FRITZ!Box 7690 ML"),
+                # even when the real model differs; the model stays in the details.
+                label = wlan.get("ssid") or router_model or vendor or dns_name
+                name = f"Router ({label})" if label else "Router"
             if not vendor and re.match(r"^(iPhone|iPad|MacBook|iMac|Mac|Apple|HomePod|AirPort)", name, re.I):
                 vendor = "Apple"
+            services = mdns.get("services", [])
+            kind = device_kind(name, dns_name or mdns.get("host", ""), model, vendor, services, is_gateway, is_self)
+            if mesh_entry and mesh_entry["role"] in ("master", "slave"):
+                kind = "router"
+            if is_gateway and router_model:
+                model = router_model
             if model and model.lower() == name.lower():
                 model = ""
 
@@ -1345,6 +2177,11 @@ class Monitor:
                 "is_self": is_self,
                 "is_gateway": is_gateway,
                 "web_url": web_url,
+                "kind": kind,
+                "group": device_group(kind, vendor, name, dns_name or mdns.get("host", ""), services),
+                "mesh": {k: mesh_entry[k] for k in ("via", "via_mac", "band", "rate_mbps", "signal_dbm", "role")}
+                if mesh_entry else None,
+                "seen_min": int((now - last_seen) // 60) if state == "sleeping" else None,
             }
             self.known[ip] = dict(dev, last_seen=last_seen)
             devices.append(dev)
@@ -1358,20 +2195,38 @@ class Monitor:
                 continue
             if now - prev.get("last_seen", 0) <= SLEEPING_KEEP:
                 sleeping = {k: v for k, v in prev.items() if k != "last_seen"}
-                devices.append(dict(sleeping, online=False, state="sleeping"))
+                devices.append(dict(sleeping, online=False, state="sleeping",
+                                    seen_min=int((now - prev.get("last_seen", now)) // 60)))
             else:
                 del self.known[ip]
                 self.last_reachable.pop(ip, None)
+
+        tracking = self.apply_store(devices, trusted, wlan.get("ssid", ""))
 
         def sort_key(dev):
             try:
                 ip_num = int(ipaddress.IPv4Address(dev["ip"]))
             except ValueError:
                 ip_num = 0
-            rank = 0 if dev["is_gateway"] else (1 if dev["is_self"] else (2 if dev["online"] else (3 if dev["state"] == "idle" else 4)))
+            rank = (0 if dev["is_gateway"] else 1 if dev["is_self"] else 2 if dev["pinned"]
+                    else 3 if dev["online"] else 4 if dev["state"] == "idle" else 5)
             return (rank, ip_num)
 
         devices.sort(key=sort_key)
+        # Access points carry their FRITZ!Box names ("fritz.box"); show the names used here instead.
+        ap_names = {d["mac"]: d["name"] for d in devices if d.get("kind") == "router" and d.get("mac")}
+        for dev in devices:
+            if dev.get("mesh") and dev["mesh"]["via_mac"] in ap_names:
+                dev["mesh"] = dict(dev["mesh"], via=ap_names[dev["mesh"]["via_mac"]])
+        fritz_info = dict(fritz_info, aps=[dict(ap, name=ap_names.get(ap["mac"], ap["name"]),
+                                                via=ap_names.get(ap.get("via_mac", ""), ap["via"]))
+                                           for ap in fritz_info["aps"]])
+        self_mesh = mesh.get((net["mac"] or "").lower())
+        if self_mesh and self_mesh["via"]:
+            via, via_band = ap_names.get(self_mesh["via_mac"], self_mesh["via"]), self_mesh["band"]
+        else:
+            owner = bssid_owner(wlan.get("bssid", ""), devices)
+            via, via_band = (owner["name"], wlan.get("band") or "") if owner else ("", "")
         online_count = sum(1 for d in devices if d["online"])
         idle_count = sum(1 for d in devices if d["state"] == "idle")
 
@@ -1401,6 +2256,8 @@ class Monitor:
                 "trusted": trusted,
                 "can_trust": bool(self.trust_identity["gateway_mac"]),
                 "scan_mode": "active" if trusted else "passive",
+                "via": clean(via, 64),
+                "via_band": via_band,
             },
             "traffic": traffic,
             "devices": devices,
@@ -1408,6 +2265,14 @@ class Monitor:
             "online_count": online_count,
             "idle_count": idle_count,
             "total_count": len(devices),
+            "hidden_count": sum(1 for d in devices if d["hidden"]),
+            "new_count": sum(1 for d in devices if d["new"] and not d["hidden"]),
+            "named_count": sum(1 for d in devices if d["custom_name"]),
+            "tracking": tracking,
+            "alerts": self.store["alerts"],
+            "view": self.store["view"],
+            "fritz": fritz_info,
+            "mesh_active": bool(mesh),
         }
 
 
@@ -1422,8 +2287,11 @@ def main():
         if net:
             monitor.traffic(net["iface"], time.monotonic())
         time.sleep(0.25)
-        emit(monitor.snapshot(force_scan=True))
+        monitor.snapshot(force_scan=True)  # learns the network for the FRITZ!Box reader
+        monitor.fritz.step()
+        emit(monitor.snapshot())
         return 0
+    monitor.fritz.start()
 
     stdin_fd = sys.stdin.fileno() if sys.stdin else None
     pending = b""

@@ -4,6 +4,7 @@ import math
 import os
 import struct
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -383,3 +384,438 @@ class WebCacheBoundTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NamingTests(unittest.TestCase):
+    def test_tidy_name(self):
+        tidy = wlan_monitor.tidy_name
+        self.assertEqual(tidy("PHILIPS_EP8757_20_392985"), "Philips EP8757")
+        self.assertEqual(tidy("MacBook-Pro-von-Uwe-2"), "MacBook Pro von Uwe 2")
+        self.assertEqual(tidy("Hue Bridge - C9B46D"), "Hue Bridge")
+        self.assertEqual(tidy("AMBEO Soundbar Plus"), "AMBEO Soundbar Plus")
+        self.assertEqual(tidy("LGwebOSTV"), "LGwebOSTV")
+        self.assertEqual(tidy("192-168-178-5"), "192-168-178-5")
+        self.assertEqual(tidy("123_456"), "123_456")
+        self.assertEqual(tidy("SwitchBot-HubMiniMatter-47DBEC"), "SwitchBot HubMiniMatter")
+        self.assertEqual(tidy("Office-2"), "Office 2")
+
+    def test_device_kind(self):
+        kind = wlan_monitor.device_kind
+        self.assertEqual(kind("iPhone 17 pro max", "", "", "Private MAC", []), "phone")
+        self.assertEqual(kind("iPad Pro", "", "", "", []), "tablet")
+        self.assertEqual(kind("MacBook Pro", "", "", "Apple", ["_airplay._tcp"]), "laptop")
+        self.assertEqual(kind("[LG] webOS TV OLED65", "LGwebOSTV", "", "LG Electronics", []), "tv")
+        self.assertEqual(kind("Brother HL-L2350DW", "", "", "", []), "printer")
+        self.assertEqual(kind("Office", "", "", "", ["_ipp._tcp"]), "printer")
+        self.assertEqual(kind("", "", "", "Espressif", []), "smarthome")
+        self.assertEqual(kind("Philips EP8757", "", "", "Philips (Versuni)", []), "appliance")
+        self.assertEqual(kind("Hue Bridge", "", "", "Philips Hue (Signify)", []), "light")
+        self.assertEqual(kind("x", "", "", "", [], is_gateway=True), "router")
+        self.assertEqual(kind("something", "", "", "Apple", []), "unknown")
+
+    def test_vendor_only_names_say_what_the_device_is(self):
+        choose = wlan_monitor.choose_device_name
+        self.assertEqual(choose("10.0.0.5", False, False, "", {}, "Espressif"), "Smart-home device (Espressif)")
+        self.assertEqual(choose("10.0.0.5", False, False, "", {}, "Apple"), "Apple device")
+        self.assertEqual(choose("10.0.0.5", False, False, "", {}, "Private MAC"), "10.0.0.5")
+        self.assertEqual(choose("10.0.0.1", False, True, "fritz.box", {}, "AVM"), "Router")
+        self.assertEqual(choose("10.0.0.7", False, False, "PHILIPS_EP8757_20_392985", {}, ""), "Philips EP8757")
+
+
+class DeviceCommandTests(unittest.TestCase):
+    def test_json_commands_are_validated(self):
+        parse = wlan_monitor.parse_command
+        self.assertEqual(parse('{"cmd":"rename","mac":"AA:BB:CC:DD:EE:FF","name":"  <b>Pellet\\n stove</b>  "}'),
+                         {"cmd": "rename", "mac": "aa:bb:cc:dd:ee:ff", "name": "bPellet stove/b"})
+        self.assertEqual(parse('{"cmd":"rename","mac":"aa:bb:cc:dd:ee:ff","name":"' + "x" * 80 + '"}')["name"], "x" * 40)
+        self.assertEqual(parse('{"cmd":"pin","mac":"aa:bb:cc:dd:ee:ff","on":"yes"}')["on"], False)
+        self.assertEqual(parse('{"cmd":"alerts","on":true}'), {"cmd": "alerts", "on": True})
+        self.assertEqual(parse('{"cmd":"rename","mac":"$(id)","name":"x"}'), "")
+        self.assertEqual(parse('{"cmd":"rename","mac":["aa"],"name":"x"}'), "")
+        self.assertEqual(parse('{"cmd":"rename","mac":"aa:bb:cc:dd:ee:ff","name":5}')["name"], "")
+        self.assertEqual(parse('{"cmd":"shell","mac":"aa:bb:cc:dd:ee:ff"}'), "")
+        self.assertEqual(parse('{"cmd":"pin"'), "")
+        self.assertEqual(parse("[1]"), "")
+        self.assertEqual(parse('{"cmd":"pin","mac":"aa:bb:cc:dd:ee:ff","pad":"' + "x" * 1100 + '"}'), "")
+        self.assertEqual(parse("known_all"), "known_all")
+
+
+class StoreTests(unittest.TestCase):
+    HOME = {"ssid": "Home", "gateway_mac": "aa:bb:cc:dd:ee:01"}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.env = mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": self.tmp.name})
+        self.env.start()
+        self.notify = mock.patch.object(wlan_monitor, "notify_new_devices")
+        self.notified = self.notify.start()
+
+    def tearDown(self):
+        self.notify.stop()
+        self.env.stop()
+        self.tmp.cleanup()
+
+    def device(self, mac, name="Thing", **extra):
+        return dict({"ip": "10.0.0.9", "name": name, "mac": mac, "is_self": False, "is_gateway": False}, **extra)
+
+    def monitor(self):
+        mon = wlan_monitor.Monitor()
+        mon.trust_identity = dict(self.HOME)
+        return mon
+
+    def test_store_roundtrip_permissions_and_malformed_entries(self):
+        store = {"alerts": False, "view": {"mode": "platform", "collapsed": ["apple"]}, "networks": {"aa:bb:cc:dd:ee:01|Home": {"since": 5, "devices": {
+            "aa:bb:cc:dd:ee:02": {"name": "Stove", "pinned": True, "hidden": False, "new": False, "first": 5}}}}}
+        self.assertTrue(wlan_monitor.save_store(store))
+        self.assertEqual(wlan_monitor.load_store(), store)
+        path = os.path.join(wlan_monitor.config_dir(), wlan_monitor.DEVICES_FILE)
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+        with open(path, "w") as handle:
+            handle.write('{"networks": {"nomac": {}, "aa:bb:cc:dd:ee:01|<x>": {}, "aa:bb:cc:dd:ee:01|Home": '
+                         '{"since": true, "devices": {"$(id)": {}, "aa:bb:cc:dd:ee:03": {"name": "<i>TV</i>", "pinned": 1}}}}}')
+        loaded = wlan_monitor.load_store()
+        self.assertTrue(loaded["alerts"])
+        self.assertEqual(list(loaded["networks"]), ["aa:bb:cc:dd:ee:01|Home"])
+        net = loaded["networks"]["aa:bb:cc:dd:ee:01|Home"]
+        self.assertIsNone(net["since"])
+        self.assertEqual(net["devices"], {"aa:bb:cc:dd:ee:03": {"name": "iTV/i", "pinned": False, "hidden": False, "new": False, "first": 0}})
+
+    def test_store_refuses_symlink(self):
+        target = os.path.join(self.tmp.name, "elsewhere.json")
+        with open(target, "w") as handle:
+            handle.write('{"alerts": false}')
+        os.makedirs(wlan_monitor.config_dir())
+        os.symlink(target, os.path.join(wlan_monitor.config_dir(), wlan_monitor.DEVICES_FILE))
+        self.assertTrue(wlan_monitor.load_store()["alerts"])
+
+    def test_store_device_is_bounded(self):
+        net = {"since": 0, "devices": {}}
+        with mock.patch.object(wlan_monitor, "MAX_STORE_DEVICES", 3):
+            wlan_monitor.store_device(net, "aa:bb:cc:dd:ee:01", 1)["name"] = "Keep"
+            for i in range(2, 9):
+                wlan_monitor.store_device(net, f"aa:bb:cc:dd:ee:0{i}", i)
+        self.assertEqual(len(net["devices"]), 3)
+        self.assertIn("aa:bb:cc:dd:ee:01", net["devices"])
+
+    def test_baseline_then_new_devices_alert(self):
+        mon = self.monitor()
+        with mock.patch.object(wlan_monitor.time, "time", return_value=1000.0):
+            first = [self.device("aa:bb:cc:dd:ee:02")]
+            self.assertTrue(mon.apply_store(first, True, "Home"))
+        self.assertFalse(first[0]["new"])
+        self.notified.assert_not_called()
+        with mock.patch.object(wlan_monitor.time, "time", return_value=1000.0 + wlan_monitor.BASELINE_SECONDS + 1):
+            later = [self.device("aa:bb:cc:dd:ee:02"), self.device("aa:bb:cc:dd:ee:03", "Stranger")]
+            mon.apply_store(later, True, "Home")
+        self.assertEqual([d["new"] for d in later], [False, True])
+        self.notified.assert_called_once_with("Home", ["Stranger"])
+        # Persisted: a fresh monitor still knows the device is new, and alerts only once.
+        mon2 = self.monitor()
+        again = [self.device("aa:bb:cc:dd:ee:03", "Stranger")]
+        mon2.apply_store(again, True, "Home")
+        self.assertTrue(again[0]["new"])
+        self.assertEqual(self.notified.call_count, 1)
+
+    def test_untrusted_networks_are_not_tracked(self):
+        mon = self.monitor()
+        devices = [self.device("aa:bb:cc:dd:ee:02")]
+        self.assertFalse(mon.apply_store(devices, False, "Cafe"))
+        self.assertFalse(os.path.exists(os.path.join(wlan_monitor.config_dir(), wlan_monitor.DEVICES_FILE)))
+        self.assertTrue(devices[0]["can_edit"])
+
+    def test_rename_pin_hide_known(self):
+        mon = self.monitor()
+        mac = "aa:bb:cc:dd:ee:02"
+        self.assertFalse(mon.handle({"cmd": "rename", "mac": mac, "name": "Stove"}))  # not on this network
+        mon.known = {"10.0.0.9": {"mac": mac}}
+        self.assertTrue(mon.handle({"cmd": "rename", "mac": mac, "name": "Stove"}))
+        self.assertTrue(mon.handle({"cmd": "pin", "mac": mac, "on": True}))
+        devices = [self.device(mac, "Smart-home device (Microchip)")]
+        mon.apply_store(devices, False, "Home")
+        self.assertEqual(devices[0]["name"], "Stove")
+        self.assertEqual(devices[0]["auto_name"], "Smart-home device (Microchip)")
+        self.assertTrue(devices[0]["custom_name"] and devices[0]["pinned"])
+        self.assertTrue(mon.handle({"cmd": "hide", "mac": mac, "on": True}))
+        rec = wlan_monitor.load_store()["networks"]["aa:bb:cc:dd:ee:01|Home"]["devices"][mac]
+        self.assertTrue(rec["hidden"])
+        self.assertFalse(rec["pinned"])
+        mon.handle({"cmd": "rename", "mac": mac, "name": ""})
+        devices = [self.device(mac, "Auto")]
+        mon.apply_store(devices, False, "Home")
+        self.assertEqual(devices[0]["name"], "Auto")
+        self.assertFalse(devices[0]["custom_name"])
+        rec["new"] = True
+        mon.store["networks"]["aa:bb:cc:dd:ee:01|Home"]["devices"][mac]["new"] = True
+        self.assertTrue(mon.handle("known_all"))
+        self.assertFalse(wlan_monitor.load_store()["networks"]["aa:bb:cc:dd:ee:01|Home"]["devices"][mac]["new"])
+        self.assertTrue(mon.handle({"cmd": "alerts", "on": False}))
+        self.assertFalse(wlan_monitor.load_store()["alerts"])
+
+
+class MdnsModelTests(unittest.TestCase):
+    def test_flag_values_are_not_models(self):
+        net = ipaddress.IPv4Network("10.0.0.0/24")
+        lines = [
+            '=;wlan0;IPv4;Mac;_companion-link._tcp;local;mac.local;10.0.0.5;7000;"model=0,1,2"',
+            '=;wlan0;IPv4;Printer;_ipp._tcp;local;prn.local;10.0.0.6;631;"ty=Brother HL-L2350DW" "md=HL-L2350DW"',
+        ]
+        hosts = wlan_monitor.parse_mdns_lines(lines, "wlan0", net)
+        self.assertEqual(hosts["10.0.0.5"]["model"], "")
+        self.assertEqual(hosts["10.0.0.6"]["model"], "HL-L2350DW")
+
+
+class NotifyTests(unittest.TestCase):
+    def test_notification_text_is_plain_and_bounded(self):
+        with mock.patch.object(wlan_monitor.shutil, "which", return_value="/usr/bin/notify-send"), \
+                mock.patch.object(wlan_monitor, "run_cmd") as run:
+            wlan_monitor.notify_new_devices('<img src="http://x/y.png">Home\r\n', ["<b>A</b>", "B & C", "D", "E"])
+        argv = run.call_args[0][0]
+        self.assertEqual(argv[:6], ["notify-send", "-a", "WLAN Monitor", "-i", "network-wireless", "--"])
+        for text in argv[6:]:
+            self.assertFalse(set(text) & set("<>&\r\n"))
+        self.assertTrue(argv[6].startswith("4 new devices on "))
+        self.assertIn("and 1 more", argv[7])
+
+
+class GroupTests(unittest.TestCase):
+    def test_device_group(self):
+        group = wlan_monitor.device_group
+        self.assertEqual(group("phone", "Private MAC", "iPhone 17 pro max", "", []), "apple")
+        self.assertEqual(group("unknown", "Private MAC", "Thing", "", ["_companion-link._tcp"]), "apple")
+        self.assertEqual(group("phone", "Private MAC", "Galaxy S24", "", []), "android")
+        self.assertEqual(group("unknown", "Samsung Electronics", "x", "", []), "android")
+        self.assertEqual(group("tv", "Samsung Electronics", "Samsung TV", "", []), "media")
+        self.assertEqual(group("tv", "LG Electronics", "[LG] webOS TV", "", ["_airplay._tcp"]), "media")
+        self.assertEqual(group("router", "Apple", "AirPort", "", []), "network")
+        self.assertEqual(group("light", "", "Hue Bridge", "", []), "smarthome")
+        self.assertEqual(group("printer", "", "HL", "", []), "office")
+        self.assertEqual(group("unknown", "", "x", "", []), "other")
+
+    def test_bssid_owner_matches_middle_bytes(self):
+        devices = [
+            {"mac": "1c:23:a2:92:2a:6c", "is_gateway": True, "kind": "router", "name": "Router"},
+            {"mac": "2e:23:a2:11:22:33", "is_gateway": False, "kind": "phone", "name": "Phone"},
+        ]
+        self.assertEqual(wlan_monitor.bssid_owner("2e:23:a2:92:2a:80", devices)["name"], "Router")
+        self.assertIsNone(wlan_monitor.bssid_owner("2e:23:a2:11:22:99", devices))  # a phone is no access point
+        self.assertIsNone(wlan_monitor.bssid_owner("nonsense", devices))
+
+    def test_view_command(self):
+        parse = wlan_monitor.parse_command
+        self.assertEqual(parse('{"cmd":"view","mode":"type","collapsed":["apple","apple","aa:bb:cc:dd:ee:ff","$(x)",5]}'),
+                         {"cmd": "view", "mode": "type", "collapsed": ["apple", "aa:bb:cc:dd:ee:ff"]})
+        self.assertEqual(parse('{"cmd":"view","mode":"tree","collapsed":[]}'), "")
+
+
+class FritzTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.env = mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": self.tmp.name})
+        self.env.start()
+
+    def tearDown(self):
+        self.env.stop()
+        self.tmp.cleanup()
+
+    def test_digest_rfc2617_vector(self):
+        challenge = {"realm": "testrealm@host.com", "nonce": "dcd98b7102dd2f0e8b11d0f600bfb0c093", "qop": "auth",
+                     "opaque": "5ccc069c403ebaf9f0171e9517f40e41"}
+        header = wlan_monitor.digest_authorization("Mufasa", "Circle Of Life", "GET", "/dir/index.html",
+                                                   challenge, "0a4f113b")
+        self.assertIn('response="6629fae49393a05397450978507c4ef1"', header)
+        parsed = wlan_monitor.parse_digest_challenge('Digest realm="F!Box SOAP-Auth", nonce="ABC123", algorithm=MD5, qop="auth"')
+        self.assertEqual((parsed["realm"], parsed["nonce"], parsed["qop"]), ("F!Box SOAP-Auth", "ABC123", "auth"))
+        self.assertIsNone(wlan_monitor.parse_digest_challenge("Basic realm=x"))
+
+    def test_login_command_validation(self):
+        parse = wlan_monitor.parse_command
+        self.assertEqual(parse('{"cmd":"fritz_login","user":"fritz1234","password":"p\\"w d"}'),
+                         {"cmd": "fritz_login", "user": "fritz1234", "password": 'p"w d'})
+        self.assertEqual(parse('{"cmd":"fritz_login","user":"a\\" b","password":"x"}'), "")  # quotes would break the header
+        self.assertEqual(parse('{"cmd":"fritz_login","user":"u","password":""}'), "")
+        self.assertEqual(parse('{"cmd":"fritz_login","user":"u","password":"a\\nb"}'), "")
+        self.assertEqual(parse('{"cmd":"fritz_login","user":"u","password":"' + "x" * 129 + '"}'), "")
+
+    MESH = {"nodes": [
+        {"uid": "n-1", "device_name": "fritz.box", "device_model": "FRITZ!Box 5690 Pro", "device_mac_address": "1C:23:A2:92:2A:6C",
+         "mesh_role": "master", "node_interfaces": [
+             {"uid": "ni-ap5", "name": "AP:5G:0", "type": "WLAN", "node_links": []},
+             {"uid": "ni-lan", "name": "LAN:1", "type": "LAN", "node_links": []}]},
+        {"uid": "n-2", "device_name": "Repeater Kitchen", "device_model": "FRITZ!Repeater 3000", "device_mac_address": "aa:aa:aa:00:00:02",
+         "mesh_role": "slave", "node_interfaces": [
+             {"uid": "ni-r-up", "name": "UPLINK:5G:0", "type": "WLAN", "node_links": [
+                 {"state": "CONNECTED", "node_1_uid": "n-1", "node_2_uid": "n-2", "node_interface_1_uid": "ni-ap5",
+                  "node_interface_2_uid": "ni-r-up", "cur_data_rate_rx": 1201000}]},
+             {"uid": "ni-r-ap2", "name": "AP:2G:0", "type": "WLAN", "node_links": []}]},
+        {"uid": "n-3", "device_name": "Pellet-Ofen", "device_mac_address": "60:8a:10:cf:a6:2e", "mesh_role": "unknown",
+         "node_interfaces": [{"uid": "ni-c", "name": "", "type": "WLAN", "node_links": [
+             {"state": "CONNECTED", "node_1_uid": "n-2", "node_2_uid": "n-3", "node_interface_1_uid": "ni-r-ap2",
+              "node_interface_2_uid": "ni-c", "cur_data_rate_rx": 65000, "rx_rcpi": 120}]}]},
+        {"uid": "n-4", "device_name": "<b>Old phone</b>", "device_mac_address": "aa:aa:aa:00:00:04", "mesh_role": "unknown",
+         "node_interfaces": [{"uid": "ni-o", "type": "WLAN", "node_links": [
+             {"state": "DISCONNECTED", "node_1_uid": "n-1", "node_2_uid": "n-4"}]}]},
+        "junk", {"uid": 5}, {"uid": "n-6", "device_mac_address": "$(id)"},
+    ]}
+
+    def test_parse_mesh(self):
+        info, aps = wlan_monitor.parse_mesh(self.MESH)
+        self.assertEqual(set(info), {"1c:23:a2:92:2a:6c", "aa:aa:aa:00:00:02", "60:8a:10:cf:a6:2e"})
+        stove = info["60:8a:10:cf:a6:2e"]
+        self.assertEqual((stove["via"], stove["band"], stove["rate_mbps"], stove["signal_dbm"], stove["box_name"]),
+                         ("Repeater Kitchen", "2.4 GHz", 65, -50, "Pellet-Ofen"))
+        repeater = info["aa:aa:aa:00:00:02"]
+        self.assertEqual((repeater["role"], repeater["via"], repeater["band"], repeater["rate_mbps"]), ("slave", "fritz.box", "5 GHz", 1201))
+        self.assertEqual([(ap["name"], ap["clients"]) for ap in aps], [("fritz.box", 0), ("Repeater Kitchen", 1)])
+        self.assertEqual(wlan_monitor.rcpi_dbm(-61), -61)   # FRITZ!OS 8: already dBm
+        self.assertEqual(wlan_monitor.rcpi_dbm(120), -50)   # older: RCPI scale
+        self.assertIsNone(wlan_monitor.rcpi_dbm(255))       # unknown
+        self.assertIsNone(wlan_monitor.rcpi_dbm(True))
+        self.assertEqual(wlan_monitor.parse_mesh({"nodes": "x"}), ({}, []))
+        self.assertEqual(wlan_monitor.parse_mesh([]), ({}, []))
+
+    def test_fritz_model_from_description(self):
+        body = b"<root><device><modelName>FRITZ!Box 5690 Pro</modelName></device></root>"
+        with mock.patch.object(wlan_monitor, "bounded_http", return_value=(200, {}, body, "")):
+            self.assertEqual(wlan_monitor.fritz_model("192.168.178.1"), "FRITZ!Box 5690 Pro")
+        with mock.patch.object(wlan_monitor, "bounded_http", return_value=(200, {}, b"<modelName>Speedport</modelName>", "")):
+            self.assertEqual(wlan_monitor.fritz_model("192.168.178.1"), "")
+        with mock.patch.object(wlan_monitor, "bounded_http", side_effect=OSError):
+            self.assertEqual(wlan_monitor.fritz_model("192.168.178.1"), "")
+
+    def test_login_flow_pins_certificate_and_never_exposes_password(self):
+        soap_ok = ("<s:Envelope><NewX_AVM-DE_MeshListPath>/meshlist.lua?sid=0123456789abcdef"
+                   "</NewX_AVM-DE_MeshListPath></s:Envelope>")
+        mesh_json = __import__("json").dumps(self.MESH).encode()
+        calls = []
+
+        def fake_http(ip, port, method, path, body=None, headers=None, tls=False, pin=None, **kw):
+            calls.append((port, method, path, pin, (headers or {}).get("Authorization", "")))
+            if method == "POST" and "Authorization" not in (headers or {}):
+                return 401, {"www-authenticate": 'Digest realm="F!Box SOAP-Auth", nonce="N1", qop="auth"'}, b"", "c" * 64
+            if method == "POST":
+                return 200, {}, soap_ok.encode(), "c" * 64
+            return 200, {}, mesh_json, "c" * 64
+
+        fritz = wlan_monitor.FritzMesh()
+        fritz.set_network("192.168.178.1", "1c:23:a2:92:2a:6c", True, True)
+        fritz.model_for = ("192.168.178.1", "1c:23:a2:92:2a:6c")
+        fritz.login("fritz1234", "s3cret pass")
+        with mock.patch.object(wlan_monitor, "bounded_http", side_effect=fake_http):
+            fritz.step()
+        info, clients = fritz.snapshot()
+        self.assertEqual(info["state"], "connected")
+        self.assertEqual(info["user"], "fritz1234")
+        self.assertNotIn("s3cret", __import__("json").dumps(info))
+        self.assertIn("60:8a:10:cf:a6:2e", clients)
+        self.assertTrue(all(port == wlan_monitor.FRITZ_TLS_PORT for port, *_ in calls))
+        self.assertIn('username="fritz1234"', calls[1][4])
+        self.assertNotIn("s3cret", "".join(c[4] for c in calls))
+        self.assertEqual(calls[-1][3], "c" * 64)  # the mesh list is fetched with the pinned certificate
+        saved = wlan_monitor.load_fritz()
+        self.assertEqual((saved["user"], saved["pin"], saved["gateway_mac"]), ("fritz1234", "c" * 64, "1c:23:a2:92:2a:6c"))
+        path = os.path.join(wlan_monitor.config_dir(), wlan_monitor.FRITZ_FILE)
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+        # Another router (different MAC) never gets the credentials.
+        fritz.set_network("192.168.1.1", "11:22:33:44:55:66", True, True)
+        with mock.patch.object(wlan_monitor, "bounded_http", side_effect=AssertionError("must not connect")), \
+                mock.patch.object(wlan_monitor, "fritz_model", return_value=""):
+            fritz.step()
+        self.assertEqual(fritz.snapshot()[0]["state"], "off")
+        fritz.logout()
+        self.assertFalse(os.path.exists(path))
+
+    def test_wrong_password_and_changed_certificate(self):
+        def unauthorized(ip, port, method, path, body=None, headers=None, tls=False, pin=None, **kw):
+            return 401, {"www-authenticate": 'Digest realm="r", nonce="n", qop="auth"'}, b"", "c" * 64
+        fritz = wlan_monitor.FritzMesh()
+        fritz.set_network("192.168.178.1", "1c:23:a2:92:2a:6c", True, True)
+        fritz.model_for = ("192.168.178.1", "1c:23:a2:92:2a:6c")
+        fritz.login("u", "bad")
+        with mock.patch.object(wlan_monitor, "bounded_http", side_effect=unauthorized):
+            fritz.step()
+        self.assertEqual(fritz.snapshot()[0]["state"], "error")
+        self.assertIn("Wrong user name or password", fritz.snapshot()[0]["message"])
+        self.assertIsNone(wlan_monitor.load_fritz())
+        with mock.patch.object(wlan_monitor, "bounded_http", side_effect=PermissionError):
+            with self.assertRaises(wlan_monitor.FritzError) as ctx:
+                wlan_monitor.fritz_soap("192.168.178.1", "u", "p", "d" * 64, "urn:x", "/c", "A")
+        self.assertIn("certificate changed", str(ctx.exception))
+
+    def test_load_fritz_rejects_malformed(self):
+        wlan_monitor.save_private_json(wlan_monitor.FRITZ_FILE, {"gateway_mac": "x", "user": "u", "password": "p", "pin": "0" * 64})
+        self.assertIsNone(wlan_monitor.load_fritz())
+        wlan_monitor.save_private_json(wlan_monitor.FRITZ_FILE, {"gateway_mac": "AA:BB:CC:DD:EE:FF", "user": "u", "password": "p", "pin": "0" * 64})
+        self.assertEqual(wlan_monitor.load_fritz()["gateway_mac"], "aa:bb:cc:dd:ee:ff")
+
+
+class BoundedHttpTests(unittest.TestCase):
+    """A router-side responder must not stall or exhaust the collector (review finding class 7b)."""
+
+    def serve(self, handler):
+        import socket as s_, threading as t_
+        srv = s_.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+
+        def run():
+            try:
+                conn, _ = srv.accept()
+                conn.recv(4096)
+                handler(conn)
+                conn.close()
+            except OSError:
+                pass
+            finally:
+                srv.close()
+        t_.Thread(target=run, daemon=True).start()
+        return srv.getsockname()[1]
+
+    def test_drip_status_line_hits_deadline(self):
+        def drip(conn):
+            for ch in b"HTTP/1.1 200 OK\r\n":
+                try:
+                    conn.send(bytes([ch]))
+                except OSError:
+                    return
+                time.sleep(0.2)
+        port = self.serve(drip)
+        start = time.monotonic()
+        with self.assertRaises((OSError, wlan_monitor.http.client.HTTPException)):
+            wlan_monitor.bounded_http("127.0.0.1", port, "GET", "/", timeout=1.0)
+        self.assertLess(time.monotonic() - start, 2.5)
+
+    def test_endless_body_is_capped(self):
+        def flood(conn):
+            try:
+                conn.send(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                while True:
+                    conn.send(b"4000\r\n" + b"x" * 0x4000 + b"\r\n")
+            except OSError:
+                pass
+        port = self.serve(flood)
+        with self.assertRaises(OSError):
+            wlan_monitor.bounded_http("127.0.0.1", port, "GET", "/", max_body=65536, timeout=3.0)
+
+    def test_huge_content_length_refused(self):
+        port = self.serve(lambda conn: conn.send(b"HTTP/1.1 200 OK\r\nContent-Length: 999999999\r\n\r\nabc"))
+        with self.assertRaises(OSError):
+            wlan_monitor.bounded_http("127.0.0.1", port, "GET", "/", max_body=65536)
+
+    def test_public_gateway_is_never_contacted(self):
+        fritz = wlan_monitor.FritzMesh()
+        fritz.set_network("8.8.8.8", "1c:23:a2:92:2a:6c", True, True)
+        with mock.patch.object(wlan_monitor, "bounded_http", side_effect=AssertionError("must not connect")):
+            self.assertEqual(fritz.step(), 5.0)
+
+
+class PrivateWriteTests(unittest.TestCase):
+    def test_permissive_existing_file_ends_private_and_no_temp_left(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": tmp}):
+            os.makedirs(wlan_monitor.config_dir(), mode=0o700)
+            path = os.path.join(wlan_monitor.config_dir(), wlan_monitor.FRITZ_FILE)
+            with open(path, "w") as handle:
+                handle.write("{}")
+            os.chmod(path, 0o644)
+            self.assertTrue(wlan_monitor.save_private_json(wlan_monitor.FRITZ_FILE, {"a": 1}))
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+            self.assertEqual(sorted(os.listdir(wlan_monitor.config_dir())), [wlan_monitor.FRITZ_FILE])

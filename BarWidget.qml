@@ -7,8 +7,9 @@ import qs.Ui as Ui
 
 // Bar indicator for the local WLAN. Dim radar icon while disconnected; green radar
 // icon (theme green) while connected, with a thin signal-quality bar underneath. Pulses while scanning the subnet. Left click opens the panel;
-// right click triggers an immediate rescan. Commands (rescan, panel open/closed,
-// trust/untrust network) go to the collector over stdin.
+// right click triggers an immediate rescan. A small dot marks devices that joined
+// recently. Commands (rescan, panel open/closed, trust/untrust network, per-device
+// rename / pin / hide as one-line JSON) go to the collector over stdin.
 Ui.BarWidget {
   id: root
   moduleName: "ubruckhaus.wlan-monitor"
@@ -19,6 +20,7 @@ Ui.BarWidget {
   readonly property bool active: stats.active === true
   readonly property int onlineCount: Number(stats.online_count || 0)
   readonly property int totalCount: Number(stats.total_count || 0)
+  readonly property int newCount: Number(stats.new_count || 0)
   property bool scanBusy: false       // collector reported that a sweep is running
   property bool rescanPending: false  // user asked for a rescan, waiting for the result
   readonly property bool scanning: scanBusy || rescanPending
@@ -71,15 +73,18 @@ Ui.BarWidget {
     var link = stats.link
     var idle = Number(stats.idle_count || 0)
     var sleeping = Math.max(0, totalCount - onlineCount - idle)
+    var q = Number(link.quality || 0)
     var header = (link.ssid || link.iface) + (link.band ? " · " + link.band : "")
-      + (link.signal_dbm !== null && link.signal_dbm !== undefined ? " · " + link.signal_dbm + " dBm (" + link.quality + "%)" : "")
-    var addr = "IP: " + (link.cidr || link.ip) + (link.gateway ? " · Gateway " + link.gateway : "")
-    var counts = "Devices: " + onlineCount + " online" + (idle > 0 ? ", " + idle + " idle" : "") + (sleeping > 0 ? ", " + sleeping + " sleeping" : "")
-      + (root.trusted ? "" : " · passive mode (network not trusted)")
-    var names = (stats.devices || []).filter(function(d) { return d.online }).slice(0, 6).map(function(d) {
-      return "• " + d.name + " (" + d.ip + ")"
+      + (link.quality !== null && link.quality !== undefined
+        ? " · signal " + (q >= 70 ? "excellent" : q >= 50 ? "good" : q >= 30 ? "fair" : "weak") + " (" + q + "%)" : "")
+    var counts = totalCount + " device" + (totalCount === 1 ? "" : "s") + ": " + onlineCount + " online"
+      + (idle > 0 ? ", " + idle + " idle" : "") + (sleeping > 0 ? ", " + sleeping + " sleeping" : "")
+      + (root.newCount > 0 ? " · " + root.newCount + " new" : "")
+    var mode = root.trusted ? "" : "\nNot marked as your network: only devices that announce themselves"
+    var names = (stats.devices || []).filter(function(d) { return d.online && !d.hidden }).slice(0, 6).map(function(d) {
+      return "• " + d.name + (d.new ? "  (new)" : "")
     }).join("\n")
-    return header + "\n" + addr + "\n" + counts + (names ? "\n" + names : "")
+    return header + "\n" + counts + mode + (names ? "\n" + names : "")
   }
 
   function send(command) {
@@ -91,6 +96,8 @@ Ui.BarWidget {
     send("rescan")
   }
   function setTrusted(trust) { send(trust ? "trust" : "untrust") }
+  // Per-device commands; JSON.stringify keeps them on one line, the collector validates them.
+  function sendJson(payload) { send(JSON.stringify(payload)) }
 
   // Background collector streaming a JSON snapshot every 3 s (panel open) / 6 s (closed).
   Process {
@@ -172,6 +179,19 @@ Ui.BarWidget {
     onPressed: function(code) {
       if (code === Qt.LeftButton) root.toggle()
       else if (code === Qt.RightButton) root.rescan()
+    }
+
+    // Accent dot: devices joined recently and are not marked as known yet.
+    Rectangle {
+      visible: root.newCount > 0
+      anchors.top: parent.top
+      anchors.right: parent.right
+      anchors.topMargin: Style.space(4)
+      anchors.rightMargin: Style.space(4)
+      width: Style.space(6)
+      height: width
+      radius: width / 2
+      color: Color.accent
     }
 
     // Signal quality bar under the chip: grows with Wi-Fi signal strength, coloured by level.
