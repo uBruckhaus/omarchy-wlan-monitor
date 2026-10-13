@@ -509,7 +509,7 @@ class StoreTests(unittest.TestCase):
             later = [self.device("aa:bb:cc:dd:ee:02"), self.device("aa:bb:cc:dd:ee:03", "Stranger")]
             mon.apply_store(later, True, "Home")
         self.assertEqual([d["new"] for d in later], [False, True])
-        self.notified.assert_called_once_with("Home", ["Stranger"])
+        self.notified.assert_called_once_with("Home", ["Stranger"], "en")
         # Persisted: a fresh monitor still knows the device is new, and alerts only once.
         mon2 = self.monitor()
         again = [self.device("aa:bb:cc:dd:ee:03", "Stranger")]
@@ -855,3 +855,22 @@ class VpnTests(unittest.TestCase):
             self.assertFalse(wlan_monitor.gateway_reachable("192.168.1.1"))
         with mock.patch.object(wlan_monitor.socket, "create_connection", side_effect=AssertionError("must not connect")):
             self.assertTrue(wlan_monitor.gateway_reachable("8.8.8.8"))
+
+class LanguageTests(unittest.TestCase):
+    """Interface language: the lang command, coded FRITZ!Box errors, translated notifications."""
+
+    def test_lang_command_is_validated(self):
+        self.assertEqual(wlan_monitor.parse_command('{"cmd": "lang", "lang": "de"}'), {"cmd": "lang", "lang": "de"})
+        self.assertEqual(wlan_monitor.parse_command('{"cmd": "lang", "lang": "../x"}'), {"cmd": "lang", "lang": "en"})
+
+    def test_fritz_error_keeps_code_args_and_english_text(self):
+        exc = wlan_monitor.FritzError("fzRefused", "The FRITZ!Box refused the request (error %s).", 606)
+        self.assertEqual((exc.code, exc.args_, str(exc)), ("fzRefused", ["606"], "The FRITZ!Box refused the request (error 606)."))
+
+    def test_notification_in_german(self):
+        with mock.patch.object(wlan_monitor.shutil, "which", return_value="/usr/bin/notify-send"), \
+             mock.patch.object(wlan_monitor, "run_cmd") as run:
+            wlan_monitor.notify_new_devices("Home", ["Phone", "Tablet"], "de")
+        argv = run.call_args[0][0]
+        self.assertEqual(argv[-2:], ["2 neue Geräte in Home", "Phone, Tablet"])
+

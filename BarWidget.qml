@@ -4,6 +4,7 @@ import Quickshell
 import Quickshell.Io
 import qs.Commons
 import qs.Ui as Ui
+import "I18n.js" as I18n
 
 // Bar indicator for the local WLAN. Dim radar icon while disconnected; green radar
 // icon (theme green) while connected, blue (theme blue) while a VPN is active, with a thin signal-quality bar underneath. Pulses while scanning the subnet. Left click opens the panel;
@@ -73,26 +74,46 @@ Ui.BarWidget {
   readonly property string barText: "󰐻"
 
   readonly property string summary: {
-    if (!active || !stats.link) return "WLAN Monitor\nNot connected to a local network"
+    if (!active || !stats.link) return "WLAN Monitor\n" + t("tipNotConnected")
     var link = stats.link
     var idle = Number(stats.idle_count || 0)
     var sleeping = Math.max(0, totalCount - onlineCount - idle)
     var q = Number(link.quality || 0)
     var header = (link.ssid || link.iface) + (link.band ? " · " + link.band : "")
       + (link.quality !== null && link.quality !== undefined
-        ? " · signal " + (q >= 70 ? "excellent" : q >= 50 ? "good" : q >= 30 ? "fair" : "weak") + " (" + q + "%)" : "")
-    var counts = totalCount + " device" + (totalCount === 1 ? "" : "s") + ": " + onlineCount + " online"
-      + (idle > 0 ? ", " + idle + " idle" : "") + (sleeping > 0 ? ", " + sleeping + " sleeping" : "")
-      + (root.newCount > 0 ? " · " + root.newCount + " new" : "")
-    var mode = root.trusted ? "" : "\nNot marked as your network: only devices that announce themselves"
-    if (root.vpn) mode = "\n" + root.vpn.name + " is on" + (root.lanBlocked
-      ? " and blocks your home network: devices cannot be reached. " + root.vpn.hint
-      : " (home network still reachable)") + mode
+        ? " · " + t("tipSignal", [t(q >= 70 ? "sigExcellent" : q >= 50 ? "sigGood" : q >= 30 ? "sigFair" : "sigWeak").toLowerCase(), q]) : "")
+    var counts = t("tipCounts", [tn("devices", totalCount), onlineCount])
+      + (idle > 0 ? ", " + t("tipIdle", [idle]) : "") + (sleeping > 0 ? ", " + t("tipSleeping", [sleeping]) : "")
+      + (root.newCount > 0 ? " · " + t("tipNew", [root.newCount]) : "")
+    var mode = root.trusted ? "" : "\n" + t("tipPassive")
+    if (root.vpn) {
+      var hint = String(root.vpn.hint || "")
+      hint = hint.indexOf("Allow it with: ") === 0 ? t("allowWith", [hint.slice(15)]) : t("vpnHintGeneric")
+      mode = "\n" + (root.lanBlocked ? t("tipVpnBlocks", [root.vpn.name, hint]) : t("tipVpnOk", [root.vpn.name])) + mode
+    }
     var names = (stats.devices || []).filter(function(d) { return d.online && !d.hidden }).slice(0, 6).map(function(d) {
-      return "• " + d.name + (d.new ? "  (new)" : "")
+      return "• " + d.name + (d.new ? "  " + t("newMark") : "")
     }).join("\n")
     return header + "\n" + counts + mode + (names ? "\n" + names : "")
   }
+
+  // Interface language: the system's unless one is picked in the panel's
+  // settings (stored in this widget's own shell.json entry).
+  readonly property string systemLang: I18n.systemLanguage(Quickshell.env("LC_ALL"), Quickshell.env("LC_MESSAGES"), Quickshell.env("LANG"))
+  readonly property string languageSetting: String(root.setting("language", "auto"))
+  readonly property string lang: I18n.resolve(languageSetting, systemLang)
+  function t(key, args) { return I18n.tr(lang, key, args) }
+  function tn(key, n, args) { return I18n.trn(lang, key, n, args) }
+  function setLanguage(code) {
+    if (!root.bar || !root.bar.shell || typeof root.bar.shell.updateEntryInline !== "function") return
+    var next = Object.assign({}, root.settings || {})
+    if (code === "auto") delete next.language
+    else next.language = code
+    root.bar.shell.updateEntryInline(root.moduleName, next)
+  }
+
+  // The collector writes new-device notifications; tell it the language.
+  onLangChanged: sendJson({ cmd: "lang", lang: root.lang })
 
   function send(command) {
     if (collector.running) collector.write(command + "\n")
@@ -124,7 +145,10 @@ Ui.BarWidget {
         } catch (e) { /* partial line during shutdown */ }
       }
     }
-    onRunningChanged: if (running && root.opened) Qt.callLater(function() { root.send("open") })
+    onRunningChanged: if (running) Qt.callLater(function() {
+      root.sendJson({ cmd: "lang", lang: root.lang })
+      if (root.opened) root.send("open")
+    })
     onExited: { root.scanBusy = false; root.rescanPending = false; restart.start() }
   }
   Timer { id: restart; interval: 5000; onTriggered: collector.running = true }

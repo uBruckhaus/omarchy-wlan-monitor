@@ -88,7 +88,9 @@ DEFAULT_DOMAINS = ("home.arpa", "fritz.box", "speedport.ip", "localdomain", "loc
 WEB_SERVICE_TYPES = {"_http._tcp": "http", "_https._tcp": "https"}
 ADMIN_URL_SERVICE_TYPES = {"_ipp._tcp", "_ipps._tcp", "_printer._tcp", "_pdl-datastream._tcp", "_uscan._tcp"}
 COMMANDS = {"rescan", "open", "closed", "trust", "untrust", "known_all", "fritz_logout"}
-JSON_COMMANDS = {"rename", "pin", "hide", "known", "alerts", "view", "fritz_login"}
+JSON_COMMANDS = {"rename", "pin", "hide", "known", "alerts", "view", "fritz_login", "lang"}
+# Interface languages the panel offers; the language arrives from the bar widget ("lang" command).
+LANGS = ("en", "de", "fr", "es", "it", "pt", "nl", "pl")
 MAX_COMMAND_BYTES = 1024
 VIEW_MODES = ("list", "platform", "type", "band", "ap")
 GROUP_ID_RE = re.compile(r"^([a-z]{2,12}|([0-9a-f]{2}:){5}[0-9a-f]{2})$")
@@ -1165,6 +1167,8 @@ def parse_command(line):
     cmd = data["cmd"]
     if cmd == "alerts":
         return {"cmd": cmd, "on": data.get("on") is True}
+    if cmd == "lang":
+        return {"cmd": cmd, "lang": data.get("lang") if data.get("lang") in LANGS else "en"}
     if cmd == "view":
         mode = data.get("mode")
         collapsed = data.get("collapsed")
@@ -1263,14 +1267,29 @@ def store_device(net, mac, now_wall):
     return devices[mac]
 
 
-def notify_new_devices(ssid, names):
+# New-device notification texts per interface language: one device, several, "and N more", "your network".
+NOTIFY_TEXT = {
+    "en": ("New device on {net}", "{n} new devices on {net}", " and {n} more", "your network"),
+    "de": ("Neues Gerät in {net}", "{n} neue Geräte in {net}", " und {n} weitere", "deinem Netzwerk"),
+    "fr": ("Nouvel appareil sur {net}", "{n} nouveaux appareils sur {net}", " et {n} de plus", "votre réseau"),
+    "es": ("Nuevo dispositivo en {net}", "{n} dispositivos nuevos en {net}", " y {n} más", "tu red"),
+    "it": ("Nuovo dispositivo su {net}", "{n} nuovi dispositivi su {net}", " e altri {n}", "la tua rete"),
+    "pt": ("Novo dispositivo em {net}", "{n} novos dispositivos em {net}", " e mais {n}", "sua rede"),
+    "nl": ("Nieuw apparaat op {net}", "{n} nieuwe apparaten op {net}", " en nog {n}", "je netwerk"),
+    "pl": ("Nowe urządzenie w {net}", "Nowe urządzenia ({n}) w {net}", " i {n} więcej", "twojej sieci"),
+}
+
+
+def notify_new_devices(ssid, names, lang="en"):
     """Desktop notification for devices that joined a trusted network (fixed argv, no shell)."""
     if not names or not shutil.which("notify-send"):
         return
+    one, many, more_text, your_net = NOTIFY_TEXT.get(lang, NOTIFY_TEXT["en"])
     shown = names[:ALERT_MAX_NAMES]
     more = len(names) - len(shown)
-    body = ", ".join(shown) + (f" and {more} more" if more > 0 else "")
-    title = "New device on " + (clean(ssid, 40) or "your network") if len(names) == 1 else f"{len(names)} new devices on " + (clean(ssid, 40) or "your network")
+    body = ", ".join(shown) + (more_text.format(n=more) if more > 0 else "")
+    net = clean(ssid, 40) or your_net
+    title = one.format(net=net) if len(names) == 1 else many.format(n=len(names), net=net)
     run_cmd(["notify-send", "-a", "WLAN Monitor", "-i", "network-wireless", "--", title, clean(body, 200)], timeout=2)
 
 
@@ -1543,7 +1562,16 @@ def digest_authorization(user, password, method, uri, challenge, cnonce, nc=1):
 
 
 class FritzError(Exception):
-    """A user-facing reason the FRITZ!Box could not be read."""
+    """A user-facing reason the FRITZ!Box could not be read.
+
+    `code` (and `args_` for placeholders) let the panel show it in its language;
+    the English text stays the message for logs and older panels.
+    """
+
+    def __init__(self, code, text, *args):
+        super().__init__(text % args if args else text)
+        self.code = code
+        self.args_ = [str(a) for a in args]
 
 
 def fritz_soap(ip, user, password, pin, service, control, action):
@@ -1560,25 +1588,25 @@ def fritz_soap(ip, user, password, pin, service, control, action):
         if status == 401:
             challenge = parse_digest_challenge(hdrs.get("www-authenticate", ""))
             if not challenge:
-                raise FritzError("The FRITZ!Box asked for an unsupported login method.")
+                raise FritzError("fzMethod", "The FRITZ!Box asked for an unsupported login method.")
             auth = dict(headers, Authorization=digest_authorization(
                 user, password, "POST", control, challenge, os.urandom(8).hex()))
             status, hdrs, body, cert = bounded_http(ip, FRITZ_TLS_PORT, "POST", control, envelope, auth, tls=True, pin=cert)
     except PermissionError:
-        raise FritzError("The FRITZ!Box certificate changed. Connect again to trust the new one.")
+        raise FritzError("fzCert", "The FRITZ!Box certificate changed. Connect again to trust the new one.")
     except ConnectionRefusedError:
-        raise FritzError("The FRITZ!Box does not accept app access. Turn on “Allow access for applications” "
+        raise FritzError("fzAppAccess", "The FRITZ!Box does not accept app access. Turn on “Allow access for applications” "
                          "under Home Network › Network › Network Settings.")
     except (OSError, http.client.HTTPException, ValueError):
-        raise FritzError("The FRITZ!Box did not answer.")
+        raise FritzError("fzNoAnswer", "The FRITZ!Box did not answer.")
     text = body.decode("utf-8", "replace")
     if status == 401:
-        raise FritzError("Wrong user name or password.")
+        raise FritzError("fzWrongLogin", "Wrong user name or password.")
     if status != 200:
         code = re.search(r"<errorCode>(\d{1,4})</errorCode>", text)
         if code and code.group(1) == "606":
-            raise FritzError("This FRITZ!Box user may not read the home network. Give it the right “FRITZ!Box settings”.")
-        raise FritzError(f"The FRITZ!Box refused the request (error {code.group(1) if code else status}).")
+            raise FritzError("fzNoRight", "This FRITZ!Box user may not read the home network. Give it the right “FRITZ!Box settings”.")
+        raise FritzError("fzRefused", "The FRITZ!Box refused the request (error %s).", code.group(1) if code else status)
     return text, cert
 
 
@@ -1717,6 +1745,8 @@ class FritzMesh:
         self.model_for = None
         self.state = "off"
         self.message = ""
+        self.message_code = ""
+        self.message_args = []
         self.clients = {}
         self.aps = []
         self.updated = 0.0
@@ -1748,6 +1778,7 @@ class FritzMesh:
         with self.lock:
             self.pending_login = (user, password)
             self.state, self.message = "connecting", "Connecting to the FRITZ!Box…"
+            self.message_code, self.message_args = "fzConnecting", []
         self.wake.set()
 
     def logout(self):
@@ -1767,6 +1798,8 @@ class FritzMesh:
                 "model": self.model if self.model_for == (ip, mac) else "",
                 "state": self.state if (bound or self.state in ("connecting", "error")) else "off",
                 "message": self.message,
+                "message_code": self.message_code if self.message else "",
+                "message_args": self.message_args if self.message else [],
                 "user": self.creds["user"] if bound else "",
                 "aps": list(self.aps),
                 "updated": int(self.updated),
@@ -1778,18 +1811,18 @@ class FritzMesh:
         match = re.search(r"<NewX_AVM-DE_MeshListPath>([^<]{1,200})</NewX_AVM-DE_MeshListPath>", text)
         path = match.group(1).replace("&amp;", "&") if match else ""
         if not MESH_PATH_RE.match(path):
-            raise FritzError("The FRITZ!Box sent no mesh list.")
+            raise FritzError("fzNoMesh", "The FRITZ!Box sent no mesh list.")
         try:
             status, _, body, _ = bounded_http(ip, FRITZ_TLS_PORT, "GET", path, tls=True, pin=creds["pin"],
                                               max_body=FRITZ_MAX_MESH)
             data = json.loads(body.decode("utf-8", "replace")) if status == 200 else None
         except PermissionError:
-            raise FritzError("The FRITZ!Box certificate changed. Connect again to trust the new one.")
+            raise FritzError("fzCert", "The FRITZ!Box certificate changed. Connect again to trust the new one.")
         except (OSError, http.client.HTTPException, ValueError):
-            raise FritzError("The FRITZ!Box mesh list could not be read.")
+            raise FritzError("fzMeshUnreadable", "The FRITZ!Box mesh list could not be read.")
         clients, aps = parse_mesh(data)
         if not clients:
-            raise FritzError("The FRITZ!Box mesh list was empty.")
+            raise FritzError("fzMeshEmpty", "The FRITZ!Box mesh list was empty.")
         return clients, aps
 
     def step(self):
@@ -1817,6 +1850,7 @@ class FritzMesh:
             except FritzError as exc:
                 with self.lock:
                     self.state, self.message = "error", str(exc)
+                    self.message_code, self.message_args = exc.code, exc.args_
                 return 5.0
             save_private_json(FRITZ_FILE, creds)
             with self.lock:
@@ -1852,6 +1886,7 @@ class FritzMesh:
 
 class Monitor:
     def __init__(self):
+        self.lang = "en"  # set by the bar widget ("lang" command); used for notifications
         self.trusted = load_trusted()
         self.store = load_store()
         self.fritz = FritzMesh()
@@ -1886,6 +1921,9 @@ class Monitor:
     def handle(self, command):
         """Apply a stdin command; returns True when a fresh snapshot should be sent right away."""
         if isinstance(command, dict):
+            if command["cmd"] == "lang":
+                self.lang = command["lang"]
+                return False
             if command["cmd"] == "view":
                 self.store["view"] = {"mode": command["mode"], "collapsed": command["collapsed"]}
                 save_store(self.store)
@@ -1988,7 +2026,7 @@ class Monitor:
         if changed:
             save_store(self.store)
         if new_names and self.store["alerts"]:
-            notify_new_devices(ssid, new_names)
+            notify_new_devices(ssid, new_names, self.lang)
         return tracking
 
     def domains(self):
@@ -2106,7 +2144,8 @@ class Monitor:
         if lan_blocked:
             mesh = {}
             fritz_info = dict(fritz_info, aps=[], state="paused" if fritz_info["user"] else fritz_info["state"],
-                              message="Paused while the VPN blocks the home network.")
+                              message="Paused while the VPN blocks the home network.",
+                              message_code="fzPaused", message_args=[])
 
         # Active scans only on trusted networks, unless the user explicitly asked for one.
         since_full = now - self.last_full_scan

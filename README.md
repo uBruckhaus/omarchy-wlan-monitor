@@ -16,7 +16,7 @@ WLAN Monitor is a lightweight Omarchy bar widget and popup panel that discovers 
     - **Rename** it (`Pellet stove` instead of `Microchip Technology device`). The name is tied to the device's hardware (MAC) address on this network, so it stays when the router hands out a new IP. Enter saves, Esc cancels, an empty name restores the automatic one.
     - **Pin to top** or **Hide** (hidden devices are listed again with **Show N hidden**).
     - **Open web page** for the router, devices announcing `_http._tcp` / `_https._tcp` over mDNS, and printer/scanner admin pages (`adminurl`). The `󰖟` icon in the row opens it directly.
-  - **New-device alerts (trusted networks):** a desktop notification and a **NEW** badge when a device joins that was never seen on this network before. **It's mine** or **All known** clears them. Devices seen in the first 10 minutes after you trust a network count as known. Turn alerts off with **Alerts on/off**.
+  - **New-device alerts (trusted networks):** a desktop notification and a **NEW** badge when a device joins that was never seen on this network before. **It's mine** or **All known** clears them. Devices seen in the first 10 minutes after you trust a network count as known. Turn alerts off in the settings page (gear ⚙ → **New-device alerts**).
   - **Groups (optional):** the grouping dropdown next to the device header (and on the Network map) changes between **No groups**, **Groups by platform** (Favourites, Apple, Android, other phones & tablets, computers, TV & audio, smart home, printers & storage, network & mesh), **Groups by type**, and with FRITZ!Box mesh details **Groups by band** (6 GHz, 5 GHz, 2.4 GHz, LAN, band not reported, sleeping) and **Groups by access point**. The Network map uses the same grouping under each router and repeater, and folded groups are shared between both pages. Click a group header to collapse or open it, or use the two buttons next to the dropdown to expand or collapse all groups; a collapsed group that contains a new device shows a **NEW** badge on its header. The choice is remembered.
   - **Mesh:** the panel shows which router or mesh node this PC is connected to ("Connected via FRITZ!Box 5690 Pro · 6 GHz", found by matching the Wi-Fi BSSID, no login needed). Repeaters and access points are recognised and listed under "Network & mesh". The router is listed under its Wi-Fi name (the one you see in your Wi-Fi settings, e.g. "Router (FRITZ!Box 7690 ML)"); when the real model differs, it is shown below it ("model FRITZ!Box 5690 Pro", read from the FRITZ!Box's public TR-064 description).
   - **FRITZ!Box mesh details (optional login):** **Show mesh details from the FRITZ!Box** asks for a FRITZ!Box user and password once (with an eye icon to show what you typed, and a short help on where to find both). Every device then shows its access point, band (2.4 / 5 / 6 GHz or LAN), speed and signal, devices can be grouped by access point, and devices known only by their maker get the name from the FRITZ!Box. **Disconnect** deletes the stored login.
@@ -25,6 +25,12 @@ WLAN Monitor is a lightweight Omarchy bar widget and popup panel that discovers 
   - **Copy IP / Copy list:** the copy icon copies a device's IP; **Copy list** copies all devices as a Markdown table. Both go to `wl-copy` through its standard input, never as a command-line argument, so the copied text (e.g. your device names) cannot be read by other local users from the process list while `wl-copy` holds the clipboard.
   - **Rescan**, **Router** (your router's settings page), **Trust / Untrust** (see below) and a Wi-Fi button that opens Omarchy's built-in Network panel.
 - **Right click:** triggers an immediate WLAN rescan.
+
+## Languages and settings
+
+The interface is built in in eight languages: English, German (Deutsch), French (Français), Spanish (Español), Italian (Italiano), Portuguese (Português), Dutch (Nederlands) and Polish (Polski). It follows the system language (`LC_ALL`, `LC_MESSAGES`, `LANG`) and falls back to English. To pick another one, open the **gear (⚙)** at the top right of the panel → **Language**. The translations ship with the plugin: nothing is downloaded or generated, and the plugin makes no extra requests for them. The choice is stored in the widget's own entry in `~/.config/omarchy/shell.json` (`"language"`); new-device notifications use the same language; **System (…)** removes it again.
+
+The settings page opens from the gear and closes with **← Back**, Backspace or Esc. It also holds **New-device alerts** (on/off), which used to be a button in the main panel.
 
 ## VPNs
 
@@ -71,7 +77,7 @@ omarchy plugin enable ubruckhaus.wlan-monitor
 
 ## How it works
 
-A collector (`scripts/wlan-monitor.py`) runs while the widget is loaded and streams one JSON snapshot every 3 s while the panel is open (6 s while closed). The bar widget sends it commands over stdin (`rescan`, `open` / `closed`, `trust` / `untrust`, `known_all`, `fritz_logout`, and one-line JSON: `rename`, `pin`, `hide`, `known`, `alerts`, `view`, `fritz_login`). JSON commands are limited to 1 KiB, need a valid MAC of a device currently listed on this network, and names are cut to 40 printable characters without `<`, `>` or `&`.
+A collector (`scripts/wlan-monitor.py`) runs while the widget is loaded and streams one JSON snapshot every 3 s while the panel is open (6 s while closed). The bar widget sends it commands over stdin (`rescan`, `open` / `closed`, `trust` / `untrust`, `known_all`, `fritz_logout`, and one-line JSON: `rename`, `pin`, `hide`, `known`, `alerts`, `view`, `lang`, `fritz_login`). JSON commands are limited to 1 KiB, need a valid MAC of a device currently listed on this network, and names are cut to 40 printable characters without `<`, `>` or `&`.
 
 - **Light on the system:** routes, signal level and traffic come from `/proc`; `iw` and `ip addr` run only every 12 / 30 s (or when the network changes). All external commands run as fixed argv lists with bounded output and timeouts.
 - **Unprivileged local discovery:**
