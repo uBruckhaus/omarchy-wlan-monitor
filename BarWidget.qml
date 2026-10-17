@@ -3,6 +3,7 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui as Ui
 import "I18n.js" as I18n
 
@@ -42,7 +43,7 @@ Ui.BarWidget {
   // Signal level in the theme's named colours: green >= 70%, yellow >= 50%, orange >= 30%, red < 30%.
   property var levelPalette: ({ green: "#9cba64", yellow: "#d9ab5e", orange: "#e09355", red: "#db6c4f", blue: "#6fa3d8" })
   function signalColor(fraction) {
-    return fraction < 0 ? Color.accent
+    return fraction < 0 ? Commons.Color.accent
       : fraction >= 0.7 ? levelPalette.green
       : fraction >= 0.5 ? levelPalette.yellow
       : fraction >= 0.3 ? levelPalette.orange
@@ -52,7 +53,7 @@ Ui.BarWidget {
 
   FileView {
     id: themeColors
-    path: Color.currentThemePath + "/colors.toml"
+    path: Commons.Color.currentThemePath + "/colors.toml"
     printErrors: false
     onLoaded: {
       var found = {}
@@ -67,7 +68,7 @@ Ui.BarWidget {
     }
   }
   Connections {
-    target: Color
+    target: Commons.Color
     function onAccentChanged() { themeColors.reload() }
   }
 
@@ -199,7 +200,7 @@ Ui.BarWidget {
     bar: root.bar
     text: root.barText
     dimmed: !root.active
-    readonly property color base: root.bar ? root.bar.barForeground : Color.foreground
+    readonly property color base: root.bar ? root.bar.barForeground : Commons.Color.foreground
     // Theme green when it really is green (hue ~75-165°); some themes map "green"
     // to teal, so fall back to a fixed green there.
     readonly property color themeGreen: root.levelPalette.green
@@ -227,7 +228,7 @@ Ui.BarWidget {
       width: Style.space(6)
       height: width
       radius: width / 2
-      color: Color.accent
+      color: Commons.Color.accent
     }
 
     // Signal quality bar under the chip: grows with Wi-Fi signal strength, coloured by level.

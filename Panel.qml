@@ -3,6 +3,7 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 import "I18n.js" as I18n
 
@@ -215,7 +216,7 @@ Panel {
   }
   readonly property int sleepingCount: Math.max(0, totalCount - onlineCount - idleCount)
   readonly property bool scanning: root.hostWidget ? root.hostWidget.scanning === true : (stats.scanning === true)
-  readonly property color fg: Color.popups.text
+  readonly property color fg: Commons.Color.popups.text
   readonly property color dim: Qt.darker(fg, 1.45)
   readonly property string font: root.bar ? root.bar.fontFamily : Style.font.family
 
@@ -395,7 +396,7 @@ Panel {
   }
 
   function signalColor(fraction) {
-    return root.hostWidget && root.hostWidget.signalColor ? root.hostWidget.signalColor(fraction) : Color.accent
+    return root.hostWidget && root.hostWidget.signalColor ? root.hostWidget.signalColor(fraction) : Commons.Color.accent
   }
   function signalWord(quality) {
     var q = Number(quality || 0)
@@ -568,7 +569,7 @@ Panel {
     property string value: ""
     property string tip: ""
     property real fraction: 0
-    property color fillColor: Color.accent
+    property color fillColor: Commons.Color.accent
     width: parent ? parent.width : 200
     height: meterLabel.height + Style.space(10)
     Text {
@@ -621,7 +622,7 @@ Panel {
     signal activated()
     textFormat: Text.PlainText
     text: (icon ? icon + " " : "") + label
-    color: actionMouse.containsMouse ? Color.accent : baseColor
+    color: actionMouse.containsMouse ? Commons.Color.accent : baseColor
     font.family: root.font
     font.pixelSize: Style.font.caption
     font.underline: actionMouse.containsMouse
@@ -682,7 +683,7 @@ Panel {
           width: Style.space(18)
           horizontalAlignment: Text.AlignHCenter
           text: root.kindIcon(block.dev.kind)
-          color: block.online ? Color.accent : root.dim
+          color: block.online ? Commons.Color.accent : root.dim
           font.family: root.font
           font.pixelSize: Style.font.icon
           MouseArea { id: iconMouse; anchors.fill: parent; hoverEnabled: true; acceptedButtons: Qt.NoButton }
@@ -745,7 +746,7 @@ Panel {
             visible: block.dev.new === true
             textFormat: Text.PlainText
             text: root.t("newBadge")
-            color: Color.accent
+            color: Commons.Color.accent
             font.family: root.font
             font.pixelSize: Style.font.caption
             font.bold: true
@@ -763,7 +764,7 @@ Panel {
             visible: block.webUrl !== ""
             textFormat: Text.PlainText
             text: root.glyph(0xF059F)
-            color: webMouse.containsMouse ? Color.accent : root.fg
+            color: webMouse.containsMouse ? Commons.Color.accent : root.fg
             font.family: root.font
             font.pixelSize: Style.font.caption
             MouseArea {
@@ -785,7 +786,7 @@ Panel {
           anchors.verticalCenter: parent.verticalCenter
           text: block.copied ? root.t("copiedClipboard") : root.deviceRightLabel(block.dev)
           color: (block.dev.is_gateway || block.dev.is_self)
-            ? Color.accent
+            ? Commons.Color.accent
             : (block.online ? root.fg : root.dim)
           font.family: root.font
           font.pixelSize: Style.font.caption
@@ -797,7 +798,7 @@ Panel {
           anchors.verticalCenter: parent.verticalCenter
           // No `width` binding: deriving it from visible/implicitWidth loops; empty text keeps it narrow.
           text: String(block.dev.ip || "") === "" ? "" : block.copied ? root.glyph(0xF012C) : root.glyph(0xF018F)
-          color: block.copied || copyMouse.containsMouse ? Color.accent : root.dim
+          color: block.copied || copyMouse.containsMouse ? Commons.Color.accent : root.dim
           font.family: root.font
           font.pixelSize: Style.font.caption
 
@@ -969,7 +970,7 @@ Panel {
         width: Style.space(18)
         horizontalAlignment: Text.AlignHCenter
         text: root.glyph(header.group.icon || 0xF0625)
-        color: header.group.online > 0 ? Color.accent : root.dim
+        color: header.group.online > 0 ? Commons.Color.accent : root.dim
         font.family: root.font
         font.pixelSize: Style.font.icon
       }
@@ -996,7 +997,7 @@ Panel {
         anchors.verticalCenter: parent.verticalCenter
         text: (header.group.hasNew ? root.t("newBadge") + "  " : "") + header.group.count + (header.group.online !== header.group.count
           ? " · " + root.t("onlineN", [header.group.online]) : "")
-        color: header.group.hasNew ? Color.accent : root.dim
+        color: header.group.hasNew ? Commons.Color.accent : root.dim
         font.family: root.font
         font.pixelSize: Style.font.caption
       }
@@ -1098,9 +1099,9 @@ Panel {
       width: Style.space(big ? 24 : 20)
       height: width
       radius: width / 2
-      color: big ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.16) : "transparent"
+      color: big ? Qt.rgba(Commons.Color.accent.r, Commons.Color.accent.g, Commons.Color.accent.b, 0.16) : "transparent"
       border.width: 1
-      border.color: mapRow.online ? Color.accent : Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.3)
+      border.color: mapRow.online ? Commons.Color.accent : Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.3)
       Text {
         anchors.centerIn: parent
         textFormat: Text.PlainText
@@ -1111,7 +1112,7 @@ Panel {
           if (r.type === "group") return root.glyph(r.node.icon || 0xF0625)
           return root.kindIcon(mapRow.dev ? mapRow.dev.kind : "unknown")
         }
-        color: mapRow.online ? Color.accent : root.dim
+        color: mapRow.online ? Commons.Color.accent : root.dim
         font.family: root.font
         font.pixelSize: nodeIcon.big ? Style.font.body : Style.font.caption
       }
@@ -1154,7 +1155,7 @@ Panel {
           if (mapRow.row.type === "device" && d && d.new) return root.t("newBadge")
           return ""
         }
-        color: Color.accent
+        color: Commons.Color.accent
         font.family: root.font
         font.pixelSize: Style.font.caption
         font.bold: true
@@ -1186,7 +1187,7 @@ Panel {
         visible: mapRow.dev !== null && String(mapRow.dev.ip || "") !== "" && mapRow.row.type !== "group"
         property bool copied: false
         text: root.glyph(copied ? 0xF012C : 0xF018F)
-        color: copied || mapCopyMouse.containsMouse ? Color.accent : root.dim
+        color: copied || mapCopyMouse.containsMouse ? Commons.Color.accent : root.dim
         font.family: root.font
         font.pixelSize: Style.font.caption
         Timer { id: mapCopyTimer; interval: 1400; onTriggered: mapCopy.copied = false }
@@ -1249,7 +1250,7 @@ Panel {
       anchors.centerIn: parent
       textFormat: Text.PlainText
       text: root.glyph(tab.icon) + "  " + tab.label
-      color: tab.active ? Color.accent : (tabMouse.containsMouse ? root.fg : root.dim)
+      color: tab.active ? Commons.Color.accent : (tabMouse.containsMouse ? root.fg : root.dim)
       font.family: root.font
       font.pixelSize: Style.font.bodySmall
       font.bold: tab.active
@@ -1260,7 +1261,7 @@ Panel {
       width: parent.width - Style.space(8)
       height: Style.space(2)
       radius: 1
-      color: Color.accent
+      color: Commons.Color.accent
       visible: tab.active
     }
     MouseArea {
@@ -1355,7 +1356,7 @@ Panel {
               Text {
                 textFormat: Text.PlainText
                 text: root.glyph(0xF043B)
-                color: root.stats.active ? Color.accent : root.dim
+                color: root.stats.active ? Commons.Color.accent : root.dim
                 font.family: root.font
                 font.pixelSize: Style.font.display
               }
@@ -1482,7 +1483,7 @@ Panel {
               width: parent.width
               height: vpnColumn.implicitHeight + Style.space(14)
               radius: Style.space(6)
-              readonly property color tint: root.hostWidget && root.hostWidget.vpnBlue ? root.hostWidget.vpnBlue : Color.accent
+              readonly property color tint: root.hostWidget && root.hostWidget.vpnBlue ? root.hostWidget.vpnBlue : Commons.Color.accent
               color: Qt.rgba(tint.r, tint.g, tint.b, 0.14)
               border.width: 1
               border.color: Qt.rgba(tint.r, tint.g, tint.b, 0.6)
@@ -1584,7 +1585,7 @@ Panel {
                   if (totalRate <= 0) return 0
                   return Math.min(1, Math.log10(1 + totalRate / 1024) / 4)
                 }
-                fillColor: Color.accent
+                fillColor: Commons.Color.accent
                 tip: root.t("trafficTip", [root.formatBytes(root.traffic.rx_bytes), root.formatBytes(root.traffic.tx_bytes)])
               }
 
@@ -1593,7 +1594,7 @@ Panel {
                 visible: root.vpn !== null
                 width: parent.width
                 height: vpnLine.implicitHeight
-                readonly property color tint: root.hostWidget && root.hostWidget.vpnBlue ? root.hostWidget.vpnBlue : Color.accent
+                readonly property color tint: root.hostWidget && root.hostWidget.vpnBlue ? root.hostWidget.vpnBlue : Commons.Color.accent
                 Text {
                   id: vpnLine
                   textFormat: Text.PlainText
@@ -1724,7 +1725,7 @@ Panel {
                     width: parent.width
                     wrapMode: Text.WordWrap
                     text: root.fritz.message_code ? root.t(root.fritz.message_code, root.fritz.message_args || []) : String(root.fritz.message || "")
-                    color: root.fritz.state === "error" ? Color.accent : root.dim
+                    color: root.fritz.state === "error" ? Commons.Color.accent : root.dim
                     font.family: root.font
                     font.pixelSize: Style.font.caption
                   }
@@ -1796,7 +1797,7 @@ Panel {
                         anchors.rightMargin: Style.space(8)
                         anchors.verticalCenter: parent.verticalCenter
                         text: root.glyph(root.showPassword ? 0xF0209 : 0xF0208)
-                        color: eyeMouse.containsMouse ? Color.accent : root.dim
+                        color: eyeMouse.containsMouse ? Commons.Color.accent : root.dim
                         font.family: root.font
                         font.pixelSize: Style.font.body
                         MouseArea {
@@ -1906,9 +1907,9 @@ Panel {
                 width: parent.width
                 height: newRow.implicitHeight + Style.space(12)
                 radius: Style.space(6)
-                color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.14)
+                color: Qt.rgba(Commons.Color.accent.r, Commons.Color.accent.g, Commons.Color.accent.b, 0.14)
                 border.width: 1
-                border.color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.5)
+                border.color: Qt.rgba(Commons.Color.accent.r, Commons.Color.accent.g, Commons.Color.accent.b, 0.5)
                 Item {
                   id: newRow
                   anchors.fill: parent
