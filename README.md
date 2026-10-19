@@ -32,6 +32,8 @@ The interface is built in in eight languages: English, German (Deutsch), French 
 
 The settings page opens from the gear and closes with **← Back**, Backspace or Esc. It also holds **New-device alerts** (on/off), which used to be a button in the main panel.
 
+The **ⓘ** button beside the gear opens an **Information** page with a card for each of the author's other plugins in the Omarchy Plugin Marketplace, with a short description in the panel's language. A click on a card opens that plugin's marketplace page in the browser (a fixed `https://plugins.omarchy.org/plugin.html?id=…` address); nothing is downloaded. **← Back**, Backspace or Esc returns.
+
 ## VPNs
 
 While a VPN is active (NordVPN, WireGuard, Proton VPN, Mullvad, Tailscale, OpenVPN and other tunnel interfaces), the bar icon turns **blue**, the panel shows a line such as "NordVPN is on · home network reachable" under the traffic meter, and the network map labels the top node "Internet via NordVPN". Many VPNs block the home network: devices then look idle or asleep, and the router page, names from the network and FRITZ!Box details are unavailable. WLAN Monitor checks the router about every 30 s while a VPN is up (a TCP connect to ports 80, 53 or 443). If the router does not answer, the panel shows which VPN blocks the home network and how to allow it (for NordVPN: `nordvpn set lan-discovery enable`, with a button to copy the command). It also pauses its own scans and the FRITZ!Box reading until the network is reachable again.
