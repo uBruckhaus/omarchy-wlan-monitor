@@ -1768,6 +1768,11 @@ class FritzMesh:
             if (ip, mac) != self.network[:2]:
                 self.clients, self.aps, self.updated = {}, [], 0.0
                 self.state, self.message = "off", ""
+                if self.pending_login is not None:
+                    # A login typed for the old gateway never goes to the new one.
+                    self.pending_login = None
+                    self.state, self.message = "error", "The network changed before the login was sent."
+                    self.message_code, self.message_args = "fzNetworkChanged", []
             self.network = (ip, mac, is_fritz)
             wake = panel_open and not self.panel_open
             self.panel_open = panel_open
@@ -1775,8 +1780,16 @@ class FritzMesh:
             self.wake.set()
 
     def login(self, user, password):
+        """Queue a login for the gateway shown right now: it is bound to that gateway's address and
+        MAC, dropped when the network changes, and sent nowhere else (step)."""
         with self.lock:
-            self.pending_login = (user, password)
+            ip, mac, _is_fritz = self.network
+            if not ip or not mac:
+                self.pending_login = None
+                self.state, self.message = "error", "The network changed before the login was sent."
+                self.message_code, self.message_args = "fzNetworkChanged", []
+                return
+            self.pending_login = (user, password, ip, mac)
             self.state, self.message = "connecting", "Connecting to the FRITZ!Box…"
             self.message_code, self.message_args = "fzConnecting", []
         self.wake.set()
@@ -1840,6 +1853,12 @@ class FritzMesh:
             model = fritz_model(ip)
             with self.lock:
                 self.model, self.model_for = model, (ip, mac)
+        if pending and pending[2:] != (ip, mac):
+            # Queued for another gateway (the network changed in between): never sent here.
+            with self.lock:
+                self.state, self.message = "error", "The network changed before the login was sent."
+                self.message_code, self.message_args = "fzNetworkChanged", []
+            return 5.0
         if pending:
             try:
                 # Trust on first use: remember the certificate seen while the user logs in.

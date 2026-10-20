@@ -726,6 +726,34 @@ class FritzTests(unittest.TestCase):
         fritz.logout()
         self.assertFalse(os.path.exists(path))
 
+    def test_a_queued_login_never_goes_to_another_gateway(self):
+        """Typed for router A, the network changes to router B (even at the same address) before
+        the login is sent: nothing is sent to B, nothing is saved, the user is told."""
+        never = mock.patch.object(wlan_monitor, "bounded_http", side_effect=AssertionError("must not connect"))
+        no_model = mock.patch.object(wlan_monitor, "fritz_model", return_value="")
+        fritz = wlan_monitor.FritzMesh()
+        fritz.set_network("192.168.178.1", "1c:23:a2:92:2a:6c", True, True)
+        fritz.login("fritz1234", "s3cret pass")
+        self.assertEqual(fritz.pending_login[2:], ("192.168.178.1", "1c:23:a2:92:2a:6c"))
+        fritz.set_network("192.168.178.1", "66:66:66:66:66:66", True, True)     # router B, same address
+        self.assertIsNone(fritz.pending_login)
+        with never, no_model:
+            fritz.step()
+        info = fritz.snapshot()[0]
+        self.assertEqual((info["state"], info["message_code"]), ("error", "fzNetworkChanged"))
+        self.assertIsNone(wlan_monitor.load_fritz())
+        # A login still queued for A when step() already sees B (the change not reported yet): not sent.
+        fritz.pending_login = ("fritz1234", "s3cret pass", "192.168.178.1", "1c:23:a2:92:2a:6c")
+        with never, no_model:
+            fritz.step()
+        self.assertEqual(fritz.snapshot()[0]["message_code"], "fzNetworkChanged")
+        self.assertIsNone(fritz.pending_login)
+        # No gateway known: a login is refused at once, nothing is queued.
+        fritz.set_network(None, "", False, True)
+        fritz.login("fritz1234", "s3cret pass")
+        self.assertIsNone(fritz.pending_login)
+        self.assertEqual(fritz.snapshot()[0]["state"], "error")
+
     def test_wrong_password_and_changed_certificate(self):
         def unauthorized(ip, port, method, path, body=None, headers=None, tls=False, pin=None, **kw):
             return 401, {"www-authenticate": 'Digest realm="r", nonce="n", qop="auth"'}, b"", "c" * 64
