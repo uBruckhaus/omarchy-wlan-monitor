@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "ubruckhaus.wlan-monitor",
   "name": "WLAN Monitor",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "author": "uBruckhaus",
   "description": "See who is on your Wi-Fi from the bar: every device with a type icon and plain-language status, your own names, new-device alerts, groups by platform, type or Wi-Fi band, a network map, FRITZ!Box mesh details and VPN detection that explains when a VPN blocks your home network. Active scans only on trusted networks.",
   "kinds": [

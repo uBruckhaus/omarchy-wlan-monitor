@@ -700,6 +700,12 @@ def read_neighbors(iface):
     return parse_neighbors(out)
 
 
+def neighbor_mac(ip):
+    """The MAC the kernel holds for `ip` right now ("" if none): read again just before a login's
+    password response is sent, so a router that took over the address in between gets nothing."""
+    return parse_neighbors(run_cmd(["ip", "-4", "neigh", "show", "to", ip])).get(ip, {}).get("mac", "")
+
+
 def parse_neighbors(out):
     neighbors = {}
     for line in out.splitlines():
@@ -1574,8 +1580,11 @@ class FritzError(Exception):
         self.args_ = [str(a) for a in args]
 
 
-def fritz_soap(ip, user, password, pin, service, control, action):
-    """Call one TR-064 action with Digest auth over pinned HTTPS; returns (body_text, cert)."""
+def fritz_soap(ip, user, password, pin, service, control, action, still_ok=None):
+    """Call one TR-064 action with Digest auth over pinned HTTPS; returns (body_text, cert).
+
+    `still_ok` is called after the challenge arrives and before the password-derived response is
+    sent; when it returns False nothing is sent (fzNetworkChanged)."""
     envelope = (
         '<?xml version="1.0" encoding="utf-8"?>'
         '<s:Envelope s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/" '
@@ -1589,6 +1598,8 @@ def fritz_soap(ip, user, password, pin, service, control, action):
             challenge = parse_digest_challenge(hdrs.get("www-authenticate", ""))
             if not challenge:
                 raise FritzError("fzMethod", "The FRITZ!Box asked for an unsupported login method.")
+            if still_ok is not None and not still_ok():
+                raise FritzError("fzNetworkChanged", "The network changed before the login was sent.")
             auth = dict(headers, Authorization=digest_authorization(
                 user, password, "POST", control, challenge, os.urandom(8).hex()))
             status, hdrs, body, cert = bounded_http(ip, FRITZ_TLS_PORT, "POST", control, envelope, auth, tls=True, pin=cert)
@@ -1751,6 +1762,7 @@ class FritzMesh:
         self.aps = []
         self.updated = 0.0
         self.pending_login = None
+        self.generation = 0  # +1 on every gateway change or logout; work begun before it is dropped
         self.thread = None
 
     def start(self):
@@ -1766,6 +1778,7 @@ class FritzMesh:
             ip = None
         with self.lock:
             if (ip, mac) != self.network[:2]:
+                self.generation += 1
                 self.clients, self.aps, self.updated = {}, [], 0.0
                 self.state, self.message = "off", ""
                 if self.pending_login is not None:
@@ -1789,7 +1802,7 @@ class FritzMesh:
                 self.state, self.message = "error", "The network changed before the login was sent."
                 self.message_code, self.message_args = "fzNetworkChanged", []
                 return
-            self.pending_login = (user, password, ip, mac)
+            self.pending_login = (user, password, ip, mac, self.generation)
             self.state, self.message = "connecting", "Connecting to the FRITZ!Box…"
             self.message_code, self.message_args = "fzConnecting", []
         self.wake.set()
@@ -1798,6 +1811,7 @@ class FritzMesh:
         with self.lock:
             self.creds = None
             self.pending_login = None
+            self.generation += 1
             self.clients, self.aps, self.updated = {}, [], 0.0
             self.state, self.message = "off", ""
         remove_fritz()
@@ -1818,9 +1832,15 @@ class FritzMesh:
                 "updated": int(self.updated),
             }, dict(self.clients)
 
-    def refresh(self, ip, creds):
+    def current(self, ip, mac, generation):
+        """True while the gateway is still the one the work began with (no change, no logout)."""
+        with self.lock:
+            return self.network[:2] == (ip, mac) and self.generation == generation
+
+    def refresh(self, ip, creds, still_ok=None):
         text, _ = fritz_soap(ip, creds["user"], creds["password"], creds["pin"],
-                             "urn:dslforum-org:service:Hosts:1", "/upnp/control/hosts", "X_AVM-DE_GetMeshListPath")
+                             "urn:dslforum-org:service:Hosts:1", "/upnp/control/hosts", "X_AVM-DE_GetMeshListPath",
+                             still_ok)
         match = re.search(r"<NewX_AVM-DE_MeshListPath>([^<]{1,200})</NewX_AVM-DE_MeshListPath>", text)
         path = match.group(1).replace("&amp;", "&") if match else ""
         if not MESH_PATH_RE.match(path):
@@ -1843,6 +1863,7 @@ class FritzMesh:
         with self.lock:
             ip, mac, is_fritz = self.network
             pending, self.pending_login = self.pending_login, None
+            generation = self.generation
             creds = self.creds
             interval = FRITZ_POLL_OPEN if self.panel_open else FRITZ_POLL_CLOSED
             age = time.time() - self.updated
@@ -1853,26 +1874,40 @@ class FritzMesh:
             model = fritz_model(ip)
             with self.lock:
                 self.model, self.model_for = model, (ip, mac)
-        if pending and pending[2:] != (ip, mac):
+        if pending and pending[2:] != (ip, mac, generation):
             # Queued for another gateway (the network changed in between): never sent here.
             with self.lock:
                 self.state, self.message = "error", "The network changed before the login was sent."
                 self.message_code, self.message_args = "fzNetworkChanged", []
             return 5.0
         if pending:
+            # The probe above took time: the gateway may have changed since the snapshot. The
+            # password-derived response goes out only while this is still the gateway the login
+            # was typed for (same generation, and the kernel still has its MAC at this address),
+            # checked once more right before it is sent.
+            def still_ok():
+                return self.current(ip, mac, generation) and neighbor_mac(ip) == mac
             try:
+                if not still_ok():
+                    raise FritzError("fzNetworkChanged", "The network changed before the login was sent.")
                 # Trust on first use: remember the certificate seen while the user logs in.
                 _, cert = fritz_soap(ip, pending[0], pending[1], None, "urn:dslforum-org:service:Hosts:1",
-                                     "/upnp/control/hosts", "X_AVM-DE_GetMeshListPath")
+                                     "/upnp/control/hosts", "X_AVM-DE_GetMeshListPath", still_ok)
                 creds = {"gateway_mac": mac, "user": pending[0], "password": pending[1], "pin": cert}
-                clients, aps = self.refresh(ip, creds)
+                clients, aps = self.refresh(ip, creds, still_ok)
             except FritzError as exc:
                 with self.lock:
-                    self.state, self.message = "error", str(exc)
-                    self.message_code, self.message_args = exc.code, exc.args_
+                    if self.generation == generation or exc.code == "fzNetworkChanged":
+                        self.state, self.message = "error", str(exc)
+                        self.message_code, self.message_args = exc.code, exc.args_
                 return 5.0
-            save_private_json(FRITZ_FILE, creds)
             with self.lock:
+                if self.network[:2] != (ip, mac) or self.generation != generation:
+                    # Changed while the login was in flight: nothing from it is kept or saved.
+                    self.state, self.message = "error", "The network changed before the login was sent."
+                    self.message_code, self.message_args = "fzNetworkChanged", []
+                    return 5.0
+                save_private_json(FRITZ_FILE, creds)
                 self.creds = creds
                 self.clients, self.aps, self.updated = clients, aps, time.time()
                 self.state, self.message = "connected", ""
@@ -1883,12 +1918,17 @@ class FritzMesh:
         if age < due:
             return min(5.0, due - age)
         try:
-            clients, aps = self.refresh(ip, creds)
+            # Saved credentials go only to the pinned certificate; a gateway change in between
+            # still stops the request before the response is sent.
+            clients, aps = self.refresh(ip, creds, lambda: self.current(ip, mac, generation))
         except FritzError as exc:
             with self.lock:
-                self.state, self.message, self.updated = "error", str(exc), time.time()
+                if self.generation == generation:
+                    self.state, self.message, self.updated = "error", str(exc), time.time()
             return 5.0
         with self.lock:
+            if self.generation != generation:
+                return 5.0  # the old gateway's mesh list is never shown for the new one
             self.clients, self.aps, self.updated = clients, aps, time.time()
             self.state, self.message = "connected", ""
         return interval

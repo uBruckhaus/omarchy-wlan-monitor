@@ -614,8 +614,13 @@ class FritzTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.env = mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": self.tmp.name})
         self.env.start()
+        # The kernel's neighbour table as the tests want it (never this machine's real one).
+        self.neighbors = {"192.168.178.1": "1c:23:a2:92:2a:6c"}
+        self.neigh = mock.patch.object(wlan_monitor, "neighbor_mac", side_effect=lambda ip: self.neighbors.get(ip, ""))
+        self.neigh.start()
 
     def tearDown(self):
+        self.neigh.stop()
         self.env.stop()
         self.tmp.cleanup()
 
@@ -734,7 +739,7 @@ class FritzTests(unittest.TestCase):
         fritz = wlan_monitor.FritzMesh()
         fritz.set_network("192.168.178.1", "1c:23:a2:92:2a:6c", True, True)
         fritz.login("fritz1234", "s3cret pass")
-        self.assertEqual(fritz.pending_login[2:], ("192.168.178.1", "1c:23:a2:92:2a:6c"))
+        self.assertEqual(fritz.pending_login[2:4], ("192.168.178.1", "1c:23:a2:92:2a:6c"))
         fritz.set_network("192.168.178.1", "66:66:66:66:66:66", True, True)     # router B, same address
         self.assertIsNone(fritz.pending_login)
         with never, no_model:
@@ -743,7 +748,7 @@ class FritzTests(unittest.TestCase):
         self.assertEqual((info["state"], info["message_code"]), ("error", "fzNetworkChanged"))
         self.assertIsNone(wlan_monitor.load_fritz())
         # A login still queued for A when step() already sees B (the change not reported yet): not sent.
-        fritz.pending_login = ("fritz1234", "s3cret pass", "192.168.178.1", "1c:23:a2:92:2a:6c")
+        fritz.pending_login = ("fritz1234", "s3cret pass", "192.168.178.1", "1c:23:a2:92:2a:6c", 1)
         with never, no_model:
             fritz.step()
         self.assertEqual(fritz.snapshot()[0]["message_code"], "fzNetworkChanged")
@@ -753,6 +758,96 @@ class FritzTests(unittest.TestCase):
         fritz.login("fritz1234", "s3cret pass")
         self.assertIsNone(fritz.pending_login)
         self.assertEqual(fritz.snapshot()[0]["state"], "error")
+
+    def challenge_http(self, calls, on_challenge=None):
+        soap_ok = ("<s:Envelope><NewX_AVM-DE_MeshListPath>/meshlist.lua?sid=0123456789abcdef"
+                   "</NewX_AVM-DE_MeshListPath></s:Envelope>")
+        mesh_json = __import__("json").dumps(self.MESH).encode()
+
+        def fake_http(ip, port, method, path, body=None, headers=None, tls=False, pin=None, **kw):
+            calls.append((method, (headers or {}).get("Authorization", "")))
+            if method == "POST" and "Authorization" not in (headers or {}):
+                if on_challenge:
+                    on_challenge()
+                return 401, {"www-authenticate": 'Digest realm="F!Box SOAP-Auth", nonce="N1", qop="auth"'}, b"", "c" * 64
+            if method == "POST":
+                return 200, {}, soap_ok.encode(), "c" * 64
+            return 200, {}, mesh_json, "c" * 64
+        return fake_http
+
+    def test_a_gateway_change_during_login_work_sends_no_password_response(self):
+        """The gateway changes (router B at the same address) while a login is in flight: during
+        the model probe, between the challenge and the response, or seen only by the kernel. No
+        Digest response is sent, nothing is saved, nothing of the old login is kept."""
+        A, B = "1c:23:a2:92:2a:6c", "66:66:66:66:66:66"
+        ip = "192.168.178.1"
+
+        def run(probe=None, on_challenge=None):
+            fritz = wlan_monitor.FritzMesh()
+            fritz.set_network(ip, A, True, True)
+            fritz.login("fritz1234", "s3cret pass")
+            calls = []
+            model = (lambda _ip: probe(fritz) or "") if probe else (lambda _ip: "")
+            hook = (lambda: on_challenge(fritz)) if on_challenge else None
+            with mock.patch.object(wlan_monitor, "fritz_model", side_effect=model), \
+                    mock.patch.object(wlan_monitor, "bounded_http", side_effect=self.challenge_http(calls, hook)):
+                fritz.step()
+            return fritz, calls
+
+        # 1. B takes over the address during the model probe (set_network reports it).
+        fritz, calls = run(probe=lambda f: f.set_network(ip, B, True, True))
+        self.assertEqual(calls, [])
+        self.assertEqual(fritz.snapshot()[0]["message_code"], "fzNetworkChanged")
+        # 2. B answers the challenge: the change arrives after it, before the response.
+        fritz, calls = run(on_challenge=lambda f: f.set_network(ip, B, True, True))
+        self.assertEqual([auth for _m, auth in calls], [""])
+        # 3. Not reported yet, but the kernel already has B's MAC at this address.
+        self.neighbors[ip] = B
+        fritz, calls = run(on_challenge=lambda f: None)
+        self.assertEqual(calls, [])
+        self.neighbors[ip] = A
+        # 4. A logout while the login is in flight.
+        fritz, calls = run(on_challenge=lambda f: f.logout())
+        self.assertEqual([auth for _m, auth in calls], [""])
+        self.assertIsNone(fritz.creds)
+        self.assertIsNone(wlan_monitor.load_fritz())
+        # 5. The change comes after the response, before the result is kept: nothing kept or saved.
+        fritz = wlan_monitor.FritzMesh()
+        fritz.set_network(ip, A, True, True)
+        fritz.login("fritz1234", "s3cret pass")
+        calls = []
+        real = self.challenge_http(calls)
+
+        def late(*args, **kw):
+            result = real(*args, **kw)
+            if args[2] == "GET":
+                fritz.set_network(ip, B, True, True)
+            return result
+        with mock.patch.object(wlan_monitor, "fritz_model", return_value=""), \
+                mock.patch.object(wlan_monitor, "bounded_http", side_effect=late):
+            fritz.step()
+        info, clients = fritz.snapshot()
+        self.assertEqual((info["message_code"], clients), ("fzNetworkChanged", {}))
+        self.assertIsNone(fritz.creds)
+        self.assertIsNone(wlan_monitor.load_fritz())
+        # Unchanged gateway: the login still works.
+        fritz, calls = run()
+        self.assertEqual(fritz.snapshot()[0]["state"], "connected")
+        self.assertIn('username="fritz1234"', calls[1][1])
+
+    def test_saved_login_refresh_stops_on_gateway_change(self):
+        A, ip = "1c:23:a2:92:2a:6c", "192.168.178.1"
+        wlan_monitor.save_private_json(wlan_monitor.FRITZ_FILE, {"gateway_mac": A, "user": "u", "password": "p",
+                                                                 "pin": "c" * 64})
+        fritz = wlan_monitor.FritzMesh()
+        fritz.set_network(ip, A, True, True)
+        fritz.model_for = (ip, A)
+        calls = []
+        hook = lambda: fritz.set_network(ip, "66:66:66:66:66:66", True, True)
+        with mock.patch.object(wlan_monitor, "bounded_http", side_effect=self.challenge_http(calls, hook)):
+            fritz.step()
+        self.assertEqual([auth for _m, auth in calls], [""])
+        self.assertEqual(fritz.snapshot()[1], {})
 
     def test_wrong_password_and_changed_certificate(self):
         def unauthorized(ip, port, method, path, body=None, headers=None, tls=False, pin=None, **kw):
