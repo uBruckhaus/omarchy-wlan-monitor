@@ -1420,6 +1420,8 @@ Panel {
               width: parent.width
               separated: false
               ownId: "ubruckhaus.wlan-monitor"
+              // The list from the marketplace's catalog when the page shows (plugin_catalog.py).
+              catalogScript: decodeURIComponent(Qt.resolvedUrl("plugin_catalog.py").toString().replace(/^file:\/\//, ""))
               lang: root.lang
               fg: root.fg
               dim: root.dim
