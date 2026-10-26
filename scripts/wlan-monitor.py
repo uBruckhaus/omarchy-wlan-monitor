@@ -2132,9 +2132,10 @@ class FritzMesh:
             }, dict(self.clients)
 
     def current(self, ip, mac, generation):
-        """True while the gateway is still the one the work began with (no change, no logout)."""
+        """True while the gateway is still the one the work began with (no change, no logout, no
+        Disconnect still being finished)."""
         with self.lock:
-            return self.network[:2] == (ip, mac) and self.generation == generation
+            return self.network[:2] == (ip, mac) and self.generation == generation and not self.revoke_pending
 
     def refresh(self, ip, creds, still_ok=None, iface=None):
         text, _ = fritz_soap(ip, creds["user"], creds["password"], creds["pin"],
@@ -2172,6 +2173,8 @@ class FritzMesh:
                 if self.revoke_pending:
                     return FRITZ_REVOKE_RETRY
         with self.lock:
+            if self.revoke_pending:  # a Disconnect began meanwhile: nothing saved is used
+                return FRITZ_REVOKE_RETRY
             ip, mac, is_fritz = self.network
             iface = self.iface
             pending, self.pending_login = self.pending_login, None
@@ -2265,7 +2268,7 @@ class FritzMesh:
         disk = load_fritz()
         if disk != creds:
             with self.lock:
-                if self.generation != generation:
+                if self.generation != generation or self.revoke_pending:
                     return 5.0
                 self.creds, creds = disk, disk
                 self.generation += 1

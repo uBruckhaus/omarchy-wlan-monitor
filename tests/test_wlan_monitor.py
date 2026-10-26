@@ -955,6 +955,33 @@ class FritzTests(unittest.TestCase):
         self.assertFalse(fritz.revoke_pending)
         self.assertEqual(fritz.snapshot()[0]["state"], "off")
 
+    def test_a_failed_disconnect_during_a_step_uses_nothing(self):
+        """The worker passed its revoke check when a Disconnect whose revision cannot be written
+        starts: it neither adopts the old login from disk nor sends anything with it."""
+        A, ip = "1c:23:a2:92:2a:6c", "192.168.178.1"
+        wlan_monitor.save_private_json(wlan_monitor.FRITZ_FILE, {"gateway_mac": A, "user": "u", "password": "p",
+                                                                 "pin": "c" * 64})
+        fritz = wlan_monitor.FritzMesh()
+        fritz.set_network(ip, A, True, True, "wlan0")
+        fritz.model_for = (ip, A)
+        never = mock.patch.object(wlan_monitor, "bounded_http", side_effect=AssertionError("must not connect"))
+        real_load = wlan_monitor.load_fritz
+        calls = []
+
+        def load_then_disconnect():
+            if not calls:
+                calls.append(1)
+                fritz.logout()  # between the step's checks, and its revision cannot be written
+            return real_load()
+        with mock.patch.object(wlan_monitor, "fritz_new_revision", return_value=None), never, \
+                mock.patch.object(wlan_monitor, "load_fritz", side_effect=load_then_disconnect):
+            fritz.creds = None
+            fritz.step()
+            self.assertIsNone(fritz.creds)
+            self.assertFalse(fritz.current(ip, A, fritz.generation))
+            self.assertEqual(fritz.step(), wlan_monitor.FRITZ_REVOKE_RETRY)
+        self.assertTrue(fritz.revoke_pending)
+
     def test_a_login_file_that_cannot_be_deleted_is_used_nowhere(self):
         A, ip = "1c:23:a2:92:2a:6c", "192.168.178.1"
         wlan_monitor.save_private_json(wlan_monitor.FRITZ_FILE, {"gateway_mac": A, "user": "u", "password": "p",
