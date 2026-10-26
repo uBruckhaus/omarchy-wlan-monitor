@@ -31,6 +31,8 @@ stored owner-only and bound to that router's MAC) a background thread reads the 
 list over TR-064 HTTPS (port 49443, certificate pinned at login) to show which access
 point, band and speed each device uses.
 """
+import contextlib
+import fcntl
 import hashlib
 import http.client
 import ipaddress
@@ -98,6 +100,11 @@ VIEW_MODES = ("list", "platform", "type", "band", "ap")
 GROUP_ID_RE = re.compile(r"^([a-z]{2,12}|([0-9a-f]{2}:){5}[0-9a-f]{2})$")
 MAX_COLLAPSED = 32
 FRITZ_FILE = "fritzbox.json"
+# Shared by every collector (one per screen): an interprocess lock around the saved login and a
+# revision that every Disconnect replaces, so a login still in flight elsewhere is never saved after it.
+FRITZ_LOCK_FILE = "fritzbox.lock"
+FRITZ_REV_FILE = "fritzbox-rev.json"
+FRITZ_LOCK_WAIT = 2.0
 FRITZ_USER_RE = re.compile(r"^[A-Za-z0-9._@-]{0,64}$")
 # The collector's id for the network it talks to right now: a random per-process part and a
 # counter that changes with every gateway change (stats.link.net_id, fritz_login "net").
@@ -1106,6 +1113,21 @@ def config_dir():
     return os.path.join(base, "ubruckhaus-wlan-monitor")
 
 
+def private_config_dir():
+    """The config directory, created 0700 if missing; None unless it is a real directory of ours."""
+    directory = config_dir()
+    try:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        info = os.lstat(directory)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            return None
+        if info.st_mode & 0o077:
+            os.chmod(directory, 0o700)
+        return directory
+    except OSError:
+        return None
+
+
 def load_private_json(filename, max_bytes=65536):
     """Read a JSON file from the config directory; refuses symlinks, foreign or oversized files."""
     path = os.path.join(config_dir(), filename)
@@ -1143,15 +1165,11 @@ def save_private_json(filename, data, max_bytes=None, compact=False):
         text = json.dumps(data, indent=2)
     if max_bytes is not None and len(text.encode("utf-8")) > max_bytes:
         return False
-    directory = config_dir()
+    directory = private_config_dir()
+    if not directory:
+        return False
     tmp = None
     try:
-        os.makedirs(directory, mode=0o700, exist_ok=True)
-        info = os.lstat(directory)
-        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
-            return False
-        if info.st_mode & 0o077:
-            os.chmod(directory, 0o700)
         # Exclusive, unpredictable temp file, private before anything is written (credentials too).
         fd, tmp = tempfile.mkstemp(prefix=f".{filename}.", suffix=".tmp", dir=directory)
         os.fchmod(fd, 0o600)
@@ -1237,7 +1255,9 @@ def parse_command(line):
         collapsed = data.get("collapsed")
         if mode not in VIEW_MODES or not isinstance(collapsed, list):
             return ""
-        ids = [g for g in collapsed if isinstance(g, str) and GROUP_ID_RE.match(g)]
+        if not all(isinstance(g, str) for g in collapsed):
+            return ""  # a wrong type anywhere refuses the whole command
+        ids = [g for g in collapsed if GROUP_ID_RE.match(g)]
         return {"cmd": cmd, "mode": mode, "collapsed": list(dict.fromkeys(ids))[:MAX_COLLAPSED]}
     if cmd == "fritz_login":
         user, password = data.get("user", ""), data.get("password")
@@ -1854,6 +1874,49 @@ def remove_fritz():
         pass
 
 
+@contextlib.contextmanager
+def fritz_file_lock():
+    """Exclusive lock shared by all collectors, held only for quick file work. Yields True while
+    held and False if it could not be taken within FRITZ_LOCK_WAIT (callers then fail closed);
+    the lock file is private, never followed through a symlink and never anything but a file."""
+    fd = None
+    try:
+        directory = private_config_dir()
+        if directory:
+            fd = os.open(os.path.join(directory, FRITZ_LOCK_FILE),
+                         os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o600)
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+                raise PermissionError("not a private lock file")
+            if info.st_mode & 0o077:
+                os.fchmod(fd, 0o600)
+            deadline = time.monotonic() + FRITZ_LOCK_WAIT
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.02)
+    except OSError:
+        if fd is not None:
+            os.close(fd)
+        fd = None
+    try:
+        yield fd is not None
+    finally:
+        if fd is not None:
+            os.close(fd)  # releases the lock
+
+
+def fritz_revision():
+    """The saved login's revision ("" before the first Disconnect); a new one on every Disconnect."""
+    data = load_private_json(FRITZ_REV_FILE, 256)
+    rev = data.get("rev") if isinstance(data, dict) else None
+    return rev if isinstance(rev, str) and re.fullmatch(r"[0-9a-f]{32}", rev) else ""
+
+
 class FritzMesh:
     """Background reader for the FRITZ!Box: model name always, mesh list only after login."""
 
@@ -1923,6 +1986,9 @@ class FritzMesh:
         """Queue a login for the network its form was opened for (net_id, from stats.link). It is
         refused unless that is still the collector's current gateway, bound to that gateway's
         address and MAC, dropped when the network changes, and sent nowhere else (step)."""
+        # The revision of the saved login now: if any collector disconnects before this login is
+        # saved, the revision changes and the login is dropped (step).
+        revision = fritz_revision()
         with self.lock:
             ip, mac, _is_fritz = self.network
             if (not ip or not mac or not net_id or net_id != f"{self.nonce}-{self.net_seq}"
@@ -1931,7 +1997,7 @@ class FritzMesh:
                 self.state, self.message = "error", "The network changed before the login was sent."
                 self.message_code, self.message_args = "fzNetworkChanged", []
                 return
-            self.pending_login = (user, password, ip, mac, self.generation)
+            self.pending_login = (user, password, ip, mac, self.generation, revision)
             self.state, self.message = "connecting", "Connecting to the FRITZ!Box…"
             self.message_code, self.message_args = "fzConnecting", []
         self.wake.set()
@@ -1943,7 +2009,11 @@ class FritzMesh:
             self.generation += 1
             self.clients, self.aps, self.updated = {}, [], 0.0
             self.state, self.message = "off", ""
-        remove_fritz()
+        # Every screen's collector: a new revision first, under the shared lock, so a login still in
+        # flight in any of them (it commits under the same lock) sees it and saves nothing.
+        with fritz_file_lock():
+            save_private_json(FRITZ_REV_FILE, {"rev": secrets.token_hex(16)})
+            remove_fritz()
 
     def looks_like_fritz(self):
         """The current gateway is a FRITZ!Box (its maker, or a model probed on this very gateway).
@@ -2014,7 +2084,7 @@ class FritzMesh:
             with self.lock:
                 if self.generation == generation:  # probed while the network changed: kept for nobody
                     self.model, self.model_for = model, (ip, mac)
-        if pending and pending[2:] != (ip, mac, generation):
+        if pending and pending[2:5] != (ip, mac, generation):
             # Queued for another gateway (the network changed in between): never sent here.
             with self.lock:
                 self.state, self.message = "error", "The network changed before the login was sent."
@@ -2047,17 +2117,26 @@ class FritzMesh:
                         self.state, self.message = "error", "The FRITZ!Box did not answer."
                         self.message_code, self.message_args = "fzNoAnswer", []
                 return 5.0
-            with self.lock:
-                if self.network[:2] != (ip, mac) or self.generation != generation:
-                    # Changed while the login was in flight: nothing from it is kept or saved.
-                    self.state, self.message = "error", "The network changed before the login was sent."
-                    self.message_code, self.message_args = "fzNetworkChanged", []
-                    return 5.0
-                save_private_json(FRITZ_FILE, creds)
-                self.creds = creds
-                self.clients, self.aps, self.updated = clients, aps, time.time()
-                self.state, self.message = "connected", ""
-                self.message_code, self.message_args = "", []
+            # Saved under the lock every collector's Disconnect takes, and only while no Disconnect
+            # happened anywhere since the login was queued (same revision).
+            with fritz_file_lock() as held:
+                unchanged = held and fritz_revision() == pending[5]
+                with self.lock:
+                    if self.network[:2] != (ip, mac) or self.generation != generation:
+                        # Changed while the login was in flight: nothing from it is kept or saved.
+                        self.state, self.message = "error", "The network changed before the login was sent."
+                        self.message_code, self.message_args = "fzNetworkChanged", []
+                        return 5.0
+                    if not unchanged:
+                        # Disconnected on another screen meanwhile (or the lock is unusable): it stays so.
+                        self.state, self.message = "off", ""
+                        self.message_code, self.message_args = "", []
+                        return 5.0
+                    save_private_json(FRITZ_FILE, creds)
+                    self.creds = creds
+                    self.clients, self.aps, self.updated = clients, aps, time.time()
+                    self.state, self.message = "connected", ""
+                    self.message_code, self.message_args = "", []
             return interval
         # Every screen runs its own collector and they share the saved login: one deleted or
         # replaced by another collector (Disconnect there, or a new login) is followed here
