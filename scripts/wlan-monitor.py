@@ -1962,19 +1962,34 @@ def load_fritz():
 
 
 def remove_fritz():
-    """Delete the saved login; True once it is gone (or was never there)."""
+    """Delete the saved login; True once it is gone or unusable. When the file cannot be deleted
+    it is emptied in place (or replaced by a revoked marker), so no collector that starts later
+    can load it either."""
     dfd, missing = open_config_dir()
     if dfd is None:
         return missing
     try:
-        os.unlink(FRITZ_FILE, dir_fd=dfd)
-    except FileNotFoundError:
-        return True
-    except OSError:
-        return False
+        try:
+            os.unlink(FRITZ_FILE, dir_fd=dfd)
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError:
+            pass
+        try:
+            fd = os.open(FRITZ_FILE, os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dfd)
+            try:
+                if stat.S_ISREG(os.fstat(fd).st_mode):
+                    os.ftruncate(fd, 0)
+                    os.fsync(fd)
+                    return True
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
     finally:
         os.close(dfd)
-    return True
+    return save_private_json(FRITZ_FILE, {"revoked": True})
 
 
 @contextlib.contextmanager
@@ -2053,7 +2068,7 @@ class FritzMesh:
         self.updated = 0.0
         self.pending_login = None
         self.remove_pending = False  # a Disconnect whose file could not be deleted yet: retried
-        self.disconnects = 0  # +1 on every Disconnect: a login in flight then ends quietly
+        self.attempts = 0  # +1 on every login and Disconnect: a login in flight then ends quietly
         self.generation = 0  # +1 on every gateway change or logout; work begun before it is dropped
         self.nonce = secrets.token_hex(6)
         self.net_seq = 0  # +1 on every gateway change only (net_id)
@@ -2107,6 +2122,8 @@ class FritzMesh:
                 self.state, self.message = "error", "The network changed before the login was sent."
                 self.message_code, self.message_args = "fzNetworkChanged", []
                 return
+            self.generation += 1  # a login still in flight (typed on another screen) is superseded
+            self.attempts += 1
             self.pending_login = (user, password, ip, mac, self.generation)
             self.state, self.message = "connecting", "Connecting to the FRITZ!Box…"
             self.message_code, self.message_args = "fzConnecting", []
@@ -2119,7 +2136,7 @@ class FritzMesh:
             self.creds = None
             self.pending_login = None
             self.generation += 1
-            self.disconnects += 1
+            self.attempts += 1
             self.clients, self.aps, self.updated = {}, [], 0.0
             self.state, self.message = "off", ""
             self.message_code, self.message_args = "", []
@@ -2207,7 +2224,7 @@ class FritzMesh:
             iface = self.iface
             pending, self.pending_login = self.pending_login, None
             generation = self.generation
-            disconnects = self.disconnects
+            attempts = self.attempts
             creds = self.creds
             interval = FRITZ_POLL_OPEN if self.panel_open else FRITZ_POLL_CLOSED
             age = time.time() - self.updated
@@ -2231,7 +2248,8 @@ class FritzMesh:
             # was typed for (same generation: no change and no Disconnect, and the kernel still has
             # its MAC at this address), checked again right before each request is sent.
             def still_ok():
-                return self.current(ip, mac, generation) and neighbor_mac(ip, iface) == mac
+                # The slow neighbour lookup first, so the generation check is the last thing done.
+                return neighbor_mac(ip, iface) == mac and self.current(ip, mac, generation)
             try:
                 if not still_ok():
                     raise FritzError("fzNetworkChanged", "The network changed before the login was sent.")
@@ -2242,7 +2260,7 @@ class FritzMesh:
                 clients, aps = self.refresh(ip, creds, still_ok, iface)
             except FritzError as exc:
                 with self.lock:
-                    if self.disconnects == disconnects and (self.generation == generation
+                    if self.attempts == attempts and (self.generation == generation
                                                             or exc.code == "fzNetworkChanged"):
                         self.state, self.message = "error", str(exc)
                         self.message_code, self.message_args = exc.code, exc.args_
@@ -2256,7 +2274,7 @@ class FritzMesh:
             with self.lock:
                 if self.network[:2] != (ip, mac) or self.generation != generation:
                     # Changed (or disconnected) while the login was in flight: nothing is kept or saved.
-                    if self.disconnects == disconnects:
+                    if self.attempts == attempts:
                         self.state, self.message = "error", "The network changed before the login was sent."
                         self.message_code, self.message_args = "fzNetworkChanged", []
                     return 5.0
@@ -2578,7 +2596,10 @@ class Monitor:
         if self.request_sock is None or self.fritz is None:
             return False
         handled = False
+        budget = time.monotonic() + 1.0  # for all requests together: snapshots never wait long
         for _ in range(limit):
+            if time.monotonic() >= budget:
+                break
             try:
                 conn, _addr = self.request_sock.accept()
             except (BlockingIOError, InterruptedError):
@@ -2586,11 +2607,16 @@ class Monitor:
             except OSError:
                 break
             try:
-                conn.settimeout(0.2)
+                deadline = min(budget, time.monotonic() + 0.3)  # per request, however it trickles in
+                conn.settimeout(0.3)
                 if peer_uid(conn) != os.getuid():
                     continue
                 data = b""
                 while len(data) <= MAX_COMMAND_BYTES:
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        raise TimeoutError("request too slow")
+                    conn.settimeout(left)
                     chunk = conn.recv(MAX_COMMAND_BYTES + 1 - len(data))
                     if not chunk:
                         break
@@ -3025,13 +3051,6 @@ class Monitor:
         do_known = not do_full and trusted and self.known and now - self.last_known_scan >= KNOWN_SCAN_EVERY
         if lan_blocked:  # probes would only be dropped by the VPN firewall
             do_full = do_known = False
-        if trusted and (do_known or (do_full and not force_scan)):
-            # Automatic probes only on the trusted network seen at this very moment: SSID and
-            # router MAC read again now, not the values cached for the display (wireless()).
-            fresh_ssid = self.wireless(iface, now, force=True).get("ssid", "") if net["is_wireless"] else ""
-            fresh_mac = read_neighbors(iface).get(gateway_ip, {}).get("mac", "") if gateway_ip else ""
-            if (fresh_ssid, fresh_mac) != (self.trust_identity["ssid"], gateway_mac) or not fresh_mac:
-                do_full, do_known = force_scan, False
 
         mdns_every = MDNS_EVERY_OPEN if self.panel_open else MDNS_EVERY_CLOSED
         if do_full or now - self.mdns_time >= mdns_every:
@@ -3046,6 +3065,17 @@ class Monitor:
                 self.mdns_hosts = hosts
             self.mdns_time = now
 
+        if trusted and (do_known or (do_full and not force_scan)):
+            # Automatic probes only on the trusted network seen at this very moment, checked
+            # right before they start: SSID and router MAC read again now (not the values cached
+            # for the display), and the shared trust list read again (Untrust on another screen).
+            fresh_ssid = self.wireless(iface, now, force=True).get("ssid", "") if net["is_wireless"] else ""
+            fresh_mac = read_neighbors(iface).get(gateway_ip, {}).get("mac", "") if gateway_ip else ""
+            fresh = {"ssid": fresh_ssid, "gateway_mac": fresh_mac}
+            self.trusted = self.shared_trusted()
+            if (fresh != self.trust_identity or not fresh_mac or fresh_mac != gateway_mac
+                    or not is_trusted(fresh, self.trusted)):
+                do_full, do_known = force_scan, False
         responders = set()
         if do_full:
             targets = subnet_hosts(local_ip, net["prefix"]) + list(self.mdns_hosts.keys())

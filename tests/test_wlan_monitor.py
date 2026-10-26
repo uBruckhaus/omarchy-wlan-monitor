@@ -1580,6 +1580,22 @@ class StaleNetworkTests(unittest.TestCase):
             sweep.assert_called()
         self.run_snapshots(steps)
 
+    def test_untrust_during_discovery_stops_the_sweep(self):
+        def steps(monitor, state, sweep):
+            monitor.snapshot()
+            monitor.handle("trust")
+            monitor.snapshot()
+            monitor.last_full_scan = -math.inf
+            sweep.reset_mock()
+
+            def discovery(*args, **kw):
+                wlan_monitor.save_trusted([])  # Untrust on another screen while mDNS runs
+                return {}
+            with mock.patch.object(wlan_monitor, "query_mdns", side_effect=discovery):
+                monitor.snapshot()
+            sweep.assert_not_called()
+        self.run_snapshots(steps)
+
     def test_disconnect_forgets_the_network(self):
         def steps(monitor, state, sweep):
             first = monitor.snapshot()["link"]["net_id"]
@@ -1702,6 +1718,50 @@ class OneFritzCollectorTests(unittest.TestCase):
             self.assertEqual(follower.fritz.creds["user"], "u")
             self.assertIsNotNone(follower.request_sock)
         self.pair(steps)
+
+    def test_a_slow_request_never_stalls_the_leader(self):
+        def steps(leader, follower, state):
+            import socket as sockets
+            slow = sockets.socket(sockets.AF_UNIX, sockets.SOCK_STREAM)
+            try:
+                slow.connect(wlan_monitor.request_socket_path())
+                slow.sendall(b"{")  # and then nothing more
+                started = time.monotonic()
+                self.assertFalse(leader.serve_requests())
+                self.assertLess(time.monotonic() - started, 1.2)
+            finally:
+                slow.close()
+        self.pair(steps)
+
+    def test_a_login_file_that_cannot_be_deleted_is_emptied(self):
+        wlan_monitor.save_private_json(wlan_monitor.FRITZ_FILE, {"gateway_mac": self.A, "user": "u",
+                                                                 "password": "p", "pin": "c" * 64})
+        fritz = wlan_monitor.FritzMesh()
+        self.assertIsNotNone(fritz.creds)
+        with mock.patch.object(wlan_monitor.os, "unlink", side_effect=PermissionError("read-only")):
+            fritz.logout()
+        self.assertFalse(fritz.remove_pending)
+        self.assertIsNone(wlan_monitor.load_fritz())  # a collector started later cannot use it
+        self.assertIsNone(wlan_monitor.FritzMesh().creds)
+
+    def test_a_newer_login_supersedes_one_in_flight(self):
+        fritz = wlan_monitor.FritzMesh()
+        fritz.set_network(self.IP, self.A, True, True, "wlan0")
+        fritz.model_for = (self.IP, self.A)
+        fritz.login("old", "p1", fritz.net_id)
+
+        def challenge(*args, **kw):
+            fritz.login("new", "p2", fritz.net_id)  # typed on another screen meanwhile
+            still_ok = args[7]
+            if not still_ok():
+                raise wlan_monitor.FritzError("fzNetworkChanged", "x")
+            return "", "c" * 64
+        with mock.patch.object(wlan_monitor, "fritz_soap", side_effect=challenge), \
+                mock.patch.object(wlan_monitor, "neighbor_mac", return_value=self.A):
+            fritz.step()
+        self.assertIsNone(wlan_monitor.load_fritz())
+        self.assertEqual(fritz.snapshot()[0]["state"], "connecting")  # the newer one is still on
+        self.assertEqual(fritz.pending_login[:2], ("new", "p2"))
 
     def test_a_stale_or_other_router_state_is_ignored(self):
         def steps(leader, follower, state):
