@@ -1102,7 +1102,7 @@ def load_private_json(filename, max_bytes=65536):
         if size > max_bytes:
             return None
         return json.loads(b"".join(chunks).decode("utf-8", "replace"))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return None
     finally:
         os.close(fd)
@@ -1542,20 +1542,27 @@ def bounded_http(ip, port, method, path, body=None, headers=None, tls=False, pin
             raise OSError("bad interface")
         conn._create_connection = lambda address, t=None, source=None: connect_bound(address, t, source, iface)
     expired = threading.Event()
+    # The connected socket, kept here: after a "Connection: close" reply http.client drops
+    # conn.sock while the response still reads from it, and the deadline must still cut it.
+    held = []
 
     def cut():
         expired.set()
-        sock = conn.sock
-        if sock is not None:
-            try:
-                sock.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
+        for sock in [conn.sock] + held:
+            if sock is not None:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
     watchdog = threading.Timer(timeout, cut)
     watchdog.daemon = True
     watchdog.start()
+    resp = None
     try:
         conn.connect()
+        held.append(conn.sock)
+        if expired.is_set():
+            raise OSError("timed out")
         cert = ""
         if tls:
             cert = hashlib.sha256(conn.sock.getpeercert(binary_form=True) or b"").hexdigest()
@@ -1568,6 +1575,8 @@ def bounded_http(ip, port, method, path, body=None, headers=None, tls=False, pin
             raise OSError("reply too large")
         chunks, size = [], 0
         while size <= max_body:
+            if expired.is_set():
+                raise OSError("timed out")
             chunk = resp.read1(65536)
             if not chunk:
                 break
@@ -1580,6 +1589,8 @@ def bounded_http(ip, port, method, path, body=None, headers=None, tls=False, pin
         return resp.status, {k.lower(): v for k, v in resp.getheaders()}, b"".join(chunks), cert
     finally:
         watchdog.cancel()
+        if resp is not None:
+            resp.close()
         conn.close()
 
 
@@ -1681,7 +1692,7 @@ def fritz_soap(ip, user, password, pin, service, control, action, still_ok=None,
 
 
 def fritz_band(iface_name):
-    name = (iface_name or "").upper()
+    name = iface_name.upper() if isinstance(iface_name, str) else ""
     for tag, band in (("6G", "6 GHz"), ("5G", "5 GHz"), ("2G", "2.4 GHz")):
         if f":{tag}" in name:
             return band
@@ -1709,12 +1720,18 @@ def parse_mesh(data):
     nodes = data.get("nodes") if isinstance(data, dict) else None
     if not isinstance(nodes, list):
         return {}, []
+
+    def items(value):
+        return value if isinstance(value, list) else []
+
+    def text(value):
+        return value if isinstance(value, str) else ""
     by_uid, iface_owner = {}, {}
     for node in nodes[:FRITZ_MAX_NODES]:
         if not isinstance(node, dict) or not isinstance(node.get("uid"), str):
             continue
         by_uid[node["uid"]] = node
-        for iface in node.get("node_interfaces") or []:
+        for iface in items(node.get("node_interfaces")):
             if isinstance(iface, dict) and isinstance(iface.get("uid"), str):
                 iface_owner[iface["uid"]] = (node["uid"], iface)
 
@@ -1722,10 +1739,10 @@ def parse_mesh(data):
         return node.get("mesh_role") in ("master", "slave")
 
     def node_name(node):
-        return clean(node.get("device_friendly_name") or node.get("device_name"), 48)
+        return clean(text(node.get("device_friendly_name")) or text(node.get("device_name")), 48)
 
     def node_mac(node):
-        mac = str(node.get("device_mac_address") or "").lower()
+        mac = text(node.get("device_mac_address")).lower()
         return mac if MAC_RE.match(mac) else ""
 
     info = {}
@@ -1737,23 +1754,23 @@ def parse_mesh(data):
         entry = {"box_name": node_name(node), "via": "", "via_mac": "", "band": "",
                  "rate_mbps": None, "signal_dbm": None, "role": node.get("mesh_role") if is_ap(node) else "client"}
         best = None
-        for iface in node.get("node_interfaces") or []:
+        for iface in items(node.get("node_interfaces")):
             if not isinstance(iface, dict):
                 continue
-            for link in iface.get("node_links") or []:
+            for link in items(iface.get("node_links")):
                 if not isinstance(link, dict) or link.get("state") != "CONNECTED":
                     continue
                 if link.get("node_1_uid") == uid:
                     other_uid, other_iface_uid = link.get("node_2_uid"), link.get("node_interface_2_uid")
                 else:
                     other_uid, other_iface_uid = link.get("node_1_uid"), link.get("node_interface_1_uid")
-                other = by_uid.get(other_uid)
+                other = by_uid.get(text(other_uid))
                 if not other or not is_ap(other):
                     continue
                 # A repeater's uplink goes to the master; a client's link to any access point.
                 if entry["role"] == "master" or (entry["role"] == "slave" and other.get("mesh_role") != "master"):
                     continue
-                _, other_iface = iface_owner.get(other_iface_uid, (None, {}))
+                _, other_iface = iface_owner.get(text(other_iface_uid), (None, {}))
                 band = fritz_band(other_iface.get("name")) or ("LAN" if iface.get("type") == "LAN" else "")
                 rates = [r for r in (link.get("cur_data_rate_rx"), link.get("cur_data_rate_tx"))
                          if isinstance(r, (int, float)) and 0 < r < 100000000]
@@ -1772,7 +1789,7 @@ def parse_mesh(data):
         if is_ap(node):
             aps.append({"mac": mac, "name": entry["box_name"], "role": entry["role"], "via": entry["via"],
                         "via_mac": entry["via_mac"],
-                        "band": entry["band"], "model": clean(node.get("device_model"), 48)})
+                        "band": entry["band"], "model": clean(text(node.get("device_model")), 48)})
     counts = {}
     for entry in info.values():
         if entry["role"] == "client" and entry["via_mac"]:
@@ -1927,7 +1944,10 @@ class FritzMesh:
             raise FritzError("fzCert", "The FRITZ!Box certificate changed. Connect again to trust the new one.")
         except (OSError, http.client.HTTPException, ValueError):
             raise FritzError("fzMeshUnreadable", "The FRITZ!Box mesh list could not be read.")
-        clients, aps = parse_mesh(data)
+        try:
+            clients, aps = parse_mesh(data)
+        except Exception:  # an odd reply is an unreadable list, never a stuck login
+            raise FritzError("fzMeshUnreadable", "The FRITZ!Box mesh list could not be read.")
         if not clients:
             raise FritzError("fzMeshEmpty", "The FRITZ!Box mesh list was empty.")
         return clients, aps
@@ -1975,6 +1995,12 @@ class FritzMesh:
                     if self.generation == generation or exc.code == "fzNetworkChanged":
                         self.state, self.message = "error", str(exc)
                         self.message_code, self.message_args = exc.code, exc.args_
+                return 5.0
+            except Exception:  # anything unexpected ends the login too: never stuck at "connecting"
+                with self.lock:
+                    if self.generation == generation:
+                        self.state, self.message = "error", "The FRITZ!Box did not answer."
+                        self.message_code, self.message_args = "fzNoAnswer", []
                 return 5.0
             with self.lock:
                 if self.network[:2] != (ip, mac) or self.generation != generation:

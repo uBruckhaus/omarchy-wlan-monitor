@@ -925,6 +925,37 @@ class BoundedHttpTests(unittest.TestCase):
         with self.assertRaises(OSError):
             wlan_monitor.bounded_http("127.0.0.1", port, "GET", "/", max_body=65536, timeout=3.0)
 
+    def test_drip_body_after_connection_close_hits_deadline(self):
+        def drip(conn):
+            try:
+                conn.send(b"HTTP/1.0 200 OK\r\nConnection: close\r\n\r\n")
+                for _ in range(100):
+                    conn.send(b"x")
+                    time.sleep(0.1)
+            except OSError:
+                pass
+        port = self.serve(drip)
+        start = time.monotonic()
+        with self.assertRaises((OSError, wlan_monitor.http.client.HTTPException)):
+            wlan_monitor.bounded_http("127.0.0.1", port, "GET", "/", timeout=1.0)
+        self.assertLess(time.monotonic() - start, 2.5)
+
+    def test_endless_trailers_hit_deadline(self):
+        def trailers(conn):
+            try:
+                conn.send(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n0\r\n")
+                end = time.monotonic() + 10
+                while time.monotonic() < end:
+                    conn.send(b"X-Pad: y\r\n")
+                    time.sleep(0.01)
+            except OSError:
+                pass
+        port = self.serve(trailers)
+        start = time.monotonic()
+        with self.assertRaises((OSError, wlan_monitor.http.client.HTTPException)):
+            wlan_monitor.bounded_http("127.0.0.1", port, "GET", "/", timeout=1.0)
+        self.assertLess(time.monotonic() - start, 2.5)
+
     def test_huge_content_length_refused(self):
         port = self.serve(lambda conn: conn.send(b"HTTP/1.1 200 OK\r\nContent-Length: 999999999\r\n\r\nabc"))
         with self.assertRaises(OSError):
@@ -1227,3 +1258,52 @@ class StoreLimitTests(unittest.TestCase):
         worker.join(2)
         self.assertFalse(worker.is_alive())
         self.assertEqual(result, [None])
+
+
+class MalformedReplyTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.env = mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": self.tmp.name})
+        self.env.start()
+
+    def tearDown(self):
+        self.env.stop()
+        self.tmp.cleanup()
+
+    def test_malformed_mesh_fields_do_not_raise(self):
+        A = "1c:23:a2:92:2a:6c"
+        for nodes in (
+            [{"uid": "a", "device_mac_address": A, "mesh_role": "master", "node_interfaces": 1}],
+            [{"uid": "a", "device_mac_address": A, "node_interfaces": [{"uid": "i", "node_links": 5}]}],
+            [{"uid": "a", "device_mac_address": A, "node_interfaces": [{"uid": "i", "node_links": [
+                {"state": "CONNECTED", "node_1_uid": "a", "node_2_uid": [], "node_interface_2_uid": {}}]}]}],
+            [{"uid": "a", "device_mac_address": A, "node_interfaces": [{"uid": "i", "name": [], "node_links": [
+                {"state": "CONNECTED", "node_1_uid": "a", "node_2_uid": "b", "node_interface_2_uid": "j"}]}]},
+             {"uid": "b", "device_mac_address": "aa:aa:aa:00:00:02", "mesh_role": "master", "device_name": 7,
+              "node_interfaces": [{"uid": "j", "name": {}, "type": []}]}],
+        ):
+            clients, aps = wlan_monitor.parse_mesh({"nodes": nodes})
+            self.assertIsInstance(clients, dict)
+            self.assertIsInstance(aps, list)
+
+    def test_unexpected_error_during_login_never_leaves_it_connecting(self):
+        fritz = wlan_monitor.FritzMesh()
+        fritz.set_network("192.168.178.1", "1c:23:a2:92:2a:6c", True, True, "wlan0")
+        fritz.model_for = ("192.168.178.1", "1c:23:a2:92:2a:6c")
+        fritz.login("u", "p", fritz.net_id)
+        with mock.patch.object(wlan_monitor, "neighbor_mac", return_value="1c:23:a2:92:2a:6c"), \
+                mock.patch.object(wlan_monitor, "fritz_soap", side_effect=TypeError("odd reply")):
+            fritz.step()
+        info = fritz.snapshot()[0]
+        self.assertEqual(info["state"], "error")
+        self.assertIsNone(fritz.pending_login)
+        self.assertIsNone(wlan_monitor.load_fritz())
+
+    def test_deeply_nested_config_is_refused(self):
+        os.makedirs(wlan_monitor.config_dir(), mode=0o700, exist_ok=True)
+        path = os.path.join(wlan_monitor.config_dir(), wlan_monitor.DEVICES_FILE)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)
+        os.write(fd, b"[" * 200000)
+        os.close(fd)
+        self.assertIsNone(wlan_monitor.load_private_json(wlan_monitor.DEVICES_FILE, wlan_monitor.MAX_STORE_BYTES))
+        self.assertEqual(wlan_monitor.load_store()["networks"], {})
