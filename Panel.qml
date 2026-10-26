@@ -27,7 +27,7 @@ Panel {
   // tick, and never while a name is being edited (a rebuild would drop the text field).
   property var devices: []
   property string devicesRev: ""
-  onStatsChanged: refreshDevices()
+  onStatsChanged: { refreshDevices(); dropFormOfOtherNetwork() }
   function refreshDevices() {
     if (root.editingKey !== "") return
     var rev = String(stats.devices_rev || "")
@@ -207,13 +207,31 @@ Panel {
   property bool fritzFormOpen: false
   property bool fritzHelpOpen: false
   property bool showPassword: false
-  function fritzConnect() {
-    if (!root.hostWidget || fritzPassword.text === "") return
-    root.hostWidget.sendJson({ cmd: "fritz_login", user: fritzUser.text.trim(), password: fritzPassword.text })
+  // The FRITZ!Box form belongs to the network it was opened on: a login typed there is
+  // never sent to another router after the network changed while the form was open.
+  property string fritzFormNet: ""
+  function networkId() {
+    return JSON.stringify([root.link.ssid || "", root.link.gateway || "", root.gatewayDevice ? (root.gatewayDevice.mac || "") : ""])
+  }
+  function openFritzForm() {
+    root.fritzFormNet = root.networkId()
+    root.fritzFormOpen = true
+  }
+  function closeFritzForm() {
     fritzPassword.clear()
     root.fritzFormOpen = false
     root.showPassword = false
+    root.fritzFormNet = ""
     keyCatcher.forceActiveFocus()
+  }
+  function dropFormOfOtherNetwork() {
+    if (root.fritzFormOpen && root.fritzFormNet !== root.networkId()) root.closeFritzForm()
+  }
+  function fritzConnect() {
+    if (!root.hostWidget || fritzPassword.text === "") return
+    if (root.fritzFormNet === root.networkId())
+      root.hostWidget.sendJson({ cmd: "fritz_login", user: fritzUser.text.trim(), password: fritzPassword.text })
+    root.closeFritzForm()
   }
   readonly property int sleepingCount: Math.max(0, totalCount - onlineCount - idleCount)
   readonly property bool scanning: root.hostWidget ? root.hostWidget.scanning === true : (stats.scanning === true)
@@ -1773,7 +1791,7 @@ Panel {
                       label: root.fritz.state === "error" && root.fritz.user ? root.t("fritzReconnect") : root.t("fritzShow")
                       baseColor: root.dim
                       onActivated: {
-                        root.fritzFormOpen = true
+                        root.openFritzForm()
                         if (root.fritz.user && fritzUser.text === "") fritzUser.text = root.fritz.user
                         Qt.callLater(function() { (fritzUser.text === "" ? fritzUser : fritzPassword).forceActiveFocus() })
                       }
@@ -1820,7 +1838,7 @@ Panel {
                         if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Tab) {
                           fritzPassword.forceActiveFocus(); event.accepted = true
                         } else if (event.key === Qt.Key_Escape) {
-                          root.fritzFormOpen = false; keyCatcher.forceActiveFocus(); event.accepted = true
+                          root.closeFritzForm(); event.accepted = true
                         }
                       }
                     }
@@ -1852,8 +1870,7 @@ Panel {
                       onAccepted: root.fritzConnect()
                       Keys.onPressed: function(event) {
                         if (event.key === Qt.Key_Escape) {
-                          fritzPassword.clear(); root.fritzFormOpen = false; root.showPassword = false
-                          keyCatcher.forceActiveFocus(); event.accepted = true
+                          root.closeFritzForm(); event.accepted = true
                         }
                       }
                       // Eye icon: show or hide the typed password.
@@ -1902,12 +1919,7 @@ Panel {
                         bordered: true
                         foreground: root.fg
                         fontFamily: root.font
-                        onClicked: {
-                          fritzPassword.clear()
-                          root.fritzFormOpen = false
-                          root.showPassword = false
-                          keyCatcher.forceActiveFocus()
-                        }
+                        onClicked: root.closeFritzForm()
                       }
                     }
                   }
