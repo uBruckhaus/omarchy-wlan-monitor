@@ -62,7 +62,7 @@ You can also create a separate FRITZ!Box user with the right "FRITZ!Box settings
 - The user name and password go from the panel to the collector over its stdin pipe (never as command-line arguments) and are saved in `~/.config/ubruckhaus-wlan-monitor/fritzbox.json` (`0600`) only after a successful login. They are never sent back to the panel.
 - They are bound to that FRITZ!Box's MAC address and used only with the current gateway when its MAC matches, over TR-064 HTTPS (port 49443) with HTTP Digest authentication, so the password itself is never transmitted.
 - The FRITZ!Box certificate is self-signed; its SHA-256 fingerprint is pinned at login. If it changes, nothing is sent and the panel asks you to connect again.
-- A login is bound to the router it was typed for (its address and MAC). If the network changes before it is sent, or while it is being sent, it is dropped and never sent to the new router: right before the password-derived response goes out, the gateway is checked again (no change reported since the login was typed, and the kernel still has that router's MAC at the address). Nothing from such a login is saved; the panel asks you to connect again.
+- A login is bound to the router it was typed for. The collector gives the network it sees a fresh id whenever the gateway (address or MAC) changes; the form remembers the id it was opened with and sends it with the login, and the collector refuses the login unless that id is still current when the login arrives, so a login typed on one router is never queued for another, even if the panel has not caught up with a change yet. When the network changes while the form is open, the form closes and the typed password and user name are cleared. If the network changes before it is sent, or while it is being sent, it is dropped and never sent to the new router: right before the password-derived response goes out, the gateway is checked again (no change reported since the login was typed, and the kernel still has that router's MAC at the address). Nothing from such a login is saved; the panel asks you to connect again.
 - Reads: `X_AVM-DE_GetMeshListPath` and the mesh list it points to, every 30 s while the panel is open and every 5 minutes otherwise. Replies are size-limited (64 KiB SOAP, 2 MiB mesh list), time-limited (4 s) and every field is validated and sanitized. Nothing is ever changed on the FRITZ!Box.
 
 Device names, pins and hidden flags are stored per network (router MAC + SSID) in `~/.config/ubruckhaus-wlan-monitor/devices.json` (`0600`). On trusted networks the MAC addresses seen there are remembered too, so new devices can be recognised; on other networks only devices you rename, pin or hide are written. The file is bounded (32 networks, 512 devices each) and read with the same checks as the trust list (no symlinks, owned by you, size limit, every field validated).
@@ -80,7 +80,7 @@ omarchy plugin enable ubruckhaus.wlan-monitor
 
 ## How it works
 
-A collector (`scripts/wlan-monitor.py`) runs while the widget is loaded and streams one JSON snapshot every 3 s while the panel is open (6 s while closed). The bar widget sends it commands over stdin (`rescan`, `open` / `closed`, `trust` / `untrust`, `known_all`, `fritz_logout`, and one-line JSON: `rename`, `pin`, `hide`, `known`, `alerts`, `view`, `lang`, `fritz_login`). JSON commands are limited to 1 KiB, need a valid MAC of a device currently listed on this network, and names are cut to 40 printable characters without `<`, `>` or `&`.
+A collector (`scripts/wlan-monitor.py`) runs while the widget is loaded and streams one JSON snapshot every 3 s while the panel is open (6 s while closed). The bar widget sends it commands over stdin (`rescan`, `open` / `closed`, `trust` / `untrust`, `known_all`, `fritz_logout`, and one-line JSON: `rename`, `pin`, `hide`, `known`, `alerts`, `view`, `lang`, `fritz_login`). JSON commands are limited to 1 KiB, every field must have the expected type (anything else is ignored, and a command that fails is dropped without stopping the collector), device commands need a valid MAC of a device currently listed on this network, and names are cut to 40 printable characters without `<`, `>` or `&`.
 
 - **Light on the system:** routes, signal level and traffic come from `/proc`; `iw` and `ip addr` run only every 12 / 30 s (or when the network changes). All external commands run as fixed argv lists with bounded output and timeouts.
 - **Unprivileged local discovery:**
@@ -105,7 +105,13 @@ omarchy plugin disable ubruckhaus.wlan-monitor
 omarchy plugin remove ubruckhaus.wlan-monitor
 ```
 
-The plugin creates no services. The only files outside its folder are the trusted network list, the device names and view settings, and the optional FRITZ!Box login in `~/.config/ubruckhaus-wlan-monitor/`. Delete that directory to remove them.
+The plugin creates no services. Outside its folder it keeps:
+
+- the trusted network list, the device names and view settings, and the optional FRITZ!Box login in `~/.config/ubruckhaus-wlan-monitor/`;
+- the cached marketplace catalog of the Information page in `~/.cache/ubruckhaus.wlan-monitor/`;
+- the interface language, if you picked one, as `"language"` in the widget's entry in `~/.config/omarchy/shell.json`.
+
+Delete the two directories to remove the first two; choose **System (…)** under gear ⚙ → **Language** before removing the plugin to drop the language setting (or delete the widget's entry from `shell.json`).
 
 ## Development
 

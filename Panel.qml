@@ -208,29 +208,39 @@ Panel {
   property bool fritzHelpOpen: false
   property bool showPassword: false
   // The FRITZ!Box form belongs to the network it was opened on: a login typed there is
-  // never sent to another router after the network changed while the form was open.
+  // never sent to another router after the network changed while the form was open. The
+  // identity comes from the collector's link (net_id changes with every gateway change; the
+  // gateway MAC is the collector's, not the device list's, which is frozen while renaming),
+  // and the collector itself refuses a login whose net_id is no longer current.
   property string fritzFormNet: ""
+  property string fritzFormNetId: ""
   function networkId() {
-    return JSON.stringify([root.link.ssid || "", root.link.gateway || "", root.gatewayDevice ? (root.gatewayDevice.mac || "") : ""])
+    return JSON.stringify([String(root.link.net_id || ""), root.link.ssid || "", root.link.gateway || "",
+      String(root.link.gateway_mac || "")])
   }
   function openFritzForm() {
     root.fritzFormNet = root.networkId()
+    root.fritzFormNetId = String(root.link.net_id || "")
     root.fritzFormOpen = true
   }
-  function closeFritzForm() {
+  function closeFritzForm(clearUser) {
     fritzPassword.clear()
+    if (clearUser === true) fritzUser.clear()
     root.fritzFormOpen = false
     root.showPassword = false
     root.fritzFormNet = ""
+    root.fritzFormNetId = ""
     keyCatcher.forceActiveFocus()
   }
   function dropFormOfOtherNetwork() {
-    if (root.fritzFormOpen && root.fritzFormNet !== root.networkId()) root.closeFritzForm()
+    // A user name typed for another router is not offered on this one either.
+    if (root.fritzFormOpen && root.fritzFormNet !== root.networkId()) root.closeFritzForm(true)
   }
   function fritzConnect() {
     if (!root.hostWidget || fritzPassword.text === "") return
-    if (root.fritzFormNet === root.networkId())
-      root.hostWidget.sendJson({ cmd: "fritz_login", user: fritzUser.text.trim(), password: fritzPassword.text })
+    if (root.fritzFormNetId !== "" && root.fritzFormNet === root.networkId())
+      root.hostWidget.sendJson({ cmd: "fritz_login", user: fritzUser.text.trim(), password: fritzPassword.text,
+        net: root.fritzFormNetId })
     root.closeFritzForm()
   }
   readonly property int sleepingCount: Math.max(0, totalCount - onlineCount - idleCount)

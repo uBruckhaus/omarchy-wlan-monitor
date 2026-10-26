@@ -25,7 +25,8 @@ Friendly names, pins and hidden flags are stored per network (router MAC + SSID)
 seen there are remembered too, so devices joining later can be flagged as new.
 
 FRITZ!Box routers: the model name comes from the unauthenticated TR-064 description
-(`http://<router>:49000/tr64desc.xml`). With an optional login (`fritz_login` command,
+(`http://<router>:49000/tr64desc.xml`). With an optional login (`fritz_login` command with the
+`net_id` from `link` it was typed for, refused unless that network is still current,
 stored owner-only and bound to that router's MAC) a background thread reads the mesh
 list over TR-064 HTTPS (port 49443, certificate pinned at login) to show which access
 point, band and speed each device uses.
@@ -39,6 +40,7 @@ import os
 import pty
 import random
 import re
+import secrets
 import select
 import shutil
 import socket
@@ -97,6 +99,9 @@ GROUP_ID_RE = re.compile(r"^([a-z]{2,12}|([0-9a-f]{2}:){5}[0-9a-f]{2})$")
 MAX_COLLAPSED = 32
 FRITZ_FILE = "fritzbox.json"
 FRITZ_USER_RE = re.compile(r"^[A-Za-z0-9._@-]{0,64}$")
+# The collector's id for the network it talks to right now: a random per-process part and a
+# counter that changes with every gateway change (stats.link.net_id, fritz_login "net").
+NET_ID_RE = re.compile(r"^[0-9a-f]{12}-[0-9]{1,12}$")
 FRITZ_PASSWORD_MAX = 128
 FRITZ_DESC_PORT = 49000
 FRITZ_TLS_PORT = 49443
@@ -1168,7 +1173,7 @@ def parse_command(line):
         data = json.loads(text)
     except ValueError:
         return ""
-    if not isinstance(data, dict) or data.get("cmd") not in JSON_COMMANDS:
+    if not isinstance(data, dict) or not isinstance(data.get("cmd"), str) or data["cmd"] not in JSON_COMMANDS:
         return ""
     cmd = data["cmd"]
     if cmd == "alerts":
@@ -1188,7 +1193,10 @@ def parse_command(line):
             return ""
         if not isinstance(password, str) or not 0 < len(password) <= FRITZ_PASSWORD_MAX or not password.isprintable():
             return ""
-        return {"cmd": cmd, "user": user, "password": password}
+        net = data.get("net", "")
+        if not isinstance(net, str) or (net and not NET_ID_RE.match(net)):
+            return ""
+        return {"cmd": cmd, "user": user, "password": password, "net": net}
     mac = data.get("mac")
     if not isinstance(mac, str) or not MAC_RE.match(mac):
         return ""
@@ -1763,6 +1771,8 @@ class FritzMesh:
         self.updated = 0.0
         self.pending_login = None
         self.generation = 0  # +1 on every gateway change or logout; work begun before it is dropped
+        self.nonce = secrets.token_hex(6)
+        self.net_seq = 0  # +1 on every gateway change only (net_id)
         self.thread = None
 
     def start(self):
@@ -1779,6 +1789,7 @@ class FritzMesh:
         with self.lock:
             if (ip, mac) != self.network[:2]:
                 self.generation += 1
+                self.net_seq += 1
                 self.clients, self.aps, self.updated = {}, [], 0.0
                 self.state, self.message = "off", ""
                 if self.pending_login is not None:
@@ -1792,12 +1803,18 @@ class FritzMesh:
         if wake:
             self.wake.set()
 
-    def login(self, user, password):
-        """Queue a login for the gateway shown right now: it is bound to that gateway's address and
-        MAC, dropped when the network changes, and sent nowhere else (step)."""
+    @property
+    def net_id(self):
+        """Id of the gateway the collector sees now; the panel sends it back with a login."""
+        return f"{self.nonce}-{self.net_seq}"
+
+    def login(self, user, password, net_id):
+        """Queue a login for the network its form was opened for (net_id, from stats.link). It is
+        refused unless that is still the collector's current gateway, bound to that gateway's
+        address and MAC, dropped when the network changes, and sent nowhere else (step)."""
         with self.lock:
             ip, mac, _is_fritz = self.network
-            if not ip or not mac:
+            if not ip or not mac or not net_id or net_id != f"{self.nonce}-{self.net_seq}":
                 self.pending_login = None
                 self.state, self.message = "error", "The network changed before the login was sent."
                 self.message_code, self.message_args = "fzNetworkChanged", []
@@ -1988,7 +2005,7 @@ class Monitor:
                 save_store(self.store)
                 return True
             if command["cmd"] == "fritz_login":
-                self.fritz.login(command["user"], command["password"])
+                self.fritz.login(command["user"], command["password"], command["net"])
                 return True
             return self.handle_device(command)
         if command == "fritz_logout":
@@ -2430,6 +2447,10 @@ class Monitor:
                 "prefix": net["prefix"],
                 "cidr": net["cidr"],
                 "gateway": gateway_ip,
+                # The router the collector talks to now (not from the device list, which the
+                # panel freezes while a name is edited) and its network id for fritz_login.
+                "gateway_mac": self.identity["gateway_mac"],
+                "net_id": self.fritz.net_id,
                 "mac": net["mac"],
                 "ssid": wlan.get("ssid") or ("Ethernet" if not net["is_wireless"] else iface),
                 "bssid": wlan.get("bssid") or "",
@@ -2471,6 +2492,14 @@ def emit(obj):
     print(json.dumps(obj), flush=True)
 
 
+def handle_line(monitor, line):
+    """Parse and apply one stdin line. A command that fails is dropped: it never ends the collector."""
+    try:
+        return monitor.handle(parse_command(line))
+    except Exception:
+        return False
+
+
 def main():
     monitor = Monitor()
     if "--once" in sys.argv:
@@ -2503,7 +2532,7 @@ def main():
                     pending = (pending + data)[-4096:]
                     *lines, pending = pending.split(b"\n")
                     for line in lines:
-                        run_now = monitor.handle(parse_command(line.decode("utf-8", "replace"))) or run_now
+                        run_now = handle_line(monitor, line.decode("utf-8", "replace")) or run_now
                 if not run_now and time.monotonic() < next_tick:
                     continue
         elif timeout:
