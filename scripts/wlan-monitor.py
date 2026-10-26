@@ -51,7 +51,6 @@ import stat
 import struct
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import urllib.parse
@@ -91,7 +90,7 @@ ACTIVE_NEIGH_STATES = {"REACHABLE", "DELAY", "PROBE", "PERMANENT", "NOARP"}
 DEFAULT_DOMAINS = ("home.arpa", "fritz.box", "speedport.ip", "localdomain", "local", "lan", "home", "internal")
 WEB_SERVICE_TYPES = {"_http._tcp": "http", "_https._tcp": "https"}
 ADMIN_URL_SERVICE_TYPES = {"_ipp._tcp", "_ipps._tcp", "_printer._tcp", "_pdl-datastream._tcp", "_uscan._tcp"}
-COMMANDS = {"rescan", "open", "closed", "trust", "untrust", "known_all", "fritz_logout"}
+COMMANDS = {"rescan", "open", "closed", "trust", "untrust", "known_all", "fritz_logout", "fritz_open"}
 JSON_COMMANDS = {"rename", "pin", "hide", "known", "alerts", "view", "fritz_login", "lang"}
 # Interface languages the panel offers; the language arrives from the bar widget ("lang" command).
 LANGS = ("en", "de", "fr", "es", "it", "pt", "nl", "pl")
@@ -100,12 +99,17 @@ VIEW_MODES = ("list", "platform", "type", "band", "ap")
 GROUP_ID_RE = re.compile(r"^([a-z]{2,12}|([0-9a-f]{2}:){5}[0-9a-f]{2})$")
 MAX_COLLAPSED = 32
 FRITZ_FILE = "fritzbox.json"
-# Shared by every collector (one per screen): an interprocess lock around the saved login and a
-# revision that every Disconnect replaces, so a login still in flight elsewhere is never saved after it.
-FRITZ_LOCK_FILE = "fritzbox.lock"
-FRITZ_REV_FILE = "fritzbox-rev.json"
-FRITZ_LOCK_WAIT = 2.0
-FRITZ_REVOKE_RETRY = 5.0
+# One collector per screen, but only one of them (the holder of the leader lock, for its whole
+# life) talks to the FRITZ!Box and holds the login; it publishes what it reads for the others and
+# takes their login / Disconnect over a private socket.
+FRITZ_LEADER_FILE = "fritzbox-leader.lock"
+FRITZ_STATE_FILE = "fritzbox-state.json"
+FRITZ_STATE_MAX = 1048576
+FRITZ_STATE_FRESH = 30.0   # a published state older than this is shown nowhere
+FRITZ_STATE_EVERY = 10.0   # republished at least this often while unchanged
+FRITZ_REMOTE_OPEN = 60.0   # a panel open on another screen keeps the fast mesh polling this long
+FRITZ_STATES = ("off", "connecting", "connected", "error", "paused")
+FRITZ_LOCK_WAIT = 2.0      # shared file locks (trust list, devices.json)
 FRITZ_USER_RE = re.compile(r"^[A-Za-z0-9._@-]{0,64}$")
 # The collector's id for the network it talks to right now: a random per-process part and a
 # counter that changes with every gateway change (stats.link.net_id, fritz_login "net").
@@ -1137,9 +1141,10 @@ def open_config_dir():
     return None, False
 
 
-def private_config_dir():
-    """The config directory, created 0700 if missing (and made 0700 if it is ours but more open);
-    None unless it is a real directory of ours."""
+def private_config_dir_fd():
+    """An open handle on the config directory, created 0700 if missing (and made 0700 if it is
+    ours but more open); None unless it is a real directory (not a symlink) of ours. Everything
+    written goes relative to this handle, so the directory cannot be swapped in between."""
     directory = config_dir()
     try:
         os.makedirs(directory, mode=0o700, exist_ok=True)
@@ -1148,15 +1153,23 @@ def private_config_dir():
         return None
     try:
         info = os.fstat(fd)
-        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
-            return None
-        if info.st_mode & 0o077:
-            os.fchmod(fd, 0o700)
-        return directory
+        if stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid():
+            if info.st_mode & 0o077:
+                os.fchmod(fd, 0o700)
+            return fd
     except OSError:
+        pass
+    os.close(fd)
+    return None
+
+
+def private_config_dir():
+    """The config directory's path once it is private (private_config_dir_fd), else None."""
+    fd = private_config_dir_fd()
+    if fd is None:
         return None
-    finally:
-        os.close(fd)
+    os.close(fd)
+    return config_dir()
 
 
 def load_private_json(filename, max_bytes=65536, secret=False):
@@ -1203,27 +1216,36 @@ def save_private_json(filename, data, max_bytes=None, compact=False):
         text = json.dumps(data, indent=2)
     if max_bytes is not None and len(text.encode("utf-8")) > max_bytes:
         return False
-    directory = private_config_dir()
-    if not directory:
+    dfd = private_config_dir_fd()
+    if dfd is None:
         return False
     tmp = None
     try:
-        # Exclusive, unpredictable temp file, private before anything is written (credentials too).
-        fd, tmp = tempfile.mkstemp(prefix=f".{filename}.", suffix=".tmp", dir=directory)
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, os.path.join(directory, filename))
+        # Exclusive, unpredictable temp file in the checked directory, private before anything is
+        # written (credentials too), then renamed over the file within that same directory.
+        name = f".{filename}.{secrets.token_hex(8)}.tmp"
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dfd)
+        tmp = name
+        try:
+            os.fchmod(fd, 0o600)
+            data = text.encode("utf-8")
+            while data:
+                data = data[os.write(fd, data):]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, filename, src_dir_fd=dfd, dst_dir_fd=dfd)
+        tmp = None
         return True
     except OSError:
+        return False
+    finally:
         if tmp:
             try:
-                os.unlink(tmp)
+                os.unlink(tmp, dir_fd=dfd)
             except OSError:
                 pass
-        return False
+        os.close(dfd)
 
 
 def load_trusted():
@@ -1638,12 +1660,18 @@ def connect_bound(address, timeout, source_address, iface):
         raise
 
 
+class NotSent(Exception):
+    """bounded_http: `before_send` said no once the connection stood; nothing was sent."""
+
+
 def bounded_http(ip, port, method, path, body=None, headers=None, tls=False, pin=None,
-                 max_body=FRITZ_MAX_SOAP, timeout=FRITZ_TIMEOUT, iface=None):
+                 max_body=FRITZ_MAX_SOAP, timeout=FRITZ_TIMEOUT, iface=None, before_send=None):
     """One HTTP(S) request to the router with an overall deadline and a body size cap.
 
     Returns (status, headers, body_bytes, cert_sha256). With `pin`, the TLS certificate
-    must match it before anything is sent (FRITZ!Box certificates are self-signed).
+    must match it before anything is sent (FRITZ!Box certificates are self-signed). With
+    `before_send`, it is asked once more after the connection and certificate check, right
+    before the request goes out; when it returns False nothing is sent (NotSent).
     """
     if tls:
         ctx = ssl.create_default_context()
@@ -1684,6 +1712,8 @@ def bounded_http(ip, port, method, path, body=None, headers=None, tls=False, pin
             cert = hashlib.sha256(conn.sock.getpeercert(binary_form=True) or b"").hexdigest()
             if pin is not None and cert != pin:
                 raise PermissionError("certificate changed")
+        if before_send is not None and not before_send():
+            raise NotSent()
         conn.request(method, path, body=body, headers=headers or {})
         resp = conn.getresponse()
         length = resp.getheader("Content-Length")
@@ -1788,7 +1818,9 @@ def fritz_soap(ip, user, password, pin, service, control, action, still_ok=None,
             auth = dict(headers, Authorization=digest_authorization(
                 user, password, "POST", control, challenge, os.urandom(8).hex()))
             status, hdrs, body, cert = bounded_http(ip, FRITZ_TLS_PORT, "POST", control, envelope, auth, tls=True, pin=cert,
-                                                    iface=iface)
+                                                    iface=iface, before_send=still_ok)
+    except NotSent:
+        raise FritzError("fzNetworkChanged", "The network changed before the login was sent.")
     except PermissionError:
         raise FritzError("fzCert", "The FRITZ!Box certificate changed. Connect again to trust the new one.")
     except ConnectionRefusedError:
@@ -1917,19 +1949,16 @@ def parse_mesh(data):
 
 
 def load_fritz():
-    """The saved login, only while it was saved under the current revision: once any collector's
-    Disconnect renewed the revision it is used nowhere, even if the file could not be deleted."""
+    """The saved login (read only by the FRITZ!Box collector, the leader)."""
     data = load_private_json(FRITZ_FILE, 4096, secret=True)
     if not isinstance(data, dict):
         return None
     mac, user, password, pin = (data.get(k) for k in ("gateway_mac", "user", "password", "pin"))
-    rev = data.get("rev", "")  # saved before any Disconnect (or by 0.8.0 and older): ""
     if not (isinstance(mac, str) and MAC_RE.match(mac) and isinstance(user, str) and FRITZ_USER_RE.match(user)
             and isinstance(password, str) and 0 < len(password) <= FRITZ_PASSWORD_MAX
-            and isinstance(pin, str) and re.fullmatch(r"[0-9a-f]{64}", pin)
-            and isinstance(rev, str) and rev == fritz_revision()):
+            and isinstance(pin, str) and re.fullmatch(r"[0-9a-f]{64}", pin)):
         return None
-    return {"gateway_mac": mac.lower(), "user": user, "password": password, "pin": pin, "rev": rev}
+    return {"gateway_mac": mac.lower(), "user": user, "password": password, "pin": pin}
 
 
 def remove_fritz():
@@ -1955,9 +1984,7 @@ def private_file_lock(name, wait=None):
     the lock file is private, never followed through a symlink and never anything but a file."""
     fd = None
     try:
-        dfd = None
-        if private_config_dir():
-            dfd, _missing = open_config_dir()
+        dfd = private_config_dir_fd()
         if dfd is not None:
             try:
                 fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o600,
@@ -1989,53 +2016,22 @@ def private_file_lock(name, wait=None):
             os.close(fd)  # releases the lock
 
 
-def fritz_file_lock():
-    return private_file_lock(FRITZ_LOCK_FILE)
-
-
-def fritz_revision():
-    """The saved login's revision: "" before the first Disconnect, a new one on every Disconnect,
-    None when the file is there but unreadable (never taken for any revision)."""
-    data = load_private_json(FRITZ_REV_FILE, 256)
-    rev = data.get("rev") if isinstance(data, dict) else None
-    if isinstance(rev, str) and re.fullmatch(r"[0-9a-f]{32}", rev):
-        return rev
-    dfd, missing = open_config_dir()
-    if dfd is None:
-        return "" if missing else None
+def fritz_target(ip, iface):
+    """(ip, iface) as the FRITZ!Box collector uses them: only a private gateway address on a
+    plainly named interface is ever contacted; anything else is (None, "")."""
     try:
-        os.stat(FRITZ_REV_FILE, dir_fd=dfd, follow_symlinks=False)
-        return None
-    except FileNotFoundError:
-        return ""
-    except OSError:
-        return None
-    finally:
-        os.close(dfd)
-
-
-def fritz_new_revision():
-    rev = secrets.token_hex(16)
-    return rev if save_private_json(FRITZ_REV_FILE, {"rev": rev}) else None
-
-
-def fritz_revoke():
-    """Disconnect for every collector: a new revision makes the saved login (saved with the old
-    one) unusable everywhere, and a login being saved in any collector (under the same lock)
-    sees it. The file is then deleted unless it already holds a newer login. True once the new
-    revision is written; the deletion is only tidying up."""
-    # Only under the lock that login()'s repair of an unreadable revision takes too, so neither
-    # can overwrite the other; without the lock the Disconnect stays pending and is retried.
-    with fritz_file_lock() as held:
-        if not held or fritz_new_revision() is None:
-            return False
-        if load_fritz() is None:
-            remove_fritz()
-    return True
+        if not ip or not ipaddress.IPv4Address(ip).is_private:
+            ip = None
+    except ValueError:
+        ip = None
+    if not isinstance(iface, str) or not IFACE_RE.match(iface):
+        ip, iface = None, ""
+    return ip, iface
 
 
 class FritzMesh:
-    """Background reader for the FRITZ!Box: model name always, mesh list only after login."""
+    """Background reader for the FRITZ!Box: model name always, mesh list only after login. Runs
+    only in the FRITZ!Box collector (the leader), the one process that holds the login."""
 
     def __init__(self):
         self.lock = threading.Lock()
@@ -2056,7 +2052,8 @@ class FritzMesh:
         self.aps = []
         self.updated = 0.0
         self.pending_login = None
-        self.revoke_pending = False  # a Disconnect whose file work failed: retried, nothing used meanwhile
+        self.remove_pending = False  # a Disconnect whose file could not be deleted yet: retried
+        self.disconnects = 0  # +1 on every Disconnect: a login in flight then ends quietly
         self.generation = 0  # +1 on every gateway change or logout; work begun before it is dropped
         self.nonce = secrets.token_hex(6)
         self.net_seq = 0  # +1 on every gateway change only (net_id)
@@ -2067,14 +2064,7 @@ class FritzMesh:
         self.thread.start()
 
     def set_network(self, ip, mac, is_fritz, panel_open, iface):
-        # Only a private gateway address on a plainly named interface is ever contacted.
-        try:
-            if not ip or not ipaddress.IPv4Address(ip).is_private:
-                ip = None
-        except ValueError:
-            ip = None
-        if not isinstance(iface, str) or not IFACE_RE.match(iface):
-            ip, iface = None, ""
+        ip, iface = fritz_target(ip, iface)
         with self.lock:
             if (ip, mac, iface) != (self.network[0], self.network[1], self.iface):
                 self.generation += 1
@@ -2100,37 +2090,16 @@ class FritzMesh:
         """Id of the gateway the collector sees now; the panel sends it back with a login."""
         return f"{self.nonce}-{self.net_seq}"
 
+    def target(self):
+        """(ip, mac, iface) this reader works for now (published with its state)."""
+        with self.lock:
+            return self.network[0] or "", self.network[1], self.iface
+
     def login(self, user, password, net_id):
         """Queue a login for the network its form was opened for (net_id, from stats.link). It is
         refused unless that is still the collector's current gateway, bound to that gateway's
         address and MAC, dropped when the network changes, and sent nowhere else (step)."""
-        # The revision of the saved login now: if any collector disconnects before this login is
-        # saved, the revision changes and the login is dropped (step). An unreadable one is renewed.
-        revision = fritz_revision()
-        cancelled = False
-        if revision is None:
-            with fritz_file_lock() as held:
-                # Repaired only under the lock and only while still unreadable: a revision written
-                # by a Disconnect meanwhile is never replaced, and this login is dropped instead.
-                again = fritz_revision() if held else None
-                if not held:
-                    revision = None
-                elif again is None:
-                    revision = fritz_new_revision()
-                else:
-                    cancelled = True
         with self.lock:
-            if cancelled:
-                self.pending_login = None
-                self.state, self.message = "off", ""
-                self.message_code, self.message_args = "", []
-                return
-            if self.revoke_pending or revision is None:
-                # The last Disconnect is not done yet (or the settings folder is unusable): no login.
-                self.pending_login = None
-                self.state, self.message = "error", "The login could not be stored in the settings folder."
-                self.message_code, self.message_args = "fzNotStored", []
-                return
             ip, mac, _is_fritz = self.network
             if (not ip or not mac or not net_id or net_id != f"{self.nonce}-{self.net_seq}"
                     or not self.looks_like_fritz()):
@@ -2138,38 +2107,39 @@ class FritzMesh:
                 self.state, self.message = "error", "The network changed before the login was sent."
                 self.message_code, self.message_args = "fzNetworkChanged", []
                 return
-            self.pending_login = (user, password, ip, mac, self.generation, revision)
+            self.pending_login = (user, password, ip, mac, self.generation)
             self.state, self.message = "connecting", "Connecting to the FRITZ!Box…"
             self.message_code, self.message_args = "fzConnecting", []
         self.wake.set()
 
     def logout(self):
+        """Disconnect: the login is dropped at once (work in flight is discarded by generation)
+        and its file deleted; a deletion that fails is retried by step()."""
         with self.lock:
             self.creds = None
             self.pending_login = None
             self.generation += 1
+            self.disconnects += 1
             self.clients, self.aps, self.updated = {}, [], 0.0
             self.state, self.message = "off", ""
             self.message_code, self.message_args = "", []
-            self.revoke_pending = True
-        self.revoke()
+            self.remove_pending = True
+        self.finish_remove()
 
-    def revoke(self):
-        """Finish a Disconnect (fritz_revoke); until it succeeds nothing saved is used and it is
-        retried (step)."""
-        done = fritz_revoke()
+    def finish_remove(self):
+        # Under the lock the login commit takes: a login saved after this Disconnect is never hit.
         with self.lock:
-            if not self.revoke_pending:
-                return
-            self.creds = None
-            if done:
-                self.revoke_pending = False
-                self.state, self.message = "off", ""
-                self.message_code, self.message_args = "", []
-            else:
+            if not self.remove_pending:
+                return  # a new login saved meanwhile replaced the file
+            gone = remove_fritz()
+            self.remove_pending = not gone
+            if not gone:
                 self.state = "error"
                 self.message = "The saved login could not be deleted yet. WLAN Monitor keeps trying and does not use it."
                 self.message_code, self.message_args = "fzNotDeleted", []
+            elif self.message_code == "fzNotDeleted":
+                self.state, self.message = "off", ""
+                self.message_code, self.message_args = "", []
 
     def looks_like_fritz(self):
         """The current gateway is a FRITZ!Box (its maker, or a model probed on this very gateway).
@@ -2194,10 +2164,9 @@ class FritzMesh:
             }, dict(self.clients)
 
     def current(self, ip, mac, generation):
-        """True while the gateway is still the one the work began with (no change, no logout, no
-        Disconnect still being finished)."""
+        """True while the gateway is still the one the work began with (no change, no logout)."""
         with self.lock:
-            return self.network[:2] == (ip, mac) and self.generation == generation and not self.revoke_pending
+            return self.network[:2] == (ip, mac) and self.generation == generation
 
     def refresh(self, ip, creds, still_ok=None, iface=None):
         text, _ = fritz_soap(ip, creds["user"], creds["password"], creds["pin"],
@@ -2211,8 +2180,10 @@ class FritzMesh:
             raise FritzError("fzNetworkChanged", "The network changed before the login was sent.")
         try:
             status, _, body, _ = bounded_http(ip, FRITZ_TLS_PORT, "GET", path, tls=True, pin=creds["pin"],
-                                              max_body=FRITZ_MAX_MESH, iface=iface)
+                                              max_body=FRITZ_MAX_MESH, iface=iface, before_send=still_ok)
             data = json.loads(body.decode("utf-8", "replace")) if status == 200 else None
+        except NotSent:
+            raise FritzError("fzNetworkChanged", "The network changed before the login was sent.")
         except PermissionError:
             raise FritzError("fzCert", "The FRITZ!Box certificate changed. Connect again to trust the new one.")
         except (OSError, http.client.HTTPException, ValueError):
@@ -2228,19 +2199,15 @@ class FritzMesh:
     def step(self):
         """One unit of work; returns seconds until the next one is due."""
         with self.lock:
-            revoke = self.revoke_pending
-        if revoke:
-            self.revoke()
-            with self.lock:
-                if self.revoke_pending:
-                    return FRITZ_REVOKE_RETRY
+            retry_remove = self.remove_pending
+        if retry_remove:
+            self.finish_remove()
         with self.lock:
-            if self.revoke_pending:  # a Disconnect began meanwhile: nothing saved is used
-                return FRITZ_REVOKE_RETRY
             ip, mac, is_fritz = self.network
             iface = self.iface
             pending, self.pending_login = self.pending_login, None
             generation = self.generation
+            disconnects = self.disconnects
             creds = self.creds
             interval = FRITZ_POLL_OPEN if self.panel_open else FRITZ_POLL_CLOSED
             age = time.time() - self.updated
@@ -2261,29 +2228,22 @@ class FritzMesh:
         if pending:
             # The probe above took time: the gateway may have changed since the snapshot. The
             # password-derived response goes out only while this is still the gateway the login
-            # was typed for (same generation, and the kernel still has its MAC at this address),
-            # checked once more right before it is sent.
+            # was typed for (same generation: no change and no Disconnect, and the kernel still has
+            # its MAC at this address), checked again right before each request is sent.
             def still_ok():
-                # ...and while no collector disconnected since the login was queued.
-                return (self.current(ip, mac, generation) and neighbor_mac(ip, iface) == mac
-                        and fritz_revision() == pending[5])
+                return self.current(ip, mac, generation) and neighbor_mac(ip, iface) == mac
             try:
                 if not still_ok():
                     raise FritzError("fzNetworkChanged", "The network changed before the login was sent.")
                 # Trust on first use: remember the certificate seen while the user logs in.
                 _, cert = fritz_soap(ip, pending[0], pending[1], None, "urn:dslforum-org:service:Hosts:1",
                                      "/upnp/control/hosts", "X_AVM-DE_GetMeshListPath", still_ok, iface)
-                creds = {"gateway_mac": mac, "user": pending[0], "password": pending[1], "pin": cert,
-                         "rev": pending[5]}
+                creds = {"gateway_mac": mac, "user": pending[0], "password": pending[1], "pin": cert}
                 clients, aps = self.refresh(ip, creds, still_ok, iface)
             except FritzError as exc:
-                revoked = fritz_revision() != pending[5]
                 with self.lock:
-                    if revoked:  # Disconnect on another screen meanwhile: it stays disconnected
-                        if self.generation == generation:
-                            self.state, self.message = "off", ""
-                            self.message_code, self.message_args = "", []
-                    elif self.generation == generation or exc.code == "fzNetworkChanged":
+                    if self.disconnects == disconnects and (self.generation == generation
+                                                            or exc.code == "fzNetworkChanged"):
                         self.state, self.message = "error", str(exc)
                         self.message_code, self.message_args = exc.code, exc.args_
                 return 5.0
@@ -2293,73 +2253,40 @@ class FritzMesh:
                         self.state, self.message = "error", "The FRITZ!Box did not answer."
                         self.message_code, self.message_args = "fzNoAnswer", []
                 return 5.0
-            # Saved under the lock every collector's Disconnect takes, and only while no Disconnect
-            # happened anywhere since the login was queued (same revision, before and after saving).
-            with fritz_file_lock() as held:
-                unchanged = held and pending[5] is not None and fritz_revision() == pending[5]
-                with self.lock:
-                    if self.network[:2] != (ip, mac) or self.generation != generation:
-                        # Changed while the login was in flight: nothing from it is kept or saved.
+            with self.lock:
+                if self.network[:2] != (ip, mac) or self.generation != generation:
+                    # Changed (or disconnected) while the login was in flight: nothing is kept or saved.
+                    if self.disconnects == disconnects:
                         self.state, self.message = "error", "The network changed before the login was sent."
                         self.message_code, self.message_args = "fzNetworkChanged", []
-                        return 5.0
-                    if not unchanged:
-                        # Disconnected on another screen meanwhile (or the lock is unusable): it stays so.
-                        self.state, self.message = "off", ""
-                        self.message_code, self.message_args = "", []
-                        return 5.0
-                    saved = save_private_json(FRITZ_FILE, creds)
-                    if saved and fritz_revision() != pending[5]:
-                        # Defensive (revisions change only under this lock): a newer revision wins.
-                        remove_fritz()
-                        self.state, self.message = "off", ""
-                        self.message_code, self.message_args = "", []
-                        return 5.0
-                    if not saved:
-                        self.state, self.message = "error", "The login could not be stored in the settings folder."
-                        self.message_code, self.message_args = "fzNotStored", []
-                        return 5.0
-                    self.creds = creds
-                    self.clients, self.aps, self.updated = clients, aps, time.time()
-                    self.state, self.message = "connected", ""
-                    self.message_code, self.message_args = "", []
-            return interval
-        # Every screen runs its own collector and they share the saved login: one deleted or
-        # replaced by another collector (Disconnect there, or a new login) is followed here
-        # before anything is sent.
-        disk = load_fritz()
-        if disk != creds:
-            with self.lock:
-                if self.generation != generation or self.revoke_pending:
                     return 5.0
-                self.creds, creds = disk, disk
-                self.generation += 1
-                generation = self.generation
-                self.clients, self.aps, self.updated = {}, [], 0.0
-                self.state, self.message = "off", ""
-                age = time.time() - self.updated
+                # Saved under the lock logout() takes too: a Disconnect is either before (and this
+                # generation check fails) or after (and deletes this file).
+                if not save_private_json(FRITZ_FILE, creds):
+                    self.state, self.message = "error", "The login could not be stored in the settings folder."
+                    self.message_code, self.message_args = "fzNotStored", []
+                    return 5.0
+                self.remove_pending = False
+                self.creds = creds
+                self.clients, self.aps, self.updated = clients, aps, time.time()
+                self.state, self.message = "connected", ""
+                self.message_code, self.message_args = "", []
+            return interval
         if not creds or creds["gateway_mac"] != mac:
             return 5.0
         due = interval if state != "error" else FRITZ_RETRY_ERROR
         if age < due:
             return min(5.0, due - age)
-        def still_saved():
-            # A gateway change or a Disconnect on any screen in between stops the request before
-            # the password-derived response (or the mesh list request) is sent.
-            return self.current(ip, mac, generation) and load_fritz() == creds
         try:
-            # Saved credentials go only to the pinned certificate.
-            clients, aps = self.refresh(ip, creds, still_saved, iface)
+            # Saved credentials go only to the pinned certificate; a gateway change or Disconnect
+            # in between stops each request before it is sent.
+            clients, aps = self.refresh(ip, creds, lambda: self.current(ip, mac, generation), iface)
         except FritzError as exc:
-            if load_fritz() != creds:
-                return 5.0  # disconnected or replaced elsewhere: followed on the next step
             with self.lock:
                 if self.generation == generation:
                     self.state, self.message, self.updated = "error", str(exc), time.time()
                     self.message_code, self.message_args = exc.code, exc.args_
             return 5.0
-        if load_fritz() != creds:
-            return 5.0  # disconnected elsewhere while it was read: never shown
         with self.lock:
             if self.generation != generation:
                 return 5.0  # the old gateway's mesh list is never shown for the new one
@@ -2378,6 +2305,211 @@ class FritzMesh:
             self.wake.clear()
 
 
+# --- One FRITZ!Box collector for all screens ---------------------------------------
+
+def take_leader_lock():
+    """The FRITZ!Box leader lock (private file in the checked config directory), taken without
+    waiting; its descriptor is kept open for the collector's whole life, so the lock frees only
+    when the collector ends. None while another collector holds it (or the file is refused)."""
+    dfd = private_config_dir_fd()
+    if dfd is None:
+        return None
+    fd = None
+    try:
+        fd = os.open(FRITZ_LEADER_FILE, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                     0o600, dir_fd=dfd)
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            raise PermissionError("not a private lock file")
+        if info.st_mode & 0o077:
+            os.fchmod(fd, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fd
+    except OSError:
+        if fd is not None:
+            os.close(fd)
+        return None
+    finally:
+        os.close(dfd)
+
+
+def runtime_dir():
+    """Private per-user directory for the request socket: $XDG_RUNTIME_DIR (a real directory of
+    ours that nobody else may enter) / ubruckhaus-wlan-monitor (created 0700, checked the same)."""
+    base = os.environ.get("XDG_RUNTIME_DIR")
+    if not base or not os.path.isabs(base):
+        return None
+
+    def private(path):
+        info = os.lstat(path)
+        return stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() and not info.st_mode & 0o077
+    try:
+        if not private(base):
+            return None
+        path = os.path.join(base, "ubruckhaus-wlan-monitor")
+        try:
+            os.mkdir(path, 0o700)
+        except FileExistsError:
+            pass
+        return path if private(path) else None
+    except OSError:
+        return None
+
+
+def request_socket_path():
+    """The leader's socket, named after the config directory it leads for (a collector with
+    another config directory never takes over or replaces this one), or None."""
+    directory = runtime_dir()
+    if not directory:
+        return None
+    tag = hashlib.sha256(os.path.abspath(config_dir()).encode("utf-8", "replace")).hexdigest()[:16]
+    return os.path.join(directory, f"fritzbox-{tag}.sock")
+
+
+def peer_uid(sock):
+    """The user id of the process at the other end of a Unix socket (SO_PEERCRED)."""
+    creds = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+    return struct.unpack("3i", creds)[1]
+
+
+def open_request_socket():
+    """The leader's listening socket for requests from the other collectors (0600, in the private
+    runtime directory). Only the lock holder calls this, so a socket left there by an ended
+    leader can be replaced; anything else in its place is left alone and no socket is opened."""
+    path = request_socket_path()
+    if not path:
+        return None
+    sock = None
+    try:
+        try:
+            info = os.lstat(path)
+            if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid():
+                return None
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM | socket.SOCK_CLOEXEC)
+        old = os.umask(0o177)
+        try:
+            sock.bind(path)
+        finally:
+            os.umask(old)
+        sock.listen(8)
+        sock.setblocking(False)
+        return sock
+    except OSError:
+        if sock is not None:
+            sock.close()
+        return None
+
+
+def send_to_leader(line):
+    """Pass one command line to the FRITZ!Box collector; True once it confirmed it. The other end
+    must be a process of this user (SO_PEERCRED), else nothing (no password) is sent."""
+    path = request_socket_path()
+    if not path:
+        return False
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM | socket.SOCK_CLOEXEC)
+        sock.settimeout(1.0)
+        sock.connect(path)
+        if peer_uid(sock) != os.getuid():
+            return False
+        sock.sendall(line.encode("utf-8"))
+        sock.shutdown(socket.SHUT_WR)
+        return sock.recv(16).startswith(b"ok")
+    except OSError:
+        return False
+    finally:
+        if sock is not None:
+            sock.close()
+
+
+def clean_fritz_info(info):
+    """A published FRITZ!Box state, every field checked like a command (None if malformed)."""
+    if not isinstance(info, dict) or info.get("state") not in FRITZ_STATES:
+        return None
+    args = info.get("message_args")
+    aps = info.get("aps")
+    if not (isinstance(info.get("available"), bool) and isinstance(info.get("model"), str)
+            and isinstance(info.get("message"), str) and isinstance(info.get("message_code"), str)
+            and re.fullmatch(r"(fz[A-Za-z]{1,30})?", info["message_code"])
+            and isinstance(args, list) and len(args) <= 4 and all(isinstance(a, str) for a in args)
+            and isinstance(info.get("user"), str) and FRITZ_USER_RE.match(info["user"])
+            and isinstance(aps, list) and len(aps) <= FRITZ_MAX_NODES
+            and store_time(info.get("updated")) is not None):
+        return None
+    clean_aps = []
+    for ap in aps:
+        if not isinstance(ap, dict):
+            return None
+        mac, via_mac, clients = ap.get("mac"), ap.get("via_mac"), ap.get("clients")
+        if not (isinstance(mac, str) and MAC_RE.match(mac) and ap.get("role") in ("master", "slave")
+                and isinstance(via_mac, str) and (not via_mac or MAC_RE.match(via_mac))
+                and all(isinstance(ap.get(k), str) for k in ("name", "via", "band", "model"))
+                and isinstance(clients, int) and not isinstance(clients, bool) and 0 <= clients <= FRITZ_MAX_NODES):
+            return None
+        clean_aps.append({"mac": mac.lower(), "name": clean(ap["name"], 48), "role": ap["role"],
+                          "via": clean(ap["via"], 48), "via_mac": via_mac.lower(), "band": clean(ap["band"], 16),
+                          "model": clean(ap["model"], 48), "clients": clients})
+    return {"available": info["available"], "model": clean(info["model"], 48), "state": info["state"],
+            "message": clean(info["message"], 300), "message_code": info["message_code"],
+            "message_args": [clean(a, 64) for a in args], "user": info["user"], "aps": clean_aps,
+            "updated": int(info["updated"])}
+
+
+def clean_fritz_clients(clients):
+    """The published mesh entries per device MAC, checked like parse_mesh output (None if malformed)."""
+    if not isinstance(clients, dict) or len(clients) > FRITZ_MAX_NODES:
+        return None
+
+    def small_int(value, low, high):
+        return value is None or (isinstance(value, int) and not isinstance(value, bool) and low <= value <= high)
+    out = {}
+    for mac, entry in clients.items():
+        if not (isinstance(mac, str) and MAC_RE.match(mac) and isinstance(entry, dict)):
+            return None
+        via_mac = entry.get("via_mac")
+        if not (all(isinstance(entry.get(k), str) for k in ("box_name", "via", "band"))
+                and isinstance(via_mac, str) and (not via_mac or MAC_RE.match(via_mac))
+                and entry.get("role") in ("master", "slave", "client")
+                and small_int(entry.get("rate_mbps"), 0, 100000) and small_int(entry.get("signal_dbm"), -150, 0)):
+            return None
+        out[mac.lower()] = {"box_name": clean(entry["box_name"], 48), "via": clean(entry["via"], 48),
+                            "via_mac": via_mac.lower(), "band": clean(entry["band"], 16),
+                            "rate_mbps": entry.get("rate_mbps"), "signal_dbm": entry.get("signal_dbm"),
+                            "role": entry["role"]}
+    return out
+
+
+FRITZ_OFF = {"available": False, "model": "", "state": "off", "message": "", "message_code": "",
+             "message_args": [], "user": "", "aps": [], "updated": 0}
+
+
+def read_fritz_state(ip, mac, iface, now_wall=None):
+    """(info, clients, net_id, published at) from the FRITZ!Box collector, only when it is fresh and for
+    the very router this collector sees now (same address, MAC and interface); else nothing."""
+    now_wall = time.time() if now_wall is None else now_wall
+    data = load_private_json(FRITZ_STATE_FILE, FRITZ_STATE_MAX)
+    try:
+        if not isinstance(data, dict):
+            return None
+        stamp, target, net_id = data.get("time"), data.get("for"), data.get("net_id")
+        ip, iface = fritz_target(ip, iface)
+        if (store_time(stamp) is None or not now_wall - FRITZ_STATE_FRESH <= stamp <= now_wall + 5
+                or not isinstance(target, dict) or not mac
+                or [target.get("ip"), target.get("mac"), target.get("iface")] != [ip or "", mac, iface]
+                or not isinstance(net_id, str) or not NET_ID_RE.match(net_id)):
+            return None
+        info, clients = clean_fritz_info(data.get("info")), clean_fritz_clients(data.get("clients"))
+        if info is None or clients is None:
+            return None
+        return info, clients, net_id, stamp
+    except Exception:  # an odd file is no state, never a failed snapshot
+        return None
+
+
 class Monitor:
     def __init__(self):
         self.lang = "en"  # set by the bar widget ("lang" command); used for notifications
@@ -2385,7 +2517,16 @@ class Monitor:
         self.untrusted_here = set()  # untrusted here while the shared list could not be saved
         self.store_stamp = store_stamp()
         self.store = load_store()
-        self.fritz = FritzMesh()
+        # The FRITZ!Box: only the leader (lead()) has a reader and the login; the others show what
+        # it publishes and pass logins / Disconnect to it.
+        self.fritz = None
+        self.leader_fd = None
+        self.request_sock = None
+        self.start_threads = False  # main(): the leader's reader runs in its own thread
+        self.remote_open_until = -math.inf  # a panel open on another screen (fritz_open)
+        self.open_sent = -math.inf
+        self.published = ("", -math.inf)
+        self.fritz_note = None  # (info patch, wall time) shown here until the leader publishes
         self.panel_open = False
         self.force_next = False
         self.iface_cache = {}
@@ -2393,6 +2534,119 @@ class Monitor:
         self.trust_identity = {"ssid": "", "gateway_mac": ""}
         self.gateway_poked = -math.inf
         self.reset_network(None)
+
+    # -- the one FRITZ!Box collector --
+    def lead(self):
+        """True when this collector is (or just became) the FRITZ!Box collector: the first to
+        take the leader lock, kept until it ends; then it alone reads and writes the login."""
+        if self.fritz is not None:
+            if self.request_sock is None:
+                self.request_sock = open_request_socket()
+            return True
+        fd = take_leader_lock()
+        if fd is None:
+            return False
+        self.leader_fd = fd
+        self.fritz = FritzMesh()
+        if self.start_threads:
+            self.fritz.start()
+        self.request_sock = open_request_socket()
+        return True
+
+    def close(self):
+        """Give up the FRITZ!Box role (the process ending does the same)."""
+        if self.request_sock is not None:
+            self.request_sock.close()
+            self.request_sock = None
+        if self.leader_fd is not None:
+            os.close(self.leader_fd)
+            self.leader_fd = None
+
+    def forward(self, line, note):
+        """A login or Disconnect from this screen's panel, passed to the FRITZ!Box collector; shown
+        here as `note` until that collector publishes again (or as an error if it was not taken)."""
+        if send_to_leader(line):
+            self.fritz_note = (note, time.time())
+        else:
+            self.fritz_note = ({"state": "error",
+                                "message": "The request could not be passed to the collector that talks to the FRITZ!Box.",
+                                "message_code": "fzNotSent", "message_args": []}, time.time())
+
+    def serve_requests(self, limit=8):
+        """The leader takes logins / Disconnect / panel-open notes from the other collectors: only
+        from processes of this user, one bounded command per connection. True if any arrived."""
+        if self.request_sock is None or self.fritz is None:
+            return False
+        handled = False
+        for _ in range(limit):
+            try:
+                conn, _addr = self.request_sock.accept()
+            except (BlockingIOError, InterruptedError):
+                break
+            except OSError:
+                break
+            try:
+                conn.settimeout(0.2)
+                if peer_uid(conn) != os.getuid():
+                    continue
+                data = b""
+                while len(data) <= MAX_COMMAND_BYTES:
+                    chunk = conn.recv(MAX_COMMAND_BYTES + 1 - len(data))
+                    if not chunk:
+                        break
+                    data += chunk
+                if len(data) > MAX_COMMAND_BYTES:
+                    continue
+                command = parse_command(data.decode("utf-8", "replace"))
+                if isinstance(command, dict) and command.get("cmd") == "fritz_login":
+                    self.fritz.login(command["user"], command["password"], command["net"])
+                elif command == "fritz_logout":
+                    self.fritz.logout()
+                elif command == "fritz_open":
+                    self.remote_open_until = time.monotonic() + FRITZ_REMOTE_OPEN
+                    self.fritz.wake.set()
+                else:
+                    continue
+                handled = True
+                conn.sendall(b"ok\n")
+            except Exception:  # a broken request is dropped, never the collector
+                pass
+            finally:
+                conn.close()
+        return handled
+
+    def fritz_view(self, ip, mac, is_fritz, iface):
+        """(info, mesh, net_id) for this snapshot: the leader reads the FRITZ!Box and publishes it,
+        the others show that state when it is fresh and for the router they see themselves."""
+        if self.lead():
+            self.fritz.set_network(ip, mac, is_fritz, self.panel_open or time.monotonic() < self.remote_open_until,
+                                   iface)
+            info, mesh = self.fritz.snapshot()
+            self.publish_fritz(info, mesh)
+            return info, mesh, self.fritz.net_id
+        now = time.monotonic()
+        if self.panel_open and now - self.open_sent >= FRITZ_REMOTE_OPEN / 3:
+            self.open_sent = now
+            send_to_leader("fritz_open")
+        state = read_fritz_state(ip, mac, iface)
+        info, mesh, net_id, stamp = state if state else (dict(FRITZ_OFF), {}, "", 0)
+        if self.fritz_note:
+            note, sent = self.fritz_note
+            if stamp > sent or time.time() - sent > 15:
+                self.fritz_note = None
+            else:
+                info = dict(info, **note)
+        return info, mesh, net_id
+
+    def publish_fritz(self, info, mesh):
+        ip, mac, iface = self.fritz.target()
+        body = {"for": {"ip": ip, "mac": mac, "iface": iface}, "net_id": self.fritz.net_id,
+                "info": info, "clients": mesh}
+        text = json.dumps(body, sort_keys=True)
+        now = time.monotonic()
+        if text != self.published[0] or now - self.published[1] >= FRITZ_STATE_EVERY:
+            if save_private_json(FRITZ_STATE_FILE, dict(body, time=round(time.time(), 3)), FRITZ_STATE_MAX, compact=True):
+                self.published = (text, now)
 
     def refresh_gateway(self, neighbors, gateway_ip, iface, now):
         """Trust needs the router's MAC from the kernel right now. Its entry ages out when nothing
@@ -2452,11 +2706,20 @@ class Monitor:
                 self.update_store(change)
                 return True
             if command["cmd"] == "fritz_login":
-                self.fritz.login(command["user"], command["password"], command["net"])
+                if self.lead():
+                    self.fritz.login(command["user"], command["password"], command["net"])
+                else:
+                    self.forward(json.dumps({"cmd": "fritz_login", "user": command["user"],
+                                             "password": command["password"], "net": command["net"]}),
+                                 {"state": "connecting", "message": "Connecting to the FRITZ!Box…",
+                                  "message_code": "fzConnecting", "message_args": []})
                 return True
             return self.handle_device(command)
         if command == "fritz_logout":
-            self.fritz.logout()
+            if self.lead():
+                self.fritz.logout()
+            else:
+                self.forward("fritz_logout", dict(FRITZ_OFF))
             return True
         if command == "known_all":
             key = network_key(self.trust_identity)
@@ -2682,7 +2945,7 @@ class Monitor:
             if self.identity is not None:
                 self.reset_network(None)
                 self.trust_identity = {"ssid": "", "gateway_mac": ""}
-            self.fritz.set_network(None, "", False, self.panel_open, "")
+            self.fritz_view(None, "", False, "")
             return {
                 "time": int(time.time()),
                 "active": False,
@@ -2746,10 +3009,8 @@ class Monitor:
 
         # Only the router's MAC seen now: one remembered from before never keeps the login offered
         # (or a typed login queued) on a network whose router cannot be told apart right now.
-        self.fritz.set_network(None if lan_blocked else gateway_ip, gateway_mac,
-                               fritz_maker(lookup_vendor(gateway_mac), trusted),
-                               self.panel_open, iface)
-        fritz_info, mesh = self.fritz.snapshot()
+        fritz_info, mesh, fritz_net_id = self.fritz_view(None if lan_blocked else gateway_ip, gateway_mac,
+                                                         fritz_maker(lookup_vendor(gateway_mac), trusted), iface)
         if lan_blocked:
             mesh = {}
             fritz_info = dict(fritz_info, aps=[], state="paused" if fritz_info["user"] else fritz_info["state"],
@@ -2764,6 +3025,13 @@ class Monitor:
         do_known = not do_full and trusted and self.known and now - self.last_known_scan >= KNOWN_SCAN_EVERY
         if lan_blocked:  # probes would only be dropped by the VPN firewall
             do_full = do_known = False
+        if trusted and (do_known or (do_full and not force_scan)):
+            # Automatic probes only on the trusted network seen at this very moment: SSID and
+            # router MAC read again now, not the values cached for the display (wireless()).
+            fresh_ssid = self.wireless(iface, now, force=True).get("ssid", "") if net["is_wireless"] else ""
+            fresh_mac = read_neighbors(iface).get(gateway_ip, {}).get("mac", "") if gateway_ip else ""
+            if (fresh_ssid, fresh_mac) != (self.trust_identity["ssid"], gateway_mac) or not fresh_mac:
+                do_full, do_known = force_scan, False
 
         mdns_every = MDNS_EVERY_OPEN if self.panel_open else MDNS_EVERY_CLOSED
         if do_full or now - self.mdns_time >= mdns_every:
@@ -2983,7 +3251,7 @@ class Monitor:
                 # The router the collector talks to now (not from the device list, which the
                 # panel freezes while a name is edited) and its network id for fritz_login.
                 "gateway_mac": self.identity["gateway_mac"],
-                "net_id": self.fritz.net_id,
+                "net_id": fritz_net_id,
                 "mac": net["mac"],
                 "ssid": wlan.get("ssid") or ("Ethernet" if not net["is_wireless"] else iface),
                 "bssid": wlan.get("bssid") or "",
@@ -3041,10 +3309,12 @@ def main():
             monitor.traffic(net["iface"], time.monotonic())
         time.sleep(0.25)
         monitor.snapshot(force_scan=True)  # learns the network for the FRITZ!Box reader
-        monitor.fritz.step()
+        if monitor.fritz is not None:
+            monitor.fritz.step()
         emit(monitor.snapshot())
         return 0
-    monitor.fritz.start()
+    monitor.start_threads = True
+    monitor.lead()
 
     stdin_fd = sys.stdin.fileno() if sys.stdin else None
     pending = b""
@@ -3052,13 +3322,20 @@ def main():
     while True:
         run_now = False
         timeout = max(0.0, next_tick - time.monotonic())
-        if stdin_fd is not None:
+        if stdin_fd is not None or monitor.request_sock is not None:
+            watch = [fd for fd in (stdin_fd, monitor.request_sock) if fd is not None]
             try:
-                ready, _, _ = select.select([stdin_fd], [], [], timeout)
-                data = os.read(stdin_fd, 1024) if ready else None
+                ready, _, _ = select.select(watch, [], [], timeout)
             except (OSError, ValueError):
-                ready, data = [], b""
+                ready = [stdin_fd] if stdin_fd is not None else []
+            if monitor.request_sock is not None and monitor.request_sock in ready:
+                ready.remove(monitor.request_sock)
+                run_now = monitor.serve_requests() or run_now
             if ready:
+                try:
+                    data = os.read(stdin_fd, 1024)
+                except (OSError, ValueError):
+                    data = b""
                 if not data:  # EOF: keep running, stop listening
                     stdin_fd = None
                 else:
@@ -3066,8 +3343,8 @@ def main():
                     *lines, pending = pending.split(b"\n")
                     for line in lines:
                         run_now = handle_line(monitor, line.decode("utf-8", "replace")) or run_now
-                if not run_now and time.monotonic() < next_tick:
-                    continue
+            if not run_now and time.monotonic() < next_tick:
+                continue
         elif timeout:
             time.sleep(timeout)
 
