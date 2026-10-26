@@ -1858,15 +1858,19 @@ def parse_mesh(data):
 
 
 def load_fritz():
+    """The saved login, only while it was saved under the current revision: once any collector's
+    Disconnect renewed the revision it is used nowhere, even if the file could not be deleted."""
     data = load_private_json(FRITZ_FILE, 4096)
     if not isinstance(data, dict):
         return None
     mac, user, password, pin = (data.get(k) for k in ("gateway_mac", "user", "password", "pin"))
+    rev = data.get("rev", "")  # saved before any Disconnect (or by 0.8.0 and older): ""
     if not (isinstance(mac, str) and MAC_RE.match(mac) and isinstance(user, str) and FRITZ_USER_RE.match(user)
             and isinstance(password, str) and 0 < len(password) <= FRITZ_PASSWORD_MAX
-            and isinstance(pin, str) and re.fullmatch(r"[0-9a-f]{64}", pin)):
+            and isinstance(pin, str) and re.fullmatch(r"[0-9a-f]{64}", pin)
+            and isinstance(rev, str) and rev == fritz_revision()):
         return None
-    return {"gateway_mac": mac.lower(), "user": user, "password": password, "pin": pin}
+    return {"gateway_mac": mac.lower(), "user": user, "password": password, "pin": pin, "rev": rev}
 
 
 def remove_fritz():
@@ -1881,7 +1885,7 @@ def remove_fritz():
 
 
 @contextlib.contextmanager
-def private_file_lock(name):
+def private_file_lock(name, wait=None):
     """Exclusive lock shared by all collectors, held only for quick file work. Yields True while
     held and False if it could not be taken within FRITZ_LOCK_WAIT (callers then fail closed);
     the lock file is private, never followed through a symlink and never anything but a file."""
@@ -1896,7 +1900,7 @@ def private_file_lock(name):
                 raise PermissionError("not a private lock file")
             if info.st_mode & 0o077:
                 os.fchmod(fd, 0o600)
-            deadline = time.monotonic() + FRITZ_LOCK_WAIT
+            deadline = time.monotonic() + (FRITZ_LOCK_WAIT if wait is None else wait)
             while True:
                 try:
                     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1936,14 +1940,16 @@ def fritz_new_revision():
 
 
 def fritz_revoke():
-    """Disconnect for every collector. The revision is renewed first: a login being saved in any
-    collector checks it again after saving and deletes what it saved. Then the saved login is
-    deleted, under the shared lock when it can be taken (and once more after). True when both
-    the new revision and the deletion succeeded."""
-    renewed = fritz_new_revision() is not None
+    """Disconnect for every collector: a new revision makes the saved login (saved with the old
+    one) unusable everywhere, and a login being saved in any collector checks it again after
+    saving. The file is then deleted unless it already holds a newer login. True once the new
+    revision is written; the deletion is only tidying up."""
+    if fritz_new_revision() is None:
+        return False
     with fritz_file_lock():
-        gone = remove_fritz()
-    return remove_fritz() and gone and renewed
+        if load_fritz() is None:
+            remove_fritz()
+    return True
 
 
 class FritzMesh:
@@ -2168,7 +2174,8 @@ class FritzMesh:
                 # Trust on first use: remember the certificate seen while the user logs in.
                 _, cert = fritz_soap(ip, pending[0], pending[1], None, "urn:dslforum-org:service:Hosts:1",
                                      "/upnp/control/hosts", "X_AVM-DE_GetMeshListPath", still_ok, iface)
-                creds = {"gateway_mac": mac, "user": pending[0], "password": pending[1], "pin": cert}
+                creds = {"gateway_mac": mac, "user": pending[0], "password": pending[1], "pin": cert,
+                         "rev": pending[5]}
                 clients, aps = self.refresh(ip, creds, still_ok, iface)
             except FritzError as exc:
                 revoked = fritz_revision() != pending[5]
@@ -2371,24 +2378,36 @@ class Monitor:
             if not ident.get("gateway_mac"):
                 return False
             key = (ident["gateway_mac"], ident["ssid"])
-            # Read, changed and written under the lock all collectors share: one screen's change
-            # never undoes another's, and every collector reloads the list before it scans.
-            with private_file_lock(TRUST_LOCK_FILE):
-                networks = [entry for entry in load_trusted() if (entry["gateway_mac"], entry["ssid"]) != key]
-                if command == "trust":
-                    networks.insert(0, {"ssid": ident["ssid"], "gateway_mac": ident["gateway_mac"]})
-                    self.last_full_scan = -math.inf
-                saved = save_trusted(networks)
+            saved = self.update_trusted(key, command == "trust")
             if command == "untrust" and not saved:
-                self.untrusted_here.add(key)  # never scanned actively here, whatever the file says
-            elif command == "trust":
+                # Never scanned actively here, whatever the file says; written later (shared_trusted).
+                self.untrusted_here.add(key)
+            else:
                 self.untrusted_here.discard(key)
+                if command == "trust" and saved:
+                    self.last_full_scan = -math.inf
             self.trusted = self.shared_trusted()
             return True
         return False
 
+    @staticmethod
+    def update_trusted(key, trust, wait=None):
+        """Read, change and write the shared trusted list under the lock all collectors share, so
+        one screen's change never undoes another's. Nothing is written without the lock."""
+        with private_file_lock(TRUST_LOCK_FILE, wait) as held:
+            if not held:
+                return False
+            networks = [entry for entry in load_trusted() if (entry["gateway_mac"], entry["ssid"]) != key]
+            if trust:
+                networks.insert(0, {"ssid": key[1], "gateway_mac": key[0]})
+            return save_trusted(networks)
+
     def shared_trusted(self):
-        """The trusted list as all collectors share it now (Untrust on another screen counts here)."""
+        """The trusted list as all collectors share it now (Untrust on another screen counts here);
+        an Untrust that could not be written yet is retried without waiting for the lock."""
+        for key in list(self.untrusted_here):
+            if self.update_trusted(key, False, wait=0):
+                self.untrusted_here.discard(key)
         return [entry for entry in load_trusted()
                 if (entry["gateway_mac"], entry["ssid"]) not in self.untrusted_here]
 

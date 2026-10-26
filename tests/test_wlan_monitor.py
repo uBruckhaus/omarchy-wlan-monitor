@@ -879,7 +879,7 @@ class FritzTests(unittest.TestCase):
         fritz.set_network(ip, A, True, True, "wlan0")
         fritz.model_for = (ip, A)
         never = mock.patch.object(wlan_monitor, "bounded_http", side_effect=AssertionError("must not connect"))
-        with mock.patch.object(wlan_monitor, "remove_fritz", return_value=False), never:
+        with mock.patch.object(wlan_monitor, "fritz_new_revision", return_value=None), never:
             fritz.logout()
             self.assertEqual(fritz.snapshot()[0]["message_code"], "fzNotDeleted")
             self.assertEqual(fritz.step(), wlan_monitor.FRITZ_REVOKE_RETRY)
@@ -892,6 +892,27 @@ class FritzTests(unittest.TestCase):
         self.assertIsNone(wlan_monitor.load_fritz())
         self.assertFalse(fritz.revoke_pending)
         self.assertEqual(fritz.snapshot()[0]["state"], "off")
+
+    def test_a_login_file_that_cannot_be_deleted_is_used_nowhere(self):
+        A, ip = "1c:23:a2:92:2a:6c", "192.168.178.1"
+        wlan_monitor.save_private_json(wlan_monitor.FRITZ_FILE, {"gateway_mac": A, "user": "u", "password": "p",
+                                                                 "pin": "c" * 64})
+        first, second = wlan_monitor.FritzMesh(), wlan_monitor.FritzMesh()
+        self.assertEqual(second.creds["user"], "u")  # saved by 0.8.0 (no revision): still used
+        for fritz in (first, second):
+            fritz.set_network(ip, A, True, True, "wlan0")
+            fritz.model_for = (ip, A)
+        with mock.patch.object(wlan_monitor, "remove_fritz", return_value=False):
+            first.logout()
+        self.assertTrue(os.path.exists(os.path.join(wlan_monitor.config_dir(), wlan_monitor.FRITZ_FILE)))
+        self.assertFalse(first.revoke_pending)  # the new revision is what counts
+        with mock.patch.object(wlan_monitor, "bounded_http", side_effect=AssertionError("must not connect")):
+            second.step()
+        self.assertIsNone(second.creds)
+        self.assertIsNone(wlan_monitor.FritzMesh().creds)  # nor by a collector started later
+        # A later Disconnect that can delete it removes the stale file.
+        first.logout()
+        self.assertFalse(os.path.exists(os.path.join(wlan_monitor.config_dir(), wlan_monitor.FRITZ_FILE)))
 
     def test_lock_file_is_never_a_symlink_or_fifo(self):
         directory = wlan_monitor.private_config_dir()
@@ -1476,7 +1497,7 @@ class MalformedReplyTests(unittest.TestCase):
         self.assertIsNone(second.creds)
         self.assertEqual(second.snapshot()[0]["user"], "")
         wlan_monitor.save_private_json(wlan_monitor.FRITZ_FILE, {"gateway_mac": A, "user": "v", "password": "q",
-                                                                 "pin": "c" * 64})
+                                                                 "pin": "c" * 64, "rev": wlan_monitor.fritz_revision()})
         with mock.patch.object(second, "refresh", side_effect=wlan_monitor.FritzError("fzNoMesh", "x")):
             second.step()
         self.assertEqual(second.snapshot()[0]["user"], "v")
@@ -1561,6 +1582,21 @@ class StaleNetworkTests(unittest.TestCase):
             # Trust on the other screen applies here too.
             other.handle("trust")
             self.assertTrue(monitor.snapshot()["link"]["trusted"])
+            # Untrust while another process holds the lock: nothing is written without it, this
+            # screen stops at once, and the shared list follows once the lock is free.
+            fcntl = __import__("fcntl")
+            held = os.open(os.path.join(wlan_monitor.config_dir(), wlan_monitor.TRUST_LOCK_FILE), os.O_RDWR)
+            try:
+                fcntl.flock(held, fcntl.LOCK_EX)
+                with mock.patch.object(wlan_monitor, "FRITZ_LOCK_WAIT", 0.05):
+                    monitor.handle("untrust")
+                    self.assertFalse(monitor.snapshot()["link"]["trusted"])
+                self.assertTrue(wlan_monitor.load_trusted())
+            finally:
+                os.close(held)
+            monitor.snapshot()
+            self.assertEqual(wlan_monitor.load_trusted(), [])
+            self.assertFalse(other.snapshot()["link"]["trusted"])
         self.run_snapshots(steps)
 
     def test_disconnect_forgets_the_network(self):
