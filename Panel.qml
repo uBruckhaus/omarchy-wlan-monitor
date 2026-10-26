@@ -227,6 +227,16 @@ Panel {
     root.fritzFormNetId = String(root.link.net_id || "")
     root.fritzFormOpen = true
   }
+  // A saved login that only a new login can fix: shown as a banner at the top, not only in the
+  // collapsed network info.
+  readonly property bool fritzNeedsLogin: root.fritz.available === true && root.fritz.state === "error"
+    && !!root.fritz.user && (root.fritz.message_code === "fzCert" || root.fritz.message_code === "fzWrongLogin")
+  function startFritzLogin() {
+    root.showPage(false)  // the form lives on the Devices page
+    root.openFritzForm()
+    if (root.fritz.user && fritzUser.text === "") fritzUser.text = root.fritz.user
+    Qt.callLater(function() { (fritzUser.text === "" ? fritzUser : fritzPassword).forceActiveFocus() })
+  }
   function closeFritzForm(clearUser) {
     fritzPassword.clear()
     if (clearUser === true) fritzUser.clear()
@@ -1621,6 +1631,41 @@ Panel {
               }
             }
 
+            // The FRITZ!Box login needs to be typed again (new certificate, changed password).
+            Rectangle {
+              visible: root.fritzNeedsLogin && !root.fritzFormOpen && !root.lanBlocked
+              width: parent.width
+              height: fritzColumn.implicitHeight + Style.space(14)
+              radius: Style.space(6)
+              readonly property color tint: Commons.Color.accent
+              color: Qt.rgba(tint.r, tint.g, tint.b, 0.14)
+              border.width: 1
+              border.color: Qt.rgba(tint.r, tint.g, tint.b, 0.6)
+              Column {
+                id: fritzColumn
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                anchors.margins: Style.space(8)
+                spacing: Style.space(4)
+                Text {
+                  textFormat: Text.PlainText
+                  width: parent.width
+                  wrapMode: Text.WordWrap
+                  text: root.glyph(0xF0026) + "  " + root.t(root.fritz.message_code || "fzCert", root.fritz.message_args || [])
+                  color: root.fg
+                  font.family: root.font
+                  font.pixelSize: Style.font.bodySmall
+                  font.bold: true
+                }
+                LinkAction {
+                  icon: root.glyph(0xF0306)
+                  label: root.t("fritzReconnect")
+                  onActivated: root.startFritzLogin()
+                }
+              }
+            }
+
             Column {
               id: devicesPage
               visible: !root.mapPage
@@ -1804,11 +1849,7 @@ Panel {
                       icon: root.glyph(0xF0306)
                       label: root.fritz.state === "error" && root.fritz.user ? root.t("fritzReconnect") : root.t("fritzShow")
                       baseColor: root.dim
-                      onActivated: {
-                        root.openFritzForm()
-                        if (root.fritz.user && fritzUser.text === "") fritzUser.text = root.fritz.user
-                        Qt.callLater(function() { (fritzUser.text === "" ? fritzUser : fritzPassword).forceActiveFocus() })
-                      }
+                      onActivated: root.startFritzLogin()
                     }
                     LinkAction {
                       visible: root.fritz.user !== undefined && root.fritz.user !== "" && !root.fritzFormOpen
