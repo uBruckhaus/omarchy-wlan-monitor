@@ -108,6 +108,8 @@ FRITZ_STATE_MAX = 1048576
 FRITZ_STATE_FRESH = 30.0   # a published state older than this is shown nowhere
 FRITZ_STATE_EVERY = 10.0   # republished at least this often while unchanged
 FRITZ_REMOTE_OPEN = 60.0   # a panel open on another screen keeps the fast mesh polling this long
+FRITZ_REQUEST_TTL = 5.0    # a forwarded request not handled by then is dropped, never done late
+FRITZ_REQUEST_MAX = 8192   # bytes of one forwarded request (the command line itself: MAX_COMMAND_BYTES)
 FRITZ_STATES = ("off", "connecting", "connected", "error", "paused")
 FRITZ_LOCK_WAIT = 2.0      # shared file locks (trust list, devices.json)
 FRITZ_USER_RE = re.compile(r"^[A-Za-z0-9._@-]{0,64}$")
@@ -710,13 +712,16 @@ def sweep(targets, dns_server=None, settle=0.22, iface=None):
     return ptr_names, responders
 
 
-def lookup_ptr(ip, servers, timeout=0.1):
-    """Single PTR lookup; returns the FQDN list from the first server that answers."""
+def lookup_ptr(ip, servers, timeout=0.1, iface=None):
+    """Single PTR lookup; returns the FQDN list from the first server that answers. With `iface`,
+    the query leaves only through that interface (nothing is sent if it cannot be bound)."""
     for server in servers:
         if not server:
             continue
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                if not bind_to(sock, iface):
+                    continue
                 sock.connect((server, 53))
                 qid = random.SystemRandom().randrange(1, 65536)
                 sock.send(build_dns_ptr_packet(qid, ip))
@@ -1107,30 +1112,42 @@ def gateway_reachable(ip, ports=(80, 53, 443), timeout=0.4):
     return False
 
 
-def tcp_open(ip, port, timeout=0.35):
+def tcp_open(ip, port, timeout=0.35, iface=None):
+    """TCP connect check to an IPv4 literal; with `iface` only through that interface (a socket
+    that cannot be bound to it connects nowhere)."""
     try:
-        with socket.create_connection((ip, port), timeout=timeout):
-            return True
+        ipaddress.IPv4Address(ip)
+    except ValueError:
+        return False  # names are never resolved here
+    try:
+        if iface is None:
+            sock = socket.create_connection((ip, port), timeout=timeout)
+        else:
+            if not isinstance(iface, str) or not IFACE_RE.match(iface):
+                return False
+            sock = connect_bound((ip, port), timeout, None, iface)
+        sock.close()
+        return True
     except OSError:
         return False
 
 
-def probe_web(ip):
+def probe_web(ip, iface=None):
     """Return "http" or "https" if the host accepts TCP on 80 / 443, else ""."""
     for port, scheme in ((80, "http"), (443, "https")):
-        if tcp_open(ip, port):
+        if tcp_open(ip, port, iface=iface):
             return scheme
     return ""
 
 
-def url_reachable(url):
+def url_reachable(url, iface=None):
     """TCP-connect check for an advertised web UI (many devices announce _http._tcp but refuse it)."""
     try:
         parts = urllib.parse.urlsplit(url)
         port = parts.port or (443 if parts.scheme == "https" else 80)
     except ValueError:
         return False
-    return bool(parts.hostname) and tcp_open(parts.hostname, port)
+    return bool(parts.hostname) and tcp_open(parts.hostname, port, iface=iface)
 
 
 # --- Trusted networks ----------------------------------------------------------
@@ -1313,8 +1330,8 @@ def parse_command(line):
     if not text.startswith("{"):
         command = text.lower()
         return command if command in COMMANDS else ""
-    if len(text) > MAX_COMMAND_BYTES:
-        return ""
+    if len(text.encode("utf-8", "replace")) > MAX_COMMAND_BYTES:
+        return ""  # one byte limit, from the panel and from another collector alike
     try:
         data = json.loads(text)
     except ValueError:
@@ -2310,6 +2327,20 @@ class FritzMesh:
                 self.state, self.message = "connected", ""
                 self.message_code, self.message_args = "", []
             return interval
+        # The saved login is read again before each refresh: deleted or replaced from outside (by
+        # hand, or by an older collector on this account) it is followed at once.
+        disk = load_fritz()
+        if disk != creds:
+            with self.lock:
+                if self.generation != generation:
+                    return 5.0
+                self.creds, creds = disk, disk
+                self.generation += 1
+                generation = self.generation
+                self.clients, self.aps, self.updated = {}, [], 0.0
+                self.state, self.message = "off", ""
+                self.message_code, self.message_args = "", []
+                age = time.time() - self.updated
         if not creds or creds["gateway_mac"] != mac:
             return 5.0
         due = interval if state != "error" else FRITZ_RETRY_ERROR
@@ -2318,8 +2349,11 @@ class FritzMesh:
         try:
             # Saved credentials go only to the pinned certificate; a gateway change or Disconnect
             # in between stops each request before it is sent.
-            clients, aps = self.refresh(ip, creds, lambda: self.current(ip, mac, generation), iface)
+            clients, aps = self.refresh(ip, creds, lambda: load_fritz() == creds and self.current(ip, mac, generation),
+                                        iface)
         except FritzError as exc:
+            if load_fritz() != creds:
+                return 5.0  # removed meanwhile: followed on the next step
             with self.lock:
                 if self.generation == generation:
                     self.state, self.message, self.updated = "error", str(exc), time.time()
@@ -2411,7 +2445,7 @@ def peer_uid(sock):
 
 
 def open_request_socket():
-    """The leader's listening socket for requests from the other collectors (0600, in the private
+    """(socket, (path, inode)) or None: the leader's listening socket for requests from the other collectors (0600, in the private
     runtime directory). Only the lock holder calls this, so a socket left there by an ended
     leader can be replaced; anything else in its place is left alone and no socket is opened."""
     path = request_socket_path()
@@ -2434,18 +2468,26 @@ def open_request_socket():
             os.umask(old)
         sock.listen(8)
         sock.setblocking(False)
-        return sock
+        return sock, (path, os.lstat(path).st_ino)
     except OSError:
         if sock is not None:
             sock.close()
         return None
 
 
-def send_to_leader(line):
-    """Pass one command line to the FRITZ!Box collector; True once it confirmed it. The other end
-    must be a process of this user (SO_PEERCRED), else nothing (no password) is sent."""
+def send_to_leader(line, ttl=FRITZ_REQUEST_TTL):
+    """Pass one command line to the FRITZ!Box collector, with an id and an expiry; True once it
+    answered that it carried out this very request. The leader drops a request it reaches after
+    the expiry, and this side waits for the answer until past it, so False always means the
+    request was not and will not be carried out. The other end must be a process of this user
+    (SO_PEERCRED), else nothing (no password) is sent."""
     path = request_socket_path()
     if not path:
+        return False
+    rid = secrets.token_hex(8)
+    expires = time.time() + ttl
+    wire = json.dumps({"id": rid, "expires": round(expires, 3), "line": line}, ensure_ascii=False).encode("utf-8")
+    if len(wire) > FRITZ_REQUEST_MAX:
         return False
     sock = None
     try:
@@ -2454,9 +2496,19 @@ def send_to_leader(line):
         sock.connect(path)
         if peer_uid(sock) != os.getuid():
             return False
-        sock.sendall(line.encode("utf-8"))
+        sock.sendall(wire)
         sock.shutdown(socket.SHUT_WR)
-        return sock.recv(16).startswith(b"ok")
+        reply, give_up = b"", expires + 2.0
+        while len(reply) < 64:
+            left = give_up - time.time()
+            if left <= 0:
+                break
+            sock.settimeout(left)
+            chunk = sock.recv(64 - len(reply))
+            if not chunk:
+                break
+            reply += chunk
+        return reply.strip() == b"ok " + rid.encode()
     except OSError:
         return False
     finally:
@@ -2560,6 +2612,9 @@ class Monitor:
         self.fritz = None
         self.leader_fd = None
         self.request_sock = None
+        self.request_id = None  # (path, inode) of the socket this collector made
+        self.request_stop = threading.Event()
+        self.request_thread = None
         self.start_threads = False  # main(): the leader's reader runs in its own thread
         self.remote_open_until = -math.inf  # a panel open on another screen (fritz_open)
         self.open_sent = -math.inf
@@ -2579,7 +2634,7 @@ class Monitor:
         take the leader lock, kept until it ends; then it alone reads and writes the login."""
         if self.fritz is not None:
             if self.request_sock is None:
-                self.request_sock = open_request_socket()
+                self.open_requests()
             return True
         fd = take_leader_lock()
         if fd is None:
@@ -2588,14 +2643,51 @@ class Monitor:
         self.fritz = FritzMesh()
         if self.start_threads:
             self.fritz.start()
-        self.request_sock = open_request_socket()
+        self.open_requests()
         return True
 
+    def open_requests(self):
+        opened = open_request_socket()
+        if opened is None:
+            return
+        self.request_sock, self.request_id = opened
+        if self.start_threads:
+            self.start_request_thread()
+
+    def start_request_thread(self):
+        """Requests from the other collectors are answered on their own thread, so a slow
+        snapshot (discovery, sweeps) never delays them past their expiry."""
+        if self.request_thread is not None or self.request_sock is None:
+            return
+
+        def loop(sock):
+            while not self.request_stop.is_set():
+                try:
+                    ready, _, _ = select.select([sock], [], [], 0.5)
+                    if ready:
+                        self.serve_requests()
+                except Exception:  # never let the request thread die
+                    time.sleep(0.5)
+        self.request_thread = threading.Thread(target=loop, args=(self.request_sock,), daemon=True)
+        self.request_thread.start()
+
     def close(self):
-        """Give up the FRITZ!Box role (the process ending does the same)."""
+        """Give up the FRITZ!Box role (the process ending does the same) and remove the socket
+        this collector made (only that very one)."""
+        self.request_stop.set()
+        if self.request_thread is not None:
+            self.request_thread.join(2.0)
+            self.request_thread = None
         if self.request_sock is not None:
             self.request_sock.close()
             self.request_sock = None
+            path, inode = self.request_id
+            try:
+                info = os.lstat(path)
+                if stat.S_ISSOCK(info.st_mode) and info.st_ino == inode:
+                    os.unlink(path)
+            except OSError:
+                pass
         if self.leader_fd is not None:
             os.close(self.leader_fd)
             self.leader_fd = None
@@ -2632,18 +2724,27 @@ class Monitor:
                 if peer_uid(conn) != os.getuid():
                     continue
                 data = b""
-                while len(data) <= MAX_COMMAND_BYTES:
+                while len(data) <= FRITZ_REQUEST_MAX:
                     left = deadline - time.monotonic()
                     if left <= 0:
                         raise TimeoutError("request too slow")
                     conn.settimeout(left)
-                    chunk = conn.recv(MAX_COMMAND_BYTES + 1 - len(data))
+                    chunk = conn.recv(FRITZ_REQUEST_MAX + 1 - len(data))
                     if not chunk:
                         break
                     data += chunk
-                if len(data) > MAX_COMMAND_BYTES:
+                if len(data) > FRITZ_REQUEST_MAX:
                     continue
-                command = parse_command(data.decode("utf-8", "replace"))
+                request = json.loads(data.decode("utf-8", "replace"))
+                rid, expires, line = (request.get(k) for k in ("id", "expires", "line")) \
+                    if isinstance(request, dict) else (None, None, None)
+                if not (isinstance(rid, str) and re.fullmatch(r"[0-9a-f]{16}", rid) and isinstance(line, str)
+                        and isinstance(expires, (int, float)) and not isinstance(expires, bool)):
+                    continue
+                if not time.time() <= expires <= time.time() + 2 * FRITZ_REQUEST_TTL:
+                    conn.sendall(b"expired " + rid.encode() + b"\n")  # never carried out late
+                    continue
+                command = parse_command(line)
                 if isinstance(command, dict) and command.get("cmd") == "fritz_login":
                     self.fritz.login(command["user"], command["password"], command["net"])
                 elif command == "fritz_logout":
@@ -2654,11 +2755,16 @@ class Monitor:
                 else:
                     continue
                 handled = True
-                conn.sendall(b"ok\n")
+                conn.sendall(b"ok " + rid.encode() + b"\n")
             except Exception:  # a broken request is dropped, never the collector
                 pass
             finally:
                 conn.close()
+        if handled:
+            try:
+                self.publish_fritz(*self.fritz.snapshot())  # the other screens see it at once
+            except Exception:
+                pass
         return handled
 
     def fritz_view(self, ip, mac, is_fritz, iface):
@@ -2756,7 +2862,8 @@ class Monitor:
                     self.fritz.login(command["user"], command["password"], command["net"])
                 else:
                     self.forward(json.dumps({"cmd": "fritz_login", "user": command["user"],
-                                             "password": command["password"], "net": command["net"]}),
+                                             "password": command["password"], "net": command["net"]},
+                                            ensure_ascii=False),
                                  {"state": "connecting", "message": "Connecting to the FRITZ!Box…",
                                   "message_code": "fzConnecting", "message_args": []})
                 return True
@@ -2966,14 +3073,16 @@ class Monitor:
             "tx_rate": round(tx_rate, 1) if tx_rate is not None else None,
         }
 
-    def hostname_for(self, ip, gateway, now, allow_lookup):
+    def hostname_for(self, ip, gateway, now, allow_lookup, iface=None):
         names = self.ptr_names.get(ip)
         if names is None:
             cached = self.dns_cache.get(ip)
             if cached and cached[0] > now:
                 names = cached[1]
             elif allow_lookup:
-                names = lookup_ptr(ip, (gateway, "127.0.0.53"))
+                # Asked of the router only, through the monitored interface (no system resolver,
+                # which could forward a local address anywhere).
+                names = lookup_ptr(ip, (gateway,), iface=iface)
                 self.dns_cache[ip] = (now + (DNS_TTL if names else DNS_NEGATIVE_TTL), names)
             else:
                 names = []
@@ -3130,7 +3239,7 @@ class Monitor:
         self.last_reachable = prune_reachable(self.last_reachable, now, in_subnet)
 
         if gateway_ip and self.gateway_web is None:
-            self.gateway_web = probe_web(gateway_ip)
+            self.gateway_web = probe_web(gateway_ip, iface=iface)
 
         traffic = self.traffic(iface, now)
         all_ips = set(neighbors) | set(self.mdns_hosts) | set(self.ptr_names) | set(responders)
@@ -3159,7 +3268,7 @@ class Monitor:
                 dns_name = clean(socket.gethostname(), 48)
             else:
                 # Single lookups only for devices we can already see (normal DNS traffic).
-                dns_name = self.hostname_for(ip, gateway_ip, now, allow_lookup=bool(neigh) or is_gateway)
+                dns_name = self.hostname_for(ip, gateway_ip, now, allow_lookup=bool(neigh) or is_gateway, iface=iface)
                 dns_name = dns_name or prev.get("hostname") or ""
             model = mdns.get("model") or prev.get("model") or ""
             real_model = model if model != wlan.get("ssid") else ""
@@ -3215,7 +3324,7 @@ class Monitor:
                         if web_checks <= 0:
                             continue  # checked in a later snapshot
                         web_checks -= 1
-                        ok = url_reachable(url)
+                        ok = url_reachable(url, iface=iface)
                         cached = (now + (WEB_OK_TTL if ok else WEB_FAIL_TTL), ok)
                         self.web_ok[url] = cached
                     if cached[1]:
@@ -3372,15 +3481,11 @@ def main():
     while True:
         run_now = False
         timeout = max(0.0, next_tick - time.monotonic())
-        if stdin_fd is not None or monitor.request_sock is not None:
-            watch = [fd for fd in (stdin_fd, monitor.request_sock) if fd is not None]
+        if stdin_fd is not None:
             try:
-                ready, _, _ = select.select(watch, [], [], timeout)
+                ready, _, _ = select.select([stdin_fd], [], [], timeout)
             except (OSError, ValueError):
-                ready = [stdin_fd] if stdin_fd is not None else []
-            if monitor.request_sock is not None and monitor.request_sock in ready:
-                ready.remove(monitor.request_sock)
-                run_now = monitor.serve_requests() or run_now
+                ready = [stdin_fd]
             if ready:
                 try:
                     data = os.read(stdin_fd, 1024)

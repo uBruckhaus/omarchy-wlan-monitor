@@ -1661,16 +1661,12 @@ class OneFritzCollectorTests(unittest.TestCase):
               "band": "", "model": "FRITZ!Box 7590", "clients": 1}])
 
     def serving(self, leader):
-        """The leader's main loop, answering requests while the follower waits for its reply."""
-        stop = threading.Event()
-
-        def loop():
-            while not stop.is_set():
-                leader.serve_requests()
-                time.sleep(0.005)
-        thread = threading.Thread(target=loop, daemon=True)
-        thread.start()
-        return stop, thread
+        """The leader's own request thread; its main loop is not running at all meanwhile (as
+        if blocked in a long snapshot), and requests are still answered."""
+        leader.start_request_thread()
+        idle = threading.Thread(target=lambda: None)
+        idle.start()
+        return threading.Event(), idle
 
     def pair(self, steps):
         def run(monitor, state, sweep):
@@ -1737,6 +1733,38 @@ class OneFritzCollectorTests(unittest.TestCase):
             self.assertEqual((snap["fritz"]["state"], snap["fritz"]["user"]), ("off", ""))
         self.pair(steps)
 
+    def test_an_expired_request_is_never_carried_out(self):
+        def steps(leader, follower, state):
+            leader.start_request_thread()
+            net_id = follower.snapshot()["link"]["net_id"]
+            line = '{"cmd":"fritz_login","user":"u","password":"p","net":"%s"}' % net_id
+            self.assertFalse(wlan_monitor.send_to_leader(line, ttl=-1))  # reached after its expiry
+            self.assertIsNone(leader.fritz.pending_login)
+            self.assertTrue(wlan_monitor.send_to_leader(line))
+            self.assertIsNotNone(leader.fritz.pending_login)
+        self.pair(steps)
+
+    def test_a_unicode_password_is_forwarded_like_any_other(self):
+        def steps(leader, follower, state):
+            leader.start_request_thread()
+            net_id = follower.snapshot()["link"]["net_id"]
+            password = "\U0001F600" * wlan_monitor.FRITZ_PASSWORD_MAX
+            line = json.dumps({"cmd": "fritz_login", "user": "u", "password": password, "net": net_id},
+                              ensure_ascii=False)
+            follower.handle(wlan_monitor.parse_command(line))
+            self.assertEqual(leader.fritz.pending_login[1], password)
+        self.pair(steps)
+
+    def test_close_removes_only_its_own_socket(self):
+        def steps(leader, follower, state):
+            path = wlan_monitor.request_socket_path()
+            self.assertTrue(os.path.exists(path))
+            leader.close()
+            self.assertFalse(os.path.exists(path))
+            follower.snapshot()  # takes over and makes a new one
+            self.assertTrue(os.path.exists(path))
+        self.pair(steps)
+
     def test_a_request_nobody_takes_is_reported(self):
         def steps(leader, follower, state):
             leader.request_sock.close()  # a leader that does not answer
@@ -1771,6 +1799,50 @@ class OneFritzCollectorTests(unittest.TestCase):
             finally:
                 slow.close()
         self.pair(steps)
+
+    def test_a_login_deleted_from_outside_is_dropped_at_once(self):
+        wlan_monitor.save_private_json(wlan_monitor.FRITZ_FILE, {"gateway_mac": self.A, "user": "u",
+                                                                 "password": "p", "pin": "c" * 64})
+        fritz = wlan_monitor.FritzMesh()
+        fritz.set_network(self.IP, self.A, True, True, "wlan0")
+        fritz.model_for = (self.IP, self.A)
+        path = os.path.join(wlan_monitor.config_dir(), wlan_monitor.FRITZ_FILE)
+        os.unlink(path)  # by hand, or by an older collector's Disconnect
+        with mock.patch.object(wlan_monitor, "bounded_http", side_effect=AssertionError("must not connect")):
+            fritz.step()
+        self.assertIsNone(fritz.creds)
+        self.assertEqual(fritz.snapshot()[0]["user"], "")
+        # Deleted while a refresh is under way: the password-derived response is not sent.
+        wlan_monitor.save_private_json(wlan_monitor.FRITZ_FILE, {"gateway_mac": self.A, "user": "u",
+                                                                 "password": "p", "pin": "c" * 64})
+        fritz = wlan_monitor.FritzMesh()
+        fritz.set_network(self.IP, self.A, True, True, "wlan0")
+        fritz.model_for = (self.IP, self.A)
+        seen = []
+
+        def fake_soap(ip, user, password, pin, service, control, action, still_ok=None, iface=None):
+            os.unlink(path)
+            seen.append(still_ok())
+            raise wlan_monitor.FritzError("fzNetworkChanged", "x")
+        with mock.patch.object(wlan_monitor, "fritz_soap", side_effect=fake_soap):
+            fritz.step()
+        self.assertEqual(seen, [False])
+        fritz.step()
+        self.assertIsNone(fritz.creds)
+
+    def test_ptr_and_web_checks_stay_on_the_interface(self):
+        with mock.patch.object(wlan_monitor, "connect_bound", side_effect=OSError("cannot bind")) as bound, \
+                mock.patch.object(wlan_monitor.socket, "create_connection",
+                                  side_effect=AssertionError("must not use plain routing")):
+            self.assertFalse(wlan_monitor.tcp_open("192.168.178.5", 80, iface="wlan0"))
+            self.assertEqual(wlan_monitor.probe_web("192.168.178.5", iface="wlan0"), "")
+            self.assertFalse(wlan_monitor.url_reachable("http://192.168.178.5/", iface="wlan0"))
+            self.assertFalse(wlan_monitor.tcp_open("printer.local", 80, iface="wlan0"))  # never resolved
+        self.assertEqual(bound.call_args[0][3], "wlan0")
+        with mock.patch.object(wlan_monitor, "bind_to", return_value=False), \
+                mock.patch.object(wlan_monitor.socket.socket, "connect",
+                                  side_effect=AssertionError("must not send unbound")):
+            self.assertEqual(wlan_monitor.lookup_ptr("192.168.178.5", ("192.168.178.1",), iface="wlan0"), [])
 
     def test_a_login_file_that_cannot_be_deleted_is_emptied(self):
         wlan_monitor.save_private_json(wlan_monitor.FRITZ_FILE, {"gateway_mac": self.A, "user": "u",
