@@ -1341,3 +1341,81 @@ class MalformedReplyTests(unittest.TestCase):
         with mock.patch.object(second, "refresh", side_effect=wlan_monitor.FritzError("fzNoMesh", "x")):
             second.step()
         self.assertEqual(second.snapshot()[0]["user"], "v")
+
+
+class StaleNetworkTests(unittest.TestCase):
+    """What was learned about one network never carries over to the next one."""
+    A = "1c:23:a2:92:2a:6c"
+    B = "66:66:66:66:66:66"
+    IP = "192.168.178.1"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.env = mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": self.tmp.name})
+        self.env.start()
+
+    def tearDown(self):
+        self.env.stop()
+        self.tmp.cleanup()
+
+    def test_a_previous_fritzbox_model_does_not_offer_login_elsewhere(self):
+        fritz = wlan_monitor.FritzMesh()
+        fritz.set_network(self.IP, self.A, True, True, "wlan0")
+        fritz.model, fritz.model_for = "FRITZ!Box 7590", (self.IP, self.A)
+        self.assertTrue(fritz.snapshot()[0]["available"])
+        fritz.set_network(self.IP, self.B, False, True, "wlan0")       # another, non-FRITZ router
+        self.assertFalse(fritz.snapshot()[0]["available"])
+        fritz.login("u", "p", fritz.net_id)
+        self.assertIsNone(fritz.pending_login)
+        # A model probe that finishes after the network changed is not kept for the new one.
+        fritz.set_network(self.IP, self.A, True, True, "wlan0")
+        fritz.model, fritz.model_for = "", None   # not probed yet on this gateway
+        def probe(ip, iface=None):
+            fritz.set_network(self.IP, self.B, False, True, "wlan0")
+            return "FRITZ!Box 7590"
+        with mock.patch.object(wlan_monitor, "fritz_model", side_effect=probe), \
+                mock.patch.object(wlan_monitor, "bounded_http", side_effect=AssertionError("must not connect")):
+            fritz.step()
+        self.assertFalse(fritz.snapshot()[0]["available"])
+        self.assertNotEqual(fritz.model_for, (self.IP, self.B))
+
+    def run_snapshots(self, steps):
+        net = {"iface": "wlan0", "ip": "192.168.178.20", "gateway": self.IP, "prefix": 24,
+               "cidr": "192.168.178.20/24", "mac": "02:00:00:00:00:01", "is_wireless": True}
+        state = {"net": net, "neighbors": {self.IP: {"mac": self.A, "state": "REACHABLE"}}}
+        with mock.patch.object(wlan_monitor, "detect_interface", side_effect=lambda cache: state["net"]), \
+                mock.patch.object(wlan_monitor, "read_neighbors", side_effect=lambda iface: dict(state["neighbors"])), \
+                mock.patch.object(wlan_monitor.Monitor, "wireless", return_value={"ssid": "Home", "bssid": self.A}), \
+                mock.patch.object(wlan_monitor, "detect_vpn", return_value=None), \
+                mock.patch.object(wlan_monitor, "read_traffic", return_value=(0, 0)), \
+                mock.patch.object(wlan_monitor, "lookup_ptr", return_value=[]), \
+                mock.patch.object(wlan_monitor, "sweep", return_value=({}, set())) as sweep, \
+                mock.patch.object(wlan_monitor, "run_cmd", return_value=""):
+            monitor = wlan_monitor.Monitor()
+            steps(monitor, state, sweep)
+
+    def test_trust_needs_the_router_seen_now(self):
+        def steps(monitor, state, sweep):
+            monitor.snapshot()
+            monitor.handle("trust")
+            self.assertTrue(monitor.snapshot()["link"]["trusted"])
+            # Same address and subnet, the router not in the neighbour table yet: no inherited trust.
+            state["neighbors"] = {}
+            monitor.last_full_scan = -math.inf
+            sweep.reset_mock()
+            snap = monitor.snapshot()
+            self.assertFalse(snap["link"]["trusted"])
+            sweep.assert_not_called()
+        self.run_snapshots(steps)
+
+    def test_disconnect_forgets_the_network(self):
+        def steps(monitor, state, sweep):
+            first = monitor.snapshot()["link"]["net_id"]
+            state["net"] = None
+            self.assertIsNone(monitor.snapshot()["link"])
+            self.assertIsNone(monitor.identity)
+            self.assertIsNone(monitor.fritz.network[0])
+            state["net"] = dict(state.get("last") or {}, **{"iface": "wlan0", "ip": "192.168.178.20", "gateway": self.IP,
+                                "prefix": 24, "cidr": "192.168.178.20/24", "mac": "02:00:00:00:00:01", "is_wireless": True})
+            self.assertNotEqual(monitor.snapshot()["link"]["net_id"], first)
+        self.run_snapshots(steps)

@@ -1888,7 +1888,8 @@ class FritzMesh:
         address and MAC, dropped when the network changes, and sent nowhere else (step)."""
         with self.lock:
             ip, mac, _is_fritz = self.network
-            if not ip or not mac or not net_id or net_id != f"{self.nonce}-{self.net_seq}":
+            if (not ip or not mac or not net_id or net_id != f"{self.nonce}-{self.net_seq}"
+                    or not self.looks_like_fritz()):
                 self.pending_login = None
                 self.state, self.message = "error", "The network changed before the login was sent."
                 self.message_code, self.message_args = "fzNetworkChanged", []
@@ -1907,12 +1908,18 @@ class FritzMesh:
             self.state, self.message = "off", ""
         remove_fritz()
 
+    def looks_like_fritz(self):
+        """The current gateway is a FRITZ!Box (its maker, or a model probed on this very gateway).
+        Called with the lock held."""
+        ip, mac, is_fritz = self.network
+        return bool(ip and mac and (is_fritz or (self.model and self.model_for == (ip, mac))))
+
     def snapshot(self):
         with self.lock:
             ip, mac, is_fritz = self.network
             bound = bool(self.creds and self.creds["gateway_mac"] == mac)
             return {
-                "available": bool(is_fritz or self.model),
+                "available": self.looks_like_fritz(),
                 "model": self.model if self.model_for == (ip, mac) else "",
                 "state": self.state if (bound or self.state in ("connecting", "error")) else "off",
                 "message": self.message,
@@ -1968,7 +1975,8 @@ class FritzMesh:
         if is_fritz and self.model_for != (ip, mac):
             model = fritz_model(ip, iface)
             with self.lock:
-                self.model, self.model_for = model, (ip, mac)
+                if self.generation == generation:  # probed while the network changed: kept for nobody
+                    self.model, self.model_for = model, (ip, mac)
         if pending and pending[2:] != (ip, mac, generation):
             # Queued for another gateway (the network changed in between): never sent here.
             with self.lock:
@@ -2259,6 +2267,11 @@ class Monitor:
 
         net = detect_interface(self.iface_cache)
         if not net:
+            # Disconnected: forget the network (and its FRITZ!Box) so nothing of it carries over.
+            if self.identity is not None:
+                self.reset_network(None)
+                self.trust_identity = {"ssid": "", "gateway_mac": ""}
+            self.fritz.set_network(None, "", False, self.panel_open, "")
             return {
                 "time": int(time.time()),
                 "active": False,
@@ -2296,7 +2309,10 @@ class Monitor:
             "ssid": self.identity["ssid"] if net["is_wireless"] else "",
             "gateway_mac": self.identity["gateway_mac"],
         }
-        trusted = is_trusted(self.trust_identity, self.trusted)
+        # Trust needs the router seen now (and the SSID on Wi-Fi), not values kept from before:
+        # an unknown gateway on the same address and subnet never inherits a trusted network.
+        evidence = bool(identity["gateway_mac"]) and (bool(identity["ssid"]) or not net["is_wireless"])
+        trusted = evidence and is_trusted(self.trust_identity, self.trusted)
 
         # A VPN that blocks the home network makes every device look idle: say so instead.
         vpn = detect_vpn(iface)

@@ -42,7 +42,7 @@ While a VPN is active (NordVPN, WireGuard, Proton VPN, Mullvad, Tailscale, OpenV
 
 Discovery is **passive** on every network by default: the kernel neighbor table, mDNS announcements and single reverse-DNS lookups for devices that are already visible. Nothing sweeps the subnet automatically, so the widget behaves well on hotel, café and office Wi-Fi. The only connections it makes there on its own are single TCP connect checks of the router's web interface (ports 80 and 443) and of web interfaces that devices advertise over mDNS (before a link to them is offered), the router check while a VPN is up (see above) and the unauthenticated FRITZ!Box description. **Rescan** runs one full sweep on any network when you ask for it.
 
-Click **Trust** in the panel to allow **active** scanning on the current network (identified by SSID and router MAC address):
+Click **Trust** in the panel to allow **active** scanning on the current network (identified by SSID and router MAC address, both seen at that moment: while the router is not in the neighbour table, or after a disconnect, nothing is inherited from before):
 
 - a full sweep every 2 minutes (and when you open the panel, if the last one is older than 30 s): paced ICMP echo to the local `/24` plus a reverse-DNS (PTR) query per address to the router, which also finds sleeping DHCP leases;
 - every 15 s a unicast probe of the devices already known, so the online state stays accurate without broadcast ARP traffic.
