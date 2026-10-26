@@ -594,11 +594,25 @@ def select_best_hostname(raw_names, domains=DEFAULT_DOMAINS):
     return clean(best or fallback, 64)
 
 
-def sweep(targets, dns_server=None, settle=0.22):
+def bind_to(sock, iface):
+    """Keep `sock` on the interface `iface` (SO_BINDTODEVICE); False (and nothing sent) if not."""
+    if iface is None:
+        return True
+    try:
+        if not isinstance(iface, str) or not IFACE_RE.match(iface):
+            return False
+        sock.setsockopt(socket.SOL_SOCKET, SO_BINDTODEVICE, iface.encode())
+        return True
+    except OSError:
+        return False
+
+
+def sweep(targets, dns_server=None, settle=0.22, iface=None):
     """Paced ICMP echo probe of `targets`, plus a PTR query per target to `dns_server` if given.
 
     Returns ({ip: [fqdn, ...]}, {responding ips}). DNS replies are only accepted from
-    `dns_server`:53 with a random, still outstanding query ID.
+    `dns_server`:53 with a random, still outstanding query ID. With `iface`, every probe leaves
+    only through that interface (a socket that cannot be bound to it sends nothing).
     """
     targets = list(dict.fromkeys(targets))
     if not targets:
@@ -621,6 +635,9 @@ def sweep(targets, dns_server=None, settle=0.22):
             icmp_port = 33434
         except OSError:
             icmp_sock = None
+    if icmp_sock and not bind_to(icmp_sock, iface):
+        icmp_sock.close()
+        icmp_sock = None
     if icmp_sock:
         icmp_sock.setblocking(False)
 
@@ -629,6 +646,8 @@ def sweep(targets, dns_server=None, settle=0.22):
     if dns_server:
         try:
             dns_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            if not bind_to(dns_sock, iface):
+                raise OSError("not bound to the interface")
             dns_sock.setblocking(False)
             dns_sock.connect((dns_server, 53))  # kernel drops datagrams from any other source
             qids = random.SystemRandom().sample(range(1, 65536), len(targets))
@@ -1979,8 +1998,9 @@ def remove_fritz():
         try:
             fd = os.open(FRITZ_FILE, os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dfd)
             try:
-                if stat.S_ISREG(os.fstat(fd).st_mode):
-                    os.ftruncate(fd, 0)
+                info = os.fstat(fd)
+                if stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and info.st_nlink == 1:
+                    os.ftruncate(fd, 0)  # never a file hard-linked elsewhere
                     os.fsync(fd)
                     return True
             finally:
@@ -3079,14 +3099,14 @@ class Monitor:
         responders = set()
         if do_full:
             targets = subnet_hosts(local_ip, net["prefix"]) + list(self.mdns_hosts.keys())
-            ptr_names, responders = sweep(targets, dns_server=gateway_ip)
+            ptr_names, responders = sweep(targets, dns_server=gateway_ip, iface=iface)
             if ptr_names:
                 self.ptr_names = ptr_names
                 self.domain = learn_domain([n for names in ptr_names.values() for n in names]) or self.domain
             self.last_full_scan = self.last_known_scan = now
         elif do_known:
             targets = [ip for ip, dev in self.known.items() if dev.get("mac") and not dev.get("is_self")]
-            _, responders = sweep(targets)
+            _, responders = sweep(targets, iface=iface)
             self.last_known_scan = now
         if do_full or do_known:
             neighbors = read_neighbors(iface)

@@ -362,6 +362,45 @@ class SweepBudgetTests(unittest.TestCase):
         self.assertTrue(responders)
         self.assertTrue(responders <= set(targets))
 
+    def test_sweep_probes_leave_only_through_the_monitored_interface(self):
+        made = []
+
+        class Probe:
+            def __init__(self, *args):
+                self.opts, self.sent = [], []
+                made.append(self)
+
+            def setsockopt(self, level, opt, value):
+                if value == b"eth9":
+                    raise OSError("no such device")
+                self.opts.append((opt, value))
+
+            def setblocking(self, flag):
+                pass
+
+            def connect(self, addr):
+                pass
+
+            def sendto(self, data, addr):
+                self.sent.append(addr)
+
+            def send(self, data):
+                self.sent.append(data)
+
+            def recvfrom(self, size):
+                raise BlockingIOError()
+
+            def close(self):
+                pass
+        with mock.patch.object(wlan_monitor.socket, "socket", Probe), \
+                mock.patch.object(wlan_monitor.time, "sleep", lambda s: None):
+            wlan_monitor.sweep(["192.168.178.5"], dns_server="192.168.178.1", settle=0.01, iface="wlan0")
+            self.assertTrue(made and all(p.opts == [(wlan_monitor.SO_BINDTODEVICE, b"wlan0")] for p in made))
+            self.assertTrue(all(p.sent for p in made))
+            made.clear()
+            wlan_monitor.sweep(["192.168.178.5"], dns_server="192.168.178.1", settle=0.01, iface="eth9")
+            self.assertTrue(made and not any(p.sent for p in made))  # not bound: nothing sent
+
     def test_sweep_deadline_stops_slow_flood(self):
         targets = ["192.168.178.%d" % i for i in range(1, 255)]
         clock = {"t": 0.0}

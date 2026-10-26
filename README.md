@@ -47,6 +47,8 @@ Click **Trust** in the panel to allow **active** scanning on the current network
 - a full sweep every 2 minutes (and when you open the panel, if the last one is older than 30 s): paced ICMP echo to the local `/24` plus a reverse-DNS (PTR) query per address to the router, which also finds sleeping DHCP leases;
 - every 15 s a unicast probe of the devices already known, so the online state stays accurate without broadcast ARP traffic.
 
+Every probe and PTR query leaves only through the monitored interface (`SO_BINDTODEVICE`; a socket that cannot be bound sends nothing), so another interface on the same subnet is never scanned.
+
 **Rescan** (or right click) runs one active sweep on demand, on any network. Trusted networks are stored in `~/.config/ubruckhaus-wlan-monitor/trusted-networks.json` (directory `0700`, file `0600`), written only when you click Trust or Untrust; every screen's collector reads the list again before it scans, so Untrust on one screen stops active scanning on all of them (the list is changed only under a shared lock; an Untrust that cannot be saved at once applies on its own screen right away and is saved as soon as the lock is free).
 
 ### FRITZ!Box login
