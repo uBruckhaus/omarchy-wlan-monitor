@@ -2014,6 +2014,20 @@ class FritzMesh:
                 self.state, self.message = "connected", ""
                 self.message_code, self.message_args = "", []
             return interval
+        # Every screen runs its own collector and they share the saved login: one deleted or
+        # replaced by another collector (Disconnect there, or a new login) is followed here
+        # before anything is sent.
+        disk = load_fritz()
+        if disk != creds:
+            with self.lock:
+                if self.generation != generation:
+                    return 5.0
+                self.creds, creds = disk, disk
+                self.generation += 1
+                generation = self.generation
+                self.clients, self.aps, self.updated = {}, [], 0.0
+                self.state, self.message = "off", ""
+                age = time.time() - self.updated
         if not creds or creds["gateway_mac"] != mac:
             return 5.0
         due = interval if state != "error" else FRITZ_RETRY_ERROR

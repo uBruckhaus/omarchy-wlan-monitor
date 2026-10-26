@@ -1320,3 +1320,24 @@ class MalformedReplyTests(unittest.TestCase):
             fritz.step()
         info = fritz.snapshot()[0]
         self.assertEqual((info["state"], info["message_code"]), ("error", "fzCert"))
+
+    def test_disconnect_in_another_collector_stops_this_one(self):
+        """One collector per screen: Disconnect on one screen deletes the shared login, and the
+        other collectors stop using it (and pick up a login saved by another one)."""
+        A, ip = "1c:23:a2:92:2a:6c", "192.168.178.1"
+        wlan_monitor.save_private_json(wlan_monitor.FRITZ_FILE, {"gateway_mac": A, "user": "u", "password": "p",
+                                                                 "pin": "c" * 64})
+        first, second = wlan_monitor.FritzMesh(), wlan_monitor.FritzMesh()
+        for fritz in (first, second):
+            fritz.set_network(ip, A, True, True, "wlan0")
+            fritz.model_for = (ip, A)
+        first.logout()
+        with mock.patch.object(wlan_monitor, "bounded_http", side_effect=AssertionError("must not connect")):
+            second.step()
+        self.assertIsNone(second.creds)
+        self.assertEqual(second.snapshot()[0]["user"], "")
+        wlan_monitor.save_private_json(wlan_monitor.FRITZ_FILE, {"gateway_mac": A, "user": "v", "password": "q",
+                                                                 "pin": "c" * 64})
+        with mock.patch.object(second, "refresh", side_effect=wlan_monitor.FritzError("fzNoMesh", "x")):
+            second.step()
+        self.assertEqual(second.snapshot()[0]["user"], "v")
