@@ -1033,6 +1033,142 @@ class FritzTests(unittest.TestCase):
         self.assertEqual([auth for _m, auth in calls], [""])
         self.assertEqual(fritz.snapshot()[1], {})
 
+    def raw_login(self):
+        return wlan_monitor.load_private_json(wlan_monitor.FRITZ_FILE, 4096, secret=True)
+
+    def removal_fails(self):
+        """Deleting, emptying and replacing the saved login all fail (read-only settings folder)."""
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(wlan_monitor.os, "unlink", side_effect=PermissionError("read-only")))
+        stack.enter_context(mock.patch.object(wlan_monitor.os, "ftruncate", side_effect=PermissionError("read-only")))
+        stack.enter_context(mock.patch.object(wlan_monitor, "save_private_json", return_value=False))
+        return stack
+
+    def test_a_disconnect_whose_file_stays_readable_never_uses_the_login(self):
+        A, ip = "1c:23:a2:92:2a:6c", "192.168.178.1"
+        wlan_monitor.save_private_json(wlan_monitor.FRITZ_FILE, {"gateway_mac": A, "user": "u", "password": "p",
+                                                                 "pin": "c" * 64})
+        fritz = wlan_monitor.FritzMesh()
+        fritz.set_network(ip, A, True, True, "wlan0")
+        fritz.model_for = (ip, A)
+        with self.removal_fails():
+            fritz.logout()
+            self.assertTrue(fritz.remove_pending)
+            self.assertIsNotNone(self.raw_login())  # still readable on disk
+            self.assertIsNone(wlan_monitor.load_fritz())
+            with mock.patch.object(wlan_monitor, "bounded_http", side_effect=AssertionError("must not connect")), \
+                    mock.patch.object(wlan_monitor, "fritz_soap", side_effect=AssertionError("must not log in")):
+                for _ in range(3):
+                    self.assertEqual(fritz.step(), 5.0)
+                # Another screen's collector takes over (or this one restarts): it never loads it.
+                other = wlan_monitor.FritzMesh()
+                other.set_network(ip, A, True, True, "wlan0")
+                other.model_for = (ip, A)
+                self.assertIsNone(other.creds)
+                self.assertTrue(other.remove_pending)
+                self.assertEqual(other.step(), 5.0)
+                self.assertEqual(other.snapshot()[0]["message_code"], "fzNotDeleted")
+        self.assertIsNone(fritz.creds)
+        info, clients = fritz.snapshot()
+        self.assertEqual((info["message_code"], info["user"], clients), ("fzNotDeleted", "", {}))
+        # Deleting works again: the file goes, and only a new login connects.
+        with mock.patch.object(wlan_monitor, "bounded_http", side_effect=AssertionError("must not connect")):
+            fritz.step()
+        self.assertFalse(fritz.remove_pending)
+        self.assertFalse(wlan_monitor.fritz_revoked())
+        self.assertIsNone(wlan_monitor.load_fritz())
+        fritz.login("fritz1234", "new pass", fritz.net_id)
+        calls = []
+        with mock.patch.object(wlan_monitor, "bounded_http", side_effect=self.challenge_http(calls)):
+            fritz.step()
+        self.assertEqual(fritz.snapshot()[0]["state"], "connected")
+        self.assertIn('username="fritz1234"', calls[1][1])
+
+    def test_a_new_login_lifts_a_revocation_that_outlived_its_collector(self):
+        A, ip = "1c:23:a2:92:2a:6c", "192.168.178.1"
+        wlan_monitor.save_private_json(wlan_monitor.FRITZ_FILE, {"gateway_mac": A, "user": "u", "password": "p",
+                                                                 "pin": "c" * 64})
+        with self.removal_fails():
+            wlan_monitor.FritzMesh().logout()
+        self.assertTrue(wlan_monitor.fritz_revoked())
+        fritz = wlan_monitor.FritzMesh()
+        fritz.set_network(ip, A, True, True, "wlan0")
+        fritz.model_for = (ip, A)
+        fritz.login("fritz1234", "new pass", fritz.net_id)
+        calls = []
+        with mock.patch.object(wlan_monitor.os, "unlink", side_effect=PermissionError("read-only")), \
+                mock.patch.object(wlan_monitor.os, "ftruncate", side_effect=PermissionError("read-only")), \
+                mock.patch.object(wlan_monitor, "bounded_http", side_effect=self.challenge_http(calls)):
+            fritz.step()  # the old file stays and the marker cannot be cleared: the new login is not kept
+        self.assertEqual(fritz.snapshot()[0]["message_code"], "fzNotStored")
+        self.assertIsNone(fritz.creds)
+        fritz.login("fritz1234", "new pass", fritz.net_id)
+        with mock.patch.object(wlan_monitor, "bounded_http", side_effect=self.challenge_http(calls)):
+            fritz.step()
+        self.assertEqual(fritz.snapshot()[0]["state"], "connected")
+        self.assertFalse(wlan_monitor.fritz_revoked())
+        self.assertEqual(wlan_monitor.load_fritz()["password"], "new pass")
+        self.assertIsNotNone(wlan_monitor.FritzMesh().creds)
+
+    def test_no_saved_login_without_a_private_runtime_directory(self):
+        """A Disconnect could not be recorded there, so the saved login is not used at all."""
+        A, ip = "1c:23:a2:92:2a:6c", "192.168.178.1"
+        wlan_monitor.save_private_json(wlan_monitor.FRITZ_FILE, {"gateway_mac": A, "user": "u", "password": "p",
+                                                                 "pin": "c" * 64})
+        with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": ""}):
+            fritz = wlan_monitor.FritzMesh()
+            fritz.set_network(ip, A, True, True, "wlan0")
+            fritz.model_for = (ip, A)
+            self.assertIsNone(fritz.creds)
+            self.assertFalse(fritz.remove_pending)  # nothing to retry
+            fritz.login("fritz1234", "pass", fritz.net_id)
+            self.assertEqual(fritz.snapshot()[0]["message_code"], "fzNotStored")
+            with mock.patch.object(wlan_monitor, "bounded_http", side_effect=AssertionError("must not connect")):
+                self.assertEqual(fritz.step(), 5.0)
+        self.assertIsNotNone(wlan_monitor.FritzMesh().creds)  # with one again it is used
+
+    def test_a_disconnect_during_a_saved_login_refresh_stops_it(self):
+        """Disconnect (with the file still readable) while a refresh with the saved login is in
+        flight: before the Digest response, or after it before the mesh list is fetched."""
+        A, ip = "1c:23:a2:92:2a:6c", "192.168.178.1"
+        mesh = __import__("json").dumps(self.MESH).encode()
+        for when in ("challenge", "response"):
+            wlan_monitor.save_private_json(wlan_monitor.FRITZ_FILE, {"gateway_mac": A, "user": "u", "password": "p",
+                                                                     "pin": "c" * 64})
+            fritz = wlan_monitor.FritzMesh()
+            fritz.set_network(ip, A, True, True, "wlan0")
+            fritz.model_for = (ip, A)
+            calls = []
+
+            def fake_http(ip_, port, method, path, body=None, headers=None, tls=False, pin=None, **kw):
+                auth = (headers or {}).get("Authorization", "")
+                calls.append((method, auth))
+                if method == "POST" and not auth:
+                    if when == "challenge":
+                        fritz.logout()
+                    return 401, {"www-authenticate": 'Digest realm="F!Box SOAP-Auth", nonce="N1", qop="auth"'}, b"", "c" * 64
+                if method == "POST":
+                    if when == "response":
+                        fritz.logout()
+                    return 200, {}, (b"<s:Envelope><NewX_AVM-DE_MeshListPath>/meshlist.lua?sid=0123456789abcdef"
+                                     b"</NewX_AVM-DE_MeshListPath></s:Envelope>"), "c" * 64
+                return 200, {}, mesh, "c" * 64
+            with self.removal_fails(), mock.patch.object(wlan_monitor, "bounded_http", side_effect=fake_http):
+                fritz.step()
+                self.assertTrue(fritz.remove_pending, when)
+                self.assertIsNotNone(self.raw_login())
+                expected = [""] if when == "challenge" else ["", calls[1][1]]
+                self.assertEqual([auth for _m, auth in calls], expected, when)
+                self.assertNotIn("GET", [m for m, _a in calls], when)
+                self.assertEqual(fritz.snapshot()[1], {}, when)
+                with mock.patch.object(wlan_monitor, "fritz_soap", side_effect=AssertionError("must not log in")):
+                    self.assertEqual(fritz.step(), 5.0)
+            self.assertIsNone(fritz.creds)
+            with mock.patch.object(wlan_monitor, "bounded_http", side_effect=AssertionError("must not connect")):
+                fritz.step()  # deleting works again: file and marker go
+            self.assertFalse(wlan_monitor.fritz_revoked())
+            self.assertIsNone(self.raw_login())
+
     def test_wrong_password_and_changed_certificate(self):
         def unauthorized(ip, port, method, path, body=None, headers=None, tls=False, pin=None, **kw):
             return 401, {"www-authenticate": 'Digest realm="r", nonce="n", qop="auth"'}, b"", "c" * 64

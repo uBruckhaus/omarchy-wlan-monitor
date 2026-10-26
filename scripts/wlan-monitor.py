@@ -1985,7 +1985,10 @@ def parse_mesh(data):
 
 
 def load_fritz():
-    """The saved login (read only by the FRITZ!Box collector, the leader)."""
+    """The saved login (read only by the FRITZ!Box collector, the leader); none after a Disconnect
+    whose file could not be removed (fritz_revoked)."""
+    if fritz_revoked():
+        return None
     data = load_private_json(FRITZ_FILE, 4096, secret=True)
     if not isinstance(data, dict):
         return None
@@ -1995,6 +1998,52 @@ def load_fritz():
             and isinstance(pin, str) and re.fullmatch(r"[0-9a-f]{64}", pin)):
         return None
     return {"gateway_mac": mac.lower(), "user": user, "password": password, "pin": pin}
+
+
+def revoked_marker_path():
+    """Marker that a Disconnect could not remove the saved login (it stays readable): kept in the
+    private runtime directory, named after the config directory, so a collector that takes over
+    later (another screen, a restart) never loads that login either. None without one."""
+    directory = runtime_dir()
+    return os.path.join(directory, f"fritzbox-{config_tag()}.revoked") if directory else None
+
+
+def fritz_revoked():
+    """True after such a Disconnect, and also without a private runtime directory: a revocation
+    could not be recorded there, so the saved login is never used then (fail closed)."""
+    path = revoked_marker_path()
+    if not path:
+        return True
+    try:
+        return os.lstat(path).st_uid == os.getuid()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True  # unreadable: fail closed
+
+
+def fritz_marker_set():
+    """The marker itself is there (a Disconnect, here or in an earlier collector, is unfinished)."""
+    path = revoked_marker_path()
+    return bool(path) and fritz_revoked()
+
+
+def mark_fritz_revoked(revoked):
+    """Set (True) or clear (False) the marker; True when it now says so."""
+    path = revoked_marker_path()
+    if not path:
+        return not revoked  # nothing to clear; fritz_revoked() stays True without one
+    try:
+        if revoked:
+            os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o600))
+        else:
+            os.lstat(path)  # none set (the usual case): nothing to remove
+            os.unlink(path)
+        return True
+    except FileNotFoundError:
+        return not revoked
+    except OSError:
+        return False
 
 
 def remove_fritz():
@@ -2104,7 +2153,9 @@ class FritzMesh:
         self.aps = []
         self.updated = 0.0
         self.pending_login = None
-        self.remove_pending = False  # a Disconnect whose file could not be deleted yet: retried
+        # A Disconnect whose file could not be deleted yet (here or by a collector before this
+        # one, see fritz_revoked): retried, and the login is never used meanwhile.
+        self.remove_pending = fritz_marker_set()
         self.attempts = 0  # +1 on every login and Disconnect: a login in flight then ends quietly
         self.generation = 0  # +1 on every gateway change or logout; work begun before it is dropped
         self.nonce = secrets.token_hex(6)
@@ -2159,6 +2210,13 @@ class FritzMesh:
                 self.state, self.message = "error", "The network changed before the login was sent."
                 self.message_code, self.message_args = "fzNetworkChanged", []
                 return
+            if not revoked_marker_path():
+                # Without a private runtime directory a later Disconnect could not be recorded if
+                # the file cannot be deleted, so no login is saved or used at all (fritz_revoked).
+                self.pending_login = None
+                self.state, self.message = "error", "The login could not be stored in the settings folder."
+                self.message_code, self.message_args = "fzNotStored", []
+                return
             self.generation += 1  # a login still in flight (typed on another screen) is superseded
             self.attempts += 1
             self.pending_login = (user, password, ip, mac, self.generation)
@@ -2186,6 +2244,10 @@ class FritzMesh:
             if not self.remove_pending:
                 return  # a new login saved meanwhile replaced the file
             gone = remove_fritz()
+            if not gone:
+                mark_fritz_revoked(True)
+            elif not mark_fritz_revoked(False):
+                gone = False  # the marker stays: keep retrying so it is cleared once the file is gone
             self.remove_pending = not gone
             if not gone:
                 self.state = "error"
@@ -2221,6 +2283,15 @@ class FritzMesh:
         """True while the gateway is still the one the work began with (no change, no logout)."""
         with self.lock:
             return self.network[:2] == (ip, mac) and self.generation == generation
+
+    def saved_usable(self, ip, mac, generation, creds):
+        """The saved login may still be sent: unchanged on disk, same gateway and generation, and
+        no Disconnect whose file could not be removed (only a new login lifts that)."""
+        if load_fritz() != creds:
+            return False
+        with self.lock:
+            return (not self.remove_pending and self.network[:2] == (ip, mac)
+                    and self.generation == generation)
 
     def refresh(self, ip, creds, still_ok=None, iface=None):
         text, _ = fritz_soap(ip, creds["user"], creds["password"], creds["pin"],
@@ -2321,18 +2392,28 @@ class FritzMesh:
                     self.state, self.message = "error", "The login could not be stored in the settings folder."
                     self.message_code, self.message_args = "fzNotStored", []
                     return 5.0
+                if not mark_fritz_revoked(False):
+                    # The old revocation could not be lifted: this login would not be loaded again.
+                    self.state, self.message = "error", "The login could not be stored in the settings folder."
+                    self.message_code, self.message_args = "fzNotStored", []
+                    return 5.0
                 self.remove_pending = False
                 self.creds = creds
                 self.clients, self.aps, self.updated = clients, aps, time.time()
                 self.state, self.message = "connected", ""
                 self.message_code, self.message_args = "", []
             return interval
+        with self.lock:
+            if self.remove_pending:
+                # Disconnected but the file is still readable: it is never loaded or used again
+                # until a new login is saved (deleting it is retried on every step).
+                return 5.0
         # The saved login is read again before each refresh: deleted or replaced from outside (by
         # hand, or by an older collector on this account) it is followed at once.
         disk = load_fritz()
         if disk != creds:
             with self.lock:
-                if self.generation != generation:
+                if self.generation != generation or self.remove_pending:
                     return 5.0
                 self.creds, creds = disk, disk
                 self.generation += 1
@@ -2349,19 +2430,18 @@ class FritzMesh:
         try:
             # Saved credentials go only to the pinned certificate; a gateway change or Disconnect
             # in between stops each request before it is sent.
-            clients, aps = self.refresh(ip, creds, lambda: load_fritz() == creds and self.current(ip, mac, generation),
-                                        iface)
+            clients, aps = self.refresh(ip, creds, lambda: self.saved_usable(ip, mac, generation, creds), iface)
         except FritzError as exc:
             if load_fritz() != creds:
                 return 5.0  # removed meanwhile: followed on the next step
             with self.lock:
-                if self.generation == generation:
+                if self.generation == generation and not self.remove_pending:
                     self.state, self.message, self.updated = "error", str(exc), time.time()
                     self.message_code, self.message_args = exc.code, exc.args_
             return 5.0
         with self.lock:
-            if self.generation != generation:
-                return 5.0  # the old gateway's mesh list is never shown for the new one
+            if self.generation != generation or self.remove_pending:
+                return 5.0  # the old gateway's mesh list (or one read after a Disconnect) is never shown
             self.clients, self.aps, self.updated = clients, aps, time.time()
             self.state, self.message = "connected", ""
             self.message_code, self.message_args = "", []
@@ -2434,8 +2514,11 @@ def request_socket_path():
     directory = runtime_dir()
     if not directory:
         return None
-    tag = hashlib.sha256(os.path.abspath(config_dir()).encode("utf-8", "replace")).hexdigest()[:16]
-    return os.path.join(directory, f"fritzbox-{tag}.sock")
+    return os.path.join(directory, f"fritzbox-{config_tag()}.sock")
+
+
+def config_tag():
+    return hashlib.sha256(os.path.abspath(config_dir()).encode("utf-8", "replace")).hexdigest()[:16]
 
 
 def peer_uid(sock):
