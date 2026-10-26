@@ -127,6 +127,8 @@ TRUST_FILE = "trusted-networks.json"
 TRUST_LOCK_FILE = "trusted-networks.lock"
 MAX_TRUSTED = 64
 DEVICES_FILE = "devices.json"
+DEVICES_LOCK_FILE = "devices.lock"
+MAX_STORE_TIME = 2 ** 33  # seconds since 1970 (year 2242): any later, negative or odd time is dropped
 MAX_STORE_BYTES = 8 * 1024 * 1024  # holds the largest valid store (32 x 512 records, 40-char names)
 MAX_STORE_NETWORKS = 32
 MAX_STORE_DEVICES = 512  # per network
@@ -1287,6 +1289,26 @@ def network_key(identity):
     return f"{mac}|{identity.get('ssid', '')}" if mac else ""
 
 
+def store_time(value):
+    """A saved time: a finite number of seconds within 0..MAX_STORE_TIME, else None."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, int) and not 0 <= value <= MAX_STORE_TIME:
+        return None  # checked before any float conversion: a 400-digit integer never overflows
+    if isinstance(value, float) and not (math.isfinite(value) and 0 <= value <= MAX_STORE_TIME):
+        return None
+    return value
+
+
+def store_stamp():
+    """What identifies the current devices.json (inode, size, mtime); None when there is none."""
+    try:
+        info = os.lstat(os.path.join(config_dir(), DEVICES_FILE))
+    except OSError:
+        return None
+    return (info.st_ino, info.st_size, info.st_mtime_ns)
+
+
 def load_store():
     """Read devices.json, keeping only well-formed networks and device records (bounded)."""
     data = load_private_json(DEVICES_FILE, MAX_STORE_BYTES)
@@ -1308,19 +1330,17 @@ def load_store():
         mac, ssid = key.split("|", 1)
         if not MAC_RE.match(mac) or ssid != clean(ssid, 64):
             continue
-        since = net.get("since")
-        entry = {"since": since if isinstance(since, (int, float)) and not isinstance(since, bool) else None, "devices": {}}
+        entry = {"since": store_time(net.get("since")), "devices": {}}
         devices = net.get("devices")
         for dev_mac, rec in list(devices.items() if isinstance(devices, dict) else [])[:MAX_STORE_DEVICES]:
             if not isinstance(dev_mac, str) or not MAC_RE.match(dev_mac) or not isinstance(rec, dict):
                 continue
-            first = rec.get("first")
             entry["devices"][dev_mac.lower()] = {
                 "name": clean_name(rec.get("name", "")),
                 "pinned": rec.get("pinned") is True,
                 "hidden": rec.get("hidden") is True,
                 "new": rec.get("new") is True,
-                "first": first if isinstance(first, (int, float)) and not isinstance(first, bool) else 0,
+                "first": store_time(rec.get("first")) or 0,
             }
         store["networks"][mac.lower() + "|" + ssid] = entry
     return store
@@ -1946,8 +1966,8 @@ def fritz_revoke():
     revision is written; the deletion is only tidying up."""
     if fritz_new_revision() is None:
         return False
-    with fritz_file_lock():
-        if load_fritz() is None:
+    with fritz_file_lock() as held:
+        if held and load_fritz() is None:  # tidied only under the lock: a newer login is never hit
             remove_fritz()
     return True
 
@@ -2025,10 +2045,24 @@ class FritzMesh:
         # The revision of the saved login now: if any collector disconnects before this login is
         # saved, the revision changes and the login is dropped (step). An unreadable one is renewed.
         revision = fritz_revision()
+        cancelled = False
         if revision is None:
-            with fritz_file_lock():
-                revision = fritz_new_revision()
+            with fritz_file_lock() as held:
+                # Repaired only under the lock and only while still unreadable: a revision written
+                # by a Disconnect meanwhile is never replaced, and this login is dropped instead.
+                again = fritz_revision() if held else None
+                if not held:
+                    revision = None
+                elif again is None:
+                    revision = fritz_new_revision()
+                else:
+                    cancelled = True
         with self.lock:
+            if cancelled:
+                self.pending_login = None
+                self.state, self.message = "off", ""
+                self.message_code, self.message_args = "", []
+                return
             if self.revoke_pending or revision is None:
                 # The last Disconnect is not done yet (or the settings folder is unusable): no login.
                 self.pending_login = None
@@ -2284,6 +2318,7 @@ class Monitor:
         self.lang = "en"  # set by the bar widget ("lang" command); used for notifications
         self.trusted = load_trusted()
         self.untrusted_here = set()  # untrusted here while the shared list could not be saved
+        self.store_stamp = store_stamp()
         self.store = load_store()
         self.fritz = FritzMesh()
         self.panel_open = False
@@ -2345,8 +2380,11 @@ class Monitor:
                 self.lang = command["lang"]
                 return False
             if command["cmd"] == "view":
-                self.store["view"] = {"mode": command["mode"], "collapsed": command["collapsed"]}
-                save_store(self.store)
+                view = {"mode": command["mode"], "collapsed": list(command["collapsed"])}
+
+                def change(store):
+                    store["view"] = dict(view, collapsed=list(view["collapsed"]))
+                self.update_store(change)
                 return True
             if command["cmd"] == "fritz_login":
                 self.fritz.login(command["user"], command["password"], command["net"])
@@ -2356,12 +2394,15 @@ class Monitor:
             self.fritz.logout()
             return True
         if command == "known_all":
-            net = self.store["networks"].get(network_key(self.trust_identity))
-            if not net:
+            key = network_key(self.trust_identity)
+            self.reload_store()
+            if not self.store["networks"].get(key):
                 return False
-            for rec in net["devices"].values():
-                rec["new"] = False
-            save_store(self.store)
+
+            def change(store):
+                for rec in (store["networks"].get(key) or {"devices": {}})["devices"].values():
+                    rec["new"] = False
+            self.update_store(change)
             return True
         if command == "open":
             self.panel_open = True
@@ -2411,30 +2452,58 @@ class Monitor:
         return [entry for entry in load_trusted()
                 if (entry["gateway_mac"], entry["ssid"]) not in self.untrusted_here]
 
+    def reload_store(self):
+        """Pick up devices.json written by another screen's collector (only when it changed)."""
+        stamp = store_stamp()
+        if stamp != self.store_stamp:
+            self.store_stamp = stamp
+            self.store = load_store()
+
+    def update_store(self, change):
+        """Apply one change to devices.json as all collectors share it: re-read under the lock
+        they share, change only what this command or scan changes, write atomically. Without the
+        lock nothing is written; the change then lasts here until the file changes."""
+        with private_file_lock(DEVICES_LOCK_FILE) as held:
+            if not held:
+                change(self.store)
+                return False
+            fresh = load_store()
+            change(fresh)
+            saved = save_store(fresh)
+            self.store = fresh
+            self.store_stamp = store_stamp() if saved else self.store_stamp
+            return saved
+
     def handle_device(self, command):
         """Rename, pin, hide or acknowledge one device on the current network, or toggle alerts."""
         if command["cmd"] == "alerts":
-            self.store["alerts"] = command["on"]
-            save_store(self.store)
+            on = command["on"]
+
+            def set_alerts(store):
+                store["alerts"] = on
+            self.update_store(set_alerts)
             return True
         key = network_key(self.trust_identity)
         # Only devices currently listed on this network can be changed.
         if not key or command["mac"] not in {dev.get("mac") for dev in self.known.values()}:
             return False
-        rec = store_device(store_network(self.store, key), command["mac"], time.time())
-        if command["cmd"] == "rename":
-            rec["name"] = command["name"]
-        elif command["cmd"] == "pin":
-            rec["pinned"] = command["on"]
-            if command["on"]:
-                rec["hidden"] = False
-        elif command["cmd"] == "hide":
-            rec["hidden"] = command["on"]
-            if command["on"]:
-                rec["pinned"] = False
-        elif command["cmd"] == "known":
-            rec["new"] = not command["on"]
-        save_store(self.store)
+        cmd, mac, now_wall = command["cmd"], command["mac"], time.time()
+
+        def change(store):
+            rec = store_device(store_network(store, key), mac, now_wall)
+            if cmd == "rename":
+                rec["name"] = command["name"]
+            elif cmd == "pin":
+                rec["pinned"] = command["on"]
+                if command["on"]:
+                    rec["hidden"] = False
+            elif cmd == "hide":
+                rec["hidden"] = command["on"]
+                if command["on"]:
+                    rec["pinned"] = False
+            elif cmd == "known":
+                rec["new"] = not command["on"]
+        self.update_store(change)
         return True
 
     def apply_store(self, devices, trusted, ssid):
@@ -2443,10 +2512,12 @@ class Monitor:
         tracking = bool(trusted and key)
         now_wall = time.time()
         changed = False
+        self.reload_store()
         net = store_network(self.store, key, create=tracking) if key else None
         if tracking and net["since"] is None:
             net["since"] = now_wall
             changed = True
+        added = {}  # mac -> record first seen in this scan (merged into the shared file below)
         new_names = []
         for dev in devices:
             mac = dev["mac"] if MAC_RE.match(dev.get("mac") or "") else ""
@@ -2456,6 +2527,7 @@ class Monitor:
                 if now_wall - net["since"] > BASELINE_SECONDS:
                     rec["new"] = True
                     new_names.append(dev["name"])
+                added[mac] = dict(rec)
                 changed = True
             dev["auto_name"] = dev["name"]
             dev["custom_name"] = bool(rec and rec["name"])
@@ -2466,7 +2538,16 @@ class Monitor:
             dev["new"] = bool(rec and rec["new"])
             dev["can_edit"] = bool(mac and key)
         if changed:
-            save_store(self.store)
+            since = net["since"]
+
+            def change(store):
+                fresh = store_network(store, key)
+                if fresh["since"] is None:
+                    fresh["since"] = since
+                for mac, rec in added.items():
+                    if mac not in fresh["devices"]:
+                        store_device(fresh, mac, rec["first"]).update(rec)
+            self.update_store(change)
         if new_names and self.store["alerts"]:
             notify_new_devices(ssid, new_names, self.lang)
         return tracking
@@ -2519,6 +2600,7 @@ class Monitor:
 
     def snapshot(self, force_scan=False, emit=None):
         now = time.monotonic()
+        self.reload_store()  # names, pins, alerts or view changed on another screen
         force_scan = force_scan or self.force_next
         self.force_next = False
 

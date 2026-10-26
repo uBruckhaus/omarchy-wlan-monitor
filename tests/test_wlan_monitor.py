@@ -1,3 +1,4 @@
+import contextlib
 import importlib.util
 import ipaddress
 import math
@@ -517,6 +518,67 @@ class StoreTests(unittest.TestCase):
         self.assertTrue(again[0]["new"])
         self.assertEqual(self.notified.call_count, 1)
 
+    def test_two_collectors_keep_each_others_changes(self):
+        """One collector per screen: a rename on A and a pin on B (and alerts, view and a newly
+        seen device) all survive, and each collector shows the other's changes."""
+        a, b = self.monitor(), self.monitor()
+        one, two = "aa:bb:cc:dd:ee:02", "aa:bb:cc:dd:ee:03"
+        for mon in (a, b):
+            mon.known = {"10.0.0.9": {"mac": one}, "10.0.0.10": {"mac": two}}
+        self.assertTrue(a.handle({"cmd": "rename", "mac": one, "name": "Stove"}))
+        self.assertTrue(b.handle({"cmd": "pin", "mac": two, "on": True}))
+        self.assertTrue(a.handle({"cmd": "alerts", "on": False}))
+        self.assertTrue(b.handle({"cmd": "view", "mode": "type", "collapsed": ["apple"]}))
+        self.assertTrue(b.handle({"cmd": "pin", "mac": one, "on": True}))
+        # B scans a trusted network and remembers a new device: nothing of A's is lost.
+        b.apply_store([self.device("aa:bb:cc:dd:ee:04")], True, "Home")
+        saved = wlan_monitor.load_store()
+        devices = saved["networks"]["aa:bb:cc:dd:ee:01|Home"]["devices"]
+        self.assertEqual((devices[one]["name"], devices[one]["pinned"]), ("Stove", True))
+        self.assertTrue(devices[two]["pinned"])
+        self.assertIn("aa:bb:cc:dd:ee:04", devices)
+        self.assertFalse(saved["alerts"])
+        self.assertEqual(saved["view"], {"mode": "type", "collapsed": ["apple"]})
+        shown = [self.device(one), self.device(two)]
+        a.apply_store(shown, True, "Home")
+        self.assertEqual((shown[0]["name"], shown[0]["pinned"], shown[1]["pinned"]), ("Stove", True, True))
+        self.assertFalse(a.store["alerts"])
+        self.assertEqual(a.store["view"]["mode"], "type")
+
+    def test_store_change_without_the_lock_writes_nothing(self):
+        mon = self.monitor()
+        mac = "aa:bb:cc:dd:ee:02"
+        mon.known = {"10.0.0.9": {"mac": mac}}
+        fcntl = __import__("fcntl")
+        os.makedirs(wlan_monitor.config_dir(), mode=0o700)
+        held = os.open(os.path.join(wlan_monitor.config_dir(), wlan_monitor.DEVICES_LOCK_FILE), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            with mock.patch.object(wlan_monitor, "FRITZ_LOCK_WAIT", 0.05):
+                self.assertTrue(mon.handle({"cmd": "rename", "mac": mac, "name": "Stove"}))
+        finally:
+            os.close(held)
+        self.assertFalse(os.path.exists(os.path.join(wlan_monitor.config_dir(), wlan_monitor.DEVICES_FILE)))
+        shown = [self.device(mac)]
+        mon.apply_store(shown, False, "Home")
+        self.assertEqual(shown[0]["name"], "Stove")  # kept here until the file changes
+
+    def test_out_of_range_times_are_dropped(self):
+        os.makedirs(wlan_monitor.config_dir(), mode=0o700)
+        path = os.path.join(wlan_monitor.config_dir(), wlan_monitor.DEVICES_FILE)
+        with open(path, "w") as handle:
+            handle.write('{"networks": {"aa:bb:cc:dd:ee:01|Home": {"since": 1' + "0" * 400 + ', "devices": {'
+                         '"aa:bb:cc:dd:ee:02": {"first": 1e999}, "aa:bb:cc:dd:ee:03": {"first": -5},'
+                         '"aa:bb:cc:dd:ee:04": {"first": NaN}, "aa:bb:cc:dd:ee:05": {"first": 1700000000.5}}}}}')
+        os.chmod(path, 0o600)
+        net = wlan_monitor.load_store()["networks"]["aa:bb:cc:dd:ee:01|Home"]
+        self.assertIsNone(net["since"])
+        self.assertEqual([r["first"] for r in net["devices"].values()], [0, 0, 0, 1700000000.5])
+        mon = self.monitor()
+        devices = [self.device("aa:bb:cc:dd:ee:06")]
+        self.assertTrue(mon.apply_store(devices, True, "Home"))  # no OverflowError, ever
+        self.assertIsNotNone(wlan_monitor.load_store()["networks"]["aa:bb:cc:dd:ee:01|Home"]["since"])
+
     def test_untrusted_networks_are_not_tracked(self):
         mon = self.monitor()
         devices = [self.device("aa:bb:cc:dd:ee:02")]
@@ -913,6 +975,29 @@ class FritzTests(unittest.TestCase):
         # A later Disconnect that can delete it removes the stale file.
         first.logout()
         self.assertFalse(os.path.exists(os.path.join(wlan_monitor.config_dir(), wlan_monitor.FRITZ_FILE)))
+
+    def test_unreadable_revision_is_repaired_only_under_the_lock(self):
+        first, _second = self.login_pair()
+        self.assertIsNotNone(first.pending_login)
+        first.pending_login = None
+        wlan_monitor.save_private_json(wlan_monitor.FRITZ_REV_FILE, {"rev": 1})
+        # A Disconnect elsewhere writes a valid revision while this login waits for the lock.
+        written = "d" * 32
+        with mock.patch.object(wlan_monitor, "fritz_revision", side_effect=[None, written]), \
+                mock.patch.object(wlan_monitor, "fritz_new_revision", side_effect=AssertionError("never replaced")):
+            first.login("fritz1234", "s3cret pass", first.net_id)
+        self.assertIsNone(first.pending_login)
+        self.assertEqual(first.snapshot()[0]["state"], "off")
+        # Without the lock it is not repaired at all.
+        with mock.patch.object(wlan_monitor, "fritz_file_lock", return_value=contextlib.nullcontext(False)), \
+                mock.patch.object(wlan_monitor, "fritz_new_revision", side_effect=AssertionError("never replaced")):
+            first.login("fritz1234", "s3cret pass", first.net_id)
+        self.assertIsNone(first.pending_login)
+        self.assertEqual(first.snapshot()[0]["message_code"], "fzNotStored")
+        # Still unreadable under the lock: repaired, and the login is queued with the new revision.
+        first.login("fritz1234", "s3cret pass", first.net_id)
+        self.assertRegex(first.pending_login[5], r"^[0-9a-f]{32}$")
+        self.assertEqual(first.pending_login[5], wlan_monitor.fritz_revision())
 
     def test_lock_file_is_never_a_symlink_or_fifo(self):
         directory = wlan_monitor.private_config_dir()
