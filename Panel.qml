@@ -214,11 +214,15 @@ Panel {
   // and the collector itself refuses a login whose net_id is no longer current.
   property string fritzFormNet: ""
   property string fritzFormNetId: ""
+  property string fritzUserNet: ""  // the network the user name in the form was typed on
   function networkId() {
     return JSON.stringify([String(root.link.net_id || ""), root.link.ssid || "", root.link.gateway || "",
       String(root.link.gateway_mac || "")])
   }
   function openFritzForm() {
+    // A user name typed for another router (form cancelled there) is not offered on this one.
+    if (root.fritzUserNet !== root.networkId()) fritzUser.clear()
+    root.fritzUserNet = root.networkId()
     root.fritzFormNet = root.networkId()
     root.fritzFormNetId = String(root.link.net_id || "")
     root.fritzFormOpen = true

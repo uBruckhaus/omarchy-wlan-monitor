@@ -429,11 +429,11 @@ class DeviceCommandTests(unittest.TestCase):
         self.assertEqual(parse('{"cmd":"rename","mac":"AA:BB:CC:DD:EE:FF","name":"  <b>Pellet\\n stove</b>  "}'),
                          {"cmd": "rename", "mac": "aa:bb:cc:dd:ee:ff", "name": "bPellet stove/b"})
         self.assertEqual(parse('{"cmd":"rename","mac":"aa:bb:cc:dd:ee:ff","name":"' + "x" * 80 + '"}')["name"], "x" * 40)
-        self.assertEqual(parse('{"cmd":"pin","mac":"aa:bb:cc:dd:ee:ff","on":"yes"}')["on"], False)
+        self.assertEqual(parse('{"cmd":"pin","mac":"aa:bb:cc:dd:ee:ff","on":"yes"}'), "")  # not a boolean: refused
         self.assertEqual(parse('{"cmd":"alerts","on":true}'), {"cmd": "alerts", "on": True})
         self.assertEqual(parse('{"cmd":"rename","mac":"$(id)","name":"x"}'), "")
         self.assertEqual(parse('{"cmd":"rename","mac":["aa"],"name":"x"}'), "")
-        self.assertEqual(parse('{"cmd":"rename","mac":"aa:bb:cc:dd:ee:ff","name":5}')["name"], "")
+        self.assertEqual(parse('{"cmd":"rename","mac":"aa:bb:cc:dd:ee:ff","name":5}'), "")  # not text: refused
         self.assertEqual(parse('{"cmd":"shell","mac":"aa:bb:cc:dd:ee:ff"}'), "")
         self.assertEqual(parse('{"cmd":"pin"'), "")
         self.assertEqual(parse("[1]"), "")
@@ -616,7 +616,7 @@ class FritzTests(unittest.TestCase):
         self.env.start()
         # The kernel's neighbour table as the tests want it (never this machine's real one).
         self.neighbors = {"192.168.178.1": "1c:23:a2:92:2a:6c"}
-        self.neigh = mock.patch.object(wlan_monitor, "neighbor_mac", side_effect=lambda ip: self.neighbors.get(ip, ""))
+        self.neigh = mock.patch.object(wlan_monitor, "neighbor_mac", side_effect=lambda ip, iface: self.neighbors.get(ip, "") if iface == "wlan0" else "")
         self.neigh.start()
 
     def tearDown(self):
@@ -708,7 +708,7 @@ class FritzTests(unittest.TestCase):
             return 200, {}, mesh_json, "c" * 64
 
         fritz = wlan_monitor.FritzMesh()
-        fritz.set_network("192.168.178.1", "1c:23:a2:92:2a:6c", True, True)
+        fritz.set_network("192.168.178.1", "1c:23:a2:92:2a:6c", True, True, "wlan0")
         fritz.model_for = ("192.168.178.1", "1c:23:a2:92:2a:6c")
         fritz.login("fritz1234", "s3cret pass", fritz.net_id)
         with mock.patch.object(wlan_monitor, "bounded_http", side_effect=fake_http):
@@ -727,7 +727,7 @@ class FritzTests(unittest.TestCase):
         path = os.path.join(wlan_monitor.config_dir(), wlan_monitor.FRITZ_FILE)
         self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
         # Another router (different MAC) never gets the credentials.
-        fritz.set_network("192.168.1.1", "11:22:33:44:55:66", True, True)
+        fritz.set_network("192.168.1.1", "11:22:33:44:55:66", True, True, "wlan0")
         with mock.patch.object(wlan_monitor, "bounded_http", side_effect=AssertionError("must not connect")), \
                 mock.patch.object(wlan_monitor, "fritz_model", return_value=""):
             fritz.step()
@@ -741,10 +741,10 @@ class FritzTests(unittest.TestCase):
         never = mock.patch.object(wlan_monitor, "bounded_http", side_effect=AssertionError("must not connect"))
         no_model = mock.patch.object(wlan_monitor, "fritz_model", return_value="")
         fritz = wlan_monitor.FritzMesh()
-        fritz.set_network("192.168.178.1", "1c:23:a2:92:2a:6c", True, True)
+        fritz.set_network("192.168.178.1", "1c:23:a2:92:2a:6c", True, True, "wlan0")
         fritz.login("fritz1234", "s3cret pass", fritz.net_id)
         self.assertEqual(fritz.pending_login[2:4], ("192.168.178.1", "1c:23:a2:92:2a:6c"))
-        fritz.set_network("192.168.178.1", "66:66:66:66:66:66", True, True)     # router B, same address
+        fritz.set_network("192.168.178.1", "66:66:66:66:66:66", True, True, "wlan0")     # router B, same address
         self.assertIsNone(fritz.pending_login)
         with never, no_model:
             fritz.step()
@@ -758,7 +758,7 @@ class FritzTests(unittest.TestCase):
         self.assertEqual(fritz.snapshot()[0]["message_code"], "fzNetworkChanged")
         self.assertIsNone(fritz.pending_login)
         # No gateway known: a login is refused at once, nothing is queued.
-        fritz.set_network(None, "", False, True)
+        fritz.set_network(None, "", False, True, "wlan0")
         fritz.login("fritz1234", "s3cret pass", fritz.net_id)
         self.assertIsNone(fritz.pending_login)
         self.assertEqual(fritz.snapshot()[0]["state"], "error")
@@ -788,10 +788,10 @@ class FritzTests(unittest.TestCase):
 
         def run(probe=None, on_challenge=None):
             fritz = wlan_monitor.FritzMesh()
-            fritz.set_network(ip, A, True, True)
+            fritz.set_network(ip, A, True, True, "wlan0")
             fritz.login("fritz1234", "s3cret pass", fritz.net_id)
             calls = []
-            model = (lambda _ip: probe(fritz) or "") if probe else (lambda _ip: "")
+            model = (lambda _ip, _iface=None: probe(fritz) or "") if probe else (lambda _ip, _iface=None: "")
             hook = (lambda: on_challenge(fritz)) if on_challenge else None
             with mock.patch.object(wlan_monitor, "fritz_model", side_effect=model), \
                     mock.patch.object(wlan_monitor, "bounded_http", side_effect=self.challenge_http(calls, hook)):
@@ -799,11 +799,11 @@ class FritzTests(unittest.TestCase):
             return fritz, calls
 
         # 1. B takes over the address during the model probe (set_network reports it).
-        fritz, calls = run(probe=lambda f: f.set_network(ip, B, True, True))
+        fritz, calls = run(probe=lambda f: f.set_network(ip, B, True, True, "wlan0"))
         self.assertEqual(calls, [])
         self.assertEqual(fritz.snapshot()[0]["message_code"], "fzNetworkChanged")
         # 2. B answers the challenge: the change arrives after it, before the response.
-        fritz, calls = run(on_challenge=lambda f: f.set_network(ip, B, True, True))
+        fritz, calls = run(on_challenge=lambda f: f.set_network(ip, B, True, True, "wlan0"))
         self.assertEqual([auth for _m, auth in calls], [""])
         # 3. Not reported yet, but the kernel already has B's MAC at this address.
         self.neighbors[ip] = B
@@ -817,7 +817,7 @@ class FritzTests(unittest.TestCase):
         self.assertIsNone(wlan_monitor.load_fritz())
         # 5. The change comes after the response, before the result is kept: nothing kept or saved.
         fritz = wlan_monitor.FritzMesh()
-        fritz.set_network(ip, A, True, True)
+        fritz.set_network(ip, A, True, True, "wlan0")
         fritz.login("fritz1234", "s3cret pass", fritz.net_id)
         calls = []
         real = self.challenge_http(calls)
@@ -825,7 +825,7 @@ class FritzTests(unittest.TestCase):
         def late(*args, **kw):
             result = real(*args, **kw)
             if args[2] == "GET":
-                fritz.set_network(ip, B, True, True)
+                fritz.set_network(ip, B, True, True, "wlan0")
             return result
         with mock.patch.object(wlan_monitor, "fritz_model", return_value=""), \
                 mock.patch.object(wlan_monitor, "bounded_http", side_effect=late):
@@ -844,10 +844,10 @@ class FritzTests(unittest.TestCase):
         wlan_monitor.save_private_json(wlan_monitor.FRITZ_FILE, {"gateway_mac": A, "user": "u", "password": "p",
                                                                  "pin": "c" * 64})
         fritz = wlan_monitor.FritzMesh()
-        fritz.set_network(ip, A, True, True)
+        fritz.set_network(ip, A, True, True, "wlan0")
         fritz.model_for = (ip, A)
         calls = []
-        hook = lambda: fritz.set_network(ip, "66:66:66:66:66:66", True, True)
+        hook = lambda: fritz.set_network(ip, "66:66:66:66:66:66", True, True, "wlan0")
         with mock.patch.object(wlan_monitor, "bounded_http", side_effect=self.challenge_http(calls, hook)):
             fritz.step()
         self.assertEqual([auth for _m, auth in calls], [""])
@@ -857,7 +857,7 @@ class FritzTests(unittest.TestCase):
         def unauthorized(ip, port, method, path, body=None, headers=None, tls=False, pin=None, **kw):
             return 401, {"www-authenticate": 'Digest realm="r", nonce="n", qop="auth"'}, b"", "c" * 64
         fritz = wlan_monitor.FritzMesh()
-        fritz.set_network("192.168.178.1", "1c:23:a2:92:2a:6c", True, True)
+        fritz.set_network("192.168.178.1", "1c:23:a2:92:2a:6c", True, True, "wlan0")
         fritz.model_for = ("192.168.178.1", "1c:23:a2:92:2a:6c")
         fritz.login("u", "bad", fritz.net_id)
         with mock.patch.object(wlan_monitor, "bounded_http", side_effect=unauthorized):
@@ -932,7 +932,7 @@ class BoundedHttpTests(unittest.TestCase):
 
     def test_public_gateway_is_never_contacted(self):
         fritz = wlan_monitor.FritzMesh()
-        fritz.set_network("8.8.8.8", "1c:23:a2:92:2a:6c", True, True)
+        fritz.set_network("8.8.8.8", "1c:23:a2:92:2a:6c", True, True, "wlan0")
         with mock.patch.object(wlan_monitor, "bounded_http", side_effect=AssertionError("must not connect")):
             self.assertEqual(fritz.step(), 5.0)
 
@@ -1010,16 +1010,21 @@ class HostileCommandTests(unittest.TestCase):
         parse = wlan_monitor.parse_command
         for line in ('{"cmd":[]}', '{"cmd":{}}', '{"cmd":1}', '{"cmd":null}', '{"cmd":true}', '[]', '"rescan"',
                      '{"cmd":"rename","mac":[],"name":"x"}', '{"cmd":"rename","mac":"aa:bb:cc:dd:ee:ff","name":{}}',
-                     '{"cmd":"view","mode":[],"collapsed":[]}', '{"cmd":"view","mode":"list","collapsed":[[],{}]}',
+                     '{"cmd":"view","mode":[],"collapsed":[]}', '{"cmd":"view","mode":"list","collapsed":{}}',
                      '{"cmd":"lang","lang":[]}', '{"cmd":"alerts","on":[]}', '{"cmd":"fritz_login","user":[],"password":"x"}',
                      '{"cmd":"fritz_login","user":"u","password":{}}', '{"cmd":"pin","mac":"aa:bb:cc:dd:ee:ff","on":{}}',
                      '{"cmd":"rename"}', '{', '{"cmd":"x' + "y" * 2000 + '"}'):
-            result = parse(line)  # must not raise
-            self.assertTrue(result == "" or isinstance(result, dict), line)
+            self.assertEqual(parse(line), "", line)  # refused, never coerced into a change
         self.assertEqual(parse('{"cmd":[]}'), "")
         self.assertEqual(parse('{"cmd":{}}'), "")
-        self.assertEqual(parse('{"cmd":"view","mode":"list","collapsed":[[],{}]}'),
-                         {"cmd": "view", "mode": "list", "collapsed": []})
+        # Lists are filtered element by element; valid commands still work.
+        self.assertEqual(parse('{"cmd":"view","mode":"list","collapsed":["type",[],{}]}'),
+                         {"cmd": "view", "mode": "list", "collapsed": ["type"]})
+        self.assertEqual(parse('{"cmd":"alerts","on":false}'), {"cmd": "alerts", "on": False})
+        self.assertEqual(parse('{"cmd":"pin","mac":"AA:BB:CC:DD:EE:FF","on":true}'),
+                         {"cmd": "pin", "mac": "aa:bb:cc:dd:ee:ff", "on": True})
+        self.assertEqual(parse('{"cmd":"rename","mac":"aa:bb:cc:dd:ee:ff","name":""}'),
+                         {"cmd": "rename", "mac": "aa:bb:cc:dd:ee:ff", "name": ""})
 
     def test_a_failing_command_never_ends_the_collector(self):
         monitor = mock.Mock()
@@ -1055,26 +1060,26 @@ class LoginNetworkTests(unittest.TestCase):
 
     def test_network_id_follows_the_gateway(self):
         fritz = wlan_monitor.FritzMesh()
-        fritz.set_network("192.168.178.1", self.A, True, True)
+        fritz.set_network("192.168.178.1", self.A, True, True, "wlan0")
         first = fritz.net_id
         self.assertRegex(first, wlan_monitor.NET_ID_RE)
-        fritz.set_network("192.168.178.1", self.A, True, False)
+        fritz.set_network("192.168.178.1", self.A, True, False, "wlan0")
         self.assertEqual(fritz.net_id, first)                     # same router: same id
-        fritz.set_network("192.168.178.1", self.B, True, True)
+        fritz.set_network("192.168.178.1", self.B, True, True, "wlan0")
         self.assertNotEqual(fritz.net_id, first)                  # same address, other router
-        fritz.set_network("192.168.178.1", self.A, True, True)
+        fritz.set_network("192.168.178.1", self.A, True, True, "wlan0")
         self.assertNotEqual(fritz.net_id, first)                  # back again: still a new id
         # Another collector process never reuses an id.
         other = wlan_monitor.FritzMesh()
-        other.set_network("192.168.178.1", self.A, True, True)
+        other.set_network("192.168.178.1", self.A, True, True, "wlan0")
         self.assertNotEqual(other.net_id, first)
 
     def test_login_for_another_network_is_refused(self):
         fritz = wlan_monitor.FritzMesh()
-        fritz.set_network("192.168.178.1", self.A, True, True)
+        fritz.set_network("192.168.178.1", self.A, True, True, "wlan0")
         opened_for = fritz.net_id
         # The panel still shows router A (devices frozen while renaming), the collector already sees B.
-        fritz.set_network("192.168.178.1", self.B, True, True)
+        fritz.set_network("192.168.178.1", self.B, True, True, "wlan0")
         fritz.login("fritz1234", "s3cret pass", opened_for)
         self.assertIsNone(fritz.pending_login)
         info = fritz.snapshot()[0]
@@ -1087,7 +1092,7 @@ class LoginNetworkTests(unittest.TestCase):
 
     def test_monitor_passes_the_network_id(self):
         monitor = wlan_monitor.Monitor()
-        monitor.fritz.set_network("192.168.178.1", self.A, True, True)
+        monitor.fritz.set_network("192.168.178.1", self.A, True, True, "wlan0")
         monitor.handle(wlan_monitor.parse_command('{"cmd":"fritz_login","user":"u","password":"x"}'))
         self.assertIsNone(monitor.fritz.pending_login)
         line = '{"cmd":"fritz_login","user":"u","password":"x","net":"%s"}' % monitor.fritz.net_id
@@ -1116,3 +1121,109 @@ class LoginNetworkTests(unittest.TestCase):
             self.assertEqual(link["gateway_mac"], self.B)
             self.assertNotEqual(link["net_id"], first)
             self.assertEqual(link["net_id"], monitor.fritz.net_id)
+
+
+class InterfaceBindingTests(unittest.TestCase):
+    """FRITZ!Box traffic goes only out of the monitored interface, to the router seen there."""
+    A = "1c:23:a2:92:2a:6c"
+    IP = "192.168.178.1"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.env = mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": self.tmp.name})
+        self.env.start()
+
+    def tearDown(self):
+        self.env.stop()
+        self.tmp.cleanup()
+
+    def test_interface_change_is_a_network_change(self):
+        fritz = wlan_monitor.FritzMesh()
+        fritz.set_network(self.IP, self.A, True, True, "wlan0")
+        first = fritz.net_id
+        fritz.login("u", "p", first)
+        fritz.set_network(self.IP, self.A, True, True, "eth0")   # same address and MAC, other interface
+        self.assertNotEqual(fritz.net_id, first)
+        self.assertIsNone(fritz.pending_login)
+        # An interface name that is not a plain kernel name: nothing is ever contacted.
+        fritz.set_network(self.IP, self.A, True, True, "-x;")
+        self.assertIsNone(fritz.network[0])
+
+    def test_login_traffic_is_scoped_to_the_interface(self):
+        seen, neigh = [], []
+
+        def fake_http(ip, port, method, path, body=None, headers=None, tls=False, pin=None, iface=None, **kw):
+            seen.append(iface)
+            if method == "POST" and "Authorization" not in (headers or {}):
+                return 401, {"www-authenticate": 'Digest realm="r", nonce="n", qop="auth"'}, b"", "c" * 64
+            return 401, {}, b"", "c" * 64
+
+        def fake_neigh(ip, iface):
+            neigh.append(iface)
+            return self.A
+        fritz = wlan_monitor.FritzMesh()
+        fritz.set_network(self.IP, self.A, True, True, "wlan0")
+        fritz.login("u", "p", fritz.net_id)
+        with mock.patch.object(wlan_monitor, "bounded_http", side_effect=fake_http), \
+                mock.patch.object(wlan_monitor, "neighbor_mac", side_effect=fake_neigh):
+            fritz.step()
+        self.assertTrue(seen)
+        self.assertEqual(set(seen), {"wlan0"})          # model probe and both login requests
+        self.assertEqual(set(neigh), {"wlan0"})
+
+    def test_neighbor_lookup_names_the_interface(self):
+        with mock.patch.object(wlan_monitor, "run_cmd", return_value="192.168.178.1 dev wlan0 lladdr 1c:23:a2:92:2a:6c REACHABLE\n") as run:
+            self.assertEqual(wlan_monitor.neighbor_mac(self.IP, "wlan0"), self.A)
+        self.assertEqual(run.call_args[0][0], ["ip", "-4", "neigh", "show", "to", self.IP, "dev", "wlan0"])
+
+    def test_connection_is_bound_to_the_device(self):
+        sock = mock.Mock()
+        with mock.patch.object(wlan_monitor.socket, "socket", return_value=sock):
+            wlan_monitor.connect_bound(("192.168.178.1", 49443), 4.0, None, "wlan0")
+        names = [c[0] for c in sock.method_calls]
+        self.assertLess(names.index("setsockopt"), names.index("connect"))
+        sock.setsockopt.assert_any_call(wlan_monitor.socket.SOL_SOCKET, wlan_monitor.SO_BINDTODEVICE, b"wlan0")
+        # Binding refused (old kernel): nothing is connected.
+        sock = mock.Mock()
+        sock.setsockopt.side_effect = PermissionError
+        with mock.patch.object(wlan_monitor.socket, "socket", return_value=sock):
+            with self.assertRaises(OSError):
+                wlan_monitor.connect_bound(("192.168.178.1", 49443), 4.0, None, "wlan0")
+        sock.connect.assert_not_called()
+        sock.close.assert_called()
+
+
+class StoreLimitTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.env = mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": self.tmp.name})
+        self.env.start()
+
+    def tearDown(self):
+        self.env.stop()
+        self.tmp.cleanup()
+
+    def test_the_largest_valid_store_reads_back(self):
+        store = {"alerts": False, "view": {"mode": "type", "collapsed": ["type"]}, "networks": {}}
+        name = "\U0001F600" * wlan_monitor.NAME_MAX
+        for n in range(wlan_monitor.MAX_STORE_NETWORKS):
+            devices = {}
+            for d in range(wlan_monitor.MAX_STORE_DEVICES):
+                mac = "02:%02x:%02x:%02x:00:01" % (n, d >> 8, d & 255)
+                devices[mac] = {"name": name, "pinned": True, "hidden": False, "new": True, "first": 1761480000.123456}
+            key = "aa:bb:cc:dd:%02x:01|" % n + "\U0001F600" * 64
+            store["networks"][key] = {"since": 1761480000.123456, "devices": devices}
+        self.assertTrue(wlan_monitor.save_store(store))
+        self.assertEqual(wlan_monitor.load_store(), store)
+
+    def test_a_fifo_does_not_block_reading(self):
+        import threading
+        os.makedirs(wlan_monitor.config_dir(), mode=0o700, exist_ok=True)
+        os.mkfifo(os.path.join(wlan_monitor.config_dir(), wlan_monitor.DEVICES_FILE), 0o600)
+        result = []
+        worker = threading.Thread(target=lambda: result.append(wlan_monitor.load_private_json(wlan_monitor.DEVICES_FILE)),
+                                  daemon=True)
+        worker.start()
+        worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(result, [None])

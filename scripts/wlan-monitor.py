@@ -102,6 +102,8 @@ FRITZ_USER_RE = re.compile(r"^[A-Za-z0-9._@-]{0,64}$")
 # The collector's id for the network it talks to right now: a random per-process part and a
 # counter that changes with every gateway change (stats.link.net_id, fritz_login "net").
 NET_ID_RE = re.compile(r"^[0-9a-f]{12}-[0-9]{1,12}$")
+IFACE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,14}$")
+SO_BINDTODEVICE = getattr(socket, "SO_BINDTODEVICE", 25)
 FRITZ_PASSWORD_MAX = 128
 FRITZ_DESC_PORT = 49000
 FRITZ_TLS_PORT = 49443
@@ -116,7 +118,7 @@ MESH_PATH_RE = re.compile(r"^/meshlist\.lua\?sid=[0-9a-f]{16}$")
 TRUST_FILE = "trusted-networks.json"
 MAX_TRUSTED = 64
 DEVICES_FILE = "devices.json"
-MAX_STORE_BYTES = 262144
+MAX_STORE_BYTES = 8 * 1024 * 1024  # holds the largest valid store (32 x 512 records, 40-char names)
 MAX_STORE_NETWORKS = 32
 MAX_STORE_DEVICES = 512  # per network
 NAME_MAX = 40
@@ -705,10 +707,14 @@ def read_neighbors(iface):
     return parse_neighbors(out)
 
 
-def neighbor_mac(ip):
-    """The MAC the kernel holds for `ip` right now ("" if none): read again just before a login's
-    password response is sent, so a router that took over the address in between gets nothing."""
-    return parse_neighbors(run_cmd(["ip", "-4", "neigh", "show", "to", ip])).get(ip, {}).get("mac", "")
+def neighbor_mac(ip, iface):
+    """The MAC the kernel holds for `ip` on `iface` right now ("" if none): read again just before
+    a login's password response is sent, so a router that took over the address in between gets
+    nothing. Scoped to the interface: the same address on another network says nothing here."""
+    if not IFACE_RE.match(iface or ""):
+        return ""
+    out = run_cmd(["ip", "-4", "neigh", "show", "to", ip, "dev", iface])
+    return parse_neighbors(out).get(ip, {}).get("mac", "")
 
 
 def parse_neighbors(out):
@@ -1078,22 +1084,39 @@ def load_private_json(filename, max_bytes=65536):
     """Read a JSON file from the config directory; refuses symlinks, foreign or oversized files."""
     path = os.path.join(config_dir(), filename)
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        # O_NONBLOCK: a FIFO in its place is refused below instead of blocking the collector.
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:
         return None
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_size > max_bytes:
             return None
-        return json.loads(os.read(fd, max_bytes).decode("utf-8", "replace"))
+        chunks, size = [], 0
+        while size <= max_bytes:
+            chunk = os.read(fd, min(1 << 20, max_bytes + 1 - size))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+        if size > max_bytes:
+            return None
+        return json.loads(b"".join(chunks).decode("utf-8", "replace"))
     except (OSError, ValueError):
         return None
     finally:
         os.close(fd)
 
 
-def save_private_json(filename, data):
-    """Atomically write a JSON file into the private (0700) config directory as 0600."""
+def save_private_json(filename, data, max_bytes=None, compact=False):
+    """Atomically write a JSON file into the private (0700) config directory as 0600. With
+    `max_bytes`, a file its reader would refuse is never written (the old one stays)."""
+    if compact:
+        text = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    else:
+        text = json.dumps(data, indent=2)
+    if max_bytes is not None and len(text.encode("utf-8")) > max_bytes:
+        return False
     directory = config_dir()
     tmp = None
     try:
@@ -1107,7 +1130,7 @@ def save_private_json(filename, data):
         fd, tmp = tempfile.mkstemp(prefix=f".{filename}.", suffix=".tmp", dir=directory)
         os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(data, handle, indent=2)
+            handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp, os.path.join(directory, filename))
@@ -1177,9 +1200,12 @@ def parse_command(line):
         return ""
     cmd = data["cmd"]
     if cmd == "alerts":
-        return {"cmd": cmd, "on": data.get("on") is True}
+        return {"cmd": cmd, "on": data["on"]} if isinstance(data.get("on"), bool) else ""
     if cmd == "lang":
-        return {"cmd": cmd, "lang": data.get("lang") if data.get("lang") in LANGS else "en"}
+        lang = data.get("lang")
+        if not isinstance(lang, str):
+            return ""
+        return {"cmd": cmd, "lang": lang if lang in LANGS else "en"}
     if cmd == "view":
         mode = data.get("mode")
         collapsed = data.get("collapsed")
@@ -1201,8 +1227,9 @@ def parse_command(line):
     if not isinstance(mac, str) or not MAC_RE.match(mac):
         return ""
     if cmd == "rename":
-        return {"cmd": cmd, "mac": mac.lower(), "name": clean_name(data.get("name", ""))}
-    return {"cmd": cmd, "mac": mac.lower(), "on": data.get("on") is True}
+        name = data.get("name", "")
+        return {"cmd": cmd, "mac": mac.lower(), "name": clean_name(name)} if isinstance(name, str) else ""
+    return {"cmd": cmd, "mac": mac.lower(), "on": data["on"]} if isinstance(data.get("on"), bool) else ""
 
 
 # --- Per-network device store (names, pins, hidden, seen devices) ------------------
@@ -1252,7 +1279,7 @@ def load_store():
 
 
 def save_store(store):
-    return save_private_json(DEVICES_FILE, store)
+    return save_private_json(DEVICES_FILE, store, MAX_STORE_BYTES, compact=True)
 
 
 def store_network(store, key, create=True):
@@ -1478,8 +1505,25 @@ def is_fritz_vendor(vendor):
     return bool(re.search(r"fritz|\bavm\b", vendor or "", re.I))
 
 
+def connect_bound(address, timeout, source_address, iface):
+    """A TCP connection that leaves only through `iface` (SO_BINDTODEVICE, unprivileged since
+    Linux 5.7). If the binding is refused, nothing is connected."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, SO_BINDTODEVICE, iface.encode())
+        if timeout is not None and timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+            sock.settimeout(timeout)
+        if source_address:
+            sock.bind(source_address)
+        sock.connect(address)
+        return sock
+    except BaseException:
+        sock.close()
+        raise
+
+
 def bounded_http(ip, port, method, path, body=None, headers=None, tls=False, pin=None,
-                 max_body=FRITZ_MAX_SOAP, timeout=FRITZ_TIMEOUT):
+                 max_body=FRITZ_MAX_SOAP, timeout=FRITZ_TIMEOUT, iface=None):
     """One HTTP(S) request to the router with an overall deadline and a body size cap.
 
     Returns (status, headers, body_bytes, cert_sha256). With `pin`, the TLS certificate
@@ -1492,6 +1536,11 @@ def bounded_http(ip, port, method, path, body=None, headers=None, tls=False, pin
         conn = http.client.HTTPSConnection(ip, port, timeout=timeout, context=ctx)
     else:
         conn = http.client.HTTPConnection(ip, port, timeout=timeout)
+    if iface is not None:
+        # Only through the monitored interface: the same address on another network is not used.
+        if not IFACE_RE.match(iface):
+            raise OSError("bad interface")
+        conn._create_connection = lambda address, t=None, source=None: connect_bound(address, t, source, iface)
     expired = threading.Event()
 
     def cut():
@@ -1534,10 +1583,10 @@ def bounded_http(ip, port, method, path, body=None, headers=None, tls=False, pin
         conn.close()
 
 
-def fritz_model(ip):
+def fritz_model(ip, iface=None):
     """Model name from the unauthenticated TR-064 description, e.g. "FRITZ!Box 5690 Pro"."""
     try:
-        status, _, body, _ = bounded_http(ip, FRITZ_DESC_PORT, "GET", "/tr64desc.xml", timeout=2.0)
+        status, _, body, _ = bounded_http(ip, FRITZ_DESC_PORT, "GET", "/tr64desc.xml", timeout=2.0, iface=iface)
     except (OSError, http.client.HTTPException, ValueError):
         return ""
     if status != 200:
@@ -1588,7 +1637,7 @@ class FritzError(Exception):
         self.args_ = [str(a) for a in args]
 
 
-def fritz_soap(ip, user, password, pin, service, control, action, still_ok=None):
+def fritz_soap(ip, user, password, pin, service, control, action, still_ok=None, iface=None):
     """Call one TR-064 action with Digest auth over pinned HTTPS; returns (body_text, cert).
 
     `still_ok` is called after the challenge arrives and before the password-derived response is
@@ -1601,7 +1650,8 @@ def fritz_soap(ip, user, password, pin, service, control, action, still_ok=None)
     ).encode()
     headers = {"Content-Type": 'text/xml; charset="utf-8"', "SOAPAction": f'"{service}#{action}"'}
     try:
-        status, hdrs, body, cert = bounded_http(ip, FRITZ_TLS_PORT, "POST", control, envelope, headers, tls=True, pin=pin)
+        status, hdrs, body, cert = bounded_http(ip, FRITZ_TLS_PORT, "POST", control, envelope, headers, tls=True, pin=pin,
+                                                iface=iface)
         if status == 401:
             challenge = parse_digest_challenge(hdrs.get("www-authenticate", ""))
             if not challenge:
@@ -1610,7 +1660,8 @@ def fritz_soap(ip, user, password, pin, service, control, action, still_ok=None)
                 raise FritzError("fzNetworkChanged", "The network changed before the login was sent.")
             auth = dict(headers, Authorization=digest_authorization(
                 user, password, "POST", control, challenge, os.urandom(8).hex()))
-            status, hdrs, body, cert = bounded_http(ip, FRITZ_TLS_PORT, "POST", control, envelope, auth, tls=True, pin=cert)
+            status, hdrs, body, cert = bounded_http(ip, FRITZ_TLS_PORT, "POST", control, envelope, auth, tls=True, pin=cert,
+                                                    iface=iface)
     except PermissionError:
         raise FritzError("fzCert", "The FRITZ!Box certificate changed. Connect again to trust the new one.")
     except ConnectionRefusedError:
@@ -1759,6 +1810,7 @@ class FritzMesh:
         self.wake = threading.Event()
         self.creds = load_fritz()
         self.network = (None, "", False)  # (gateway ip, gateway mac, looks like a FRITZ!Box)
+        self.iface = ""  # the interface the gateway is reached through (all FRITZ!Box traffic is bound to it)
         self.panel_open = False
         self.model = ""
         self.model_for = None
@@ -1779,17 +1831,22 @@ class FritzMesh:
         self.thread = threading.Thread(target=self.worker, daemon=True)
         self.thread.start()
 
-    def set_network(self, ip, mac, is_fritz, panel_open):
-        # Only a private gateway address is ever contacted.
+    def set_network(self, ip, mac, is_fritz, panel_open, iface):
+        # Only a private gateway address on a plainly named interface is ever contacted.
         try:
             if not ip or not ipaddress.IPv4Address(ip).is_private:
                 ip = None
         except ValueError:
             ip = None
+        if not isinstance(iface, str) or not IFACE_RE.match(iface):
+            ip, iface = None, ""
         with self.lock:
-            if (ip, mac) != self.network[:2]:
+            if (ip, mac, iface) != (self.network[0], self.network[1], self.iface):
                 self.generation += 1
                 self.net_seq += 1
+                if iface != self.iface:
+                    self.model_for = None
+                self.iface = iface
                 self.clients, self.aps, self.updated = {}, [], 0.0
                 self.state, self.message = "off", ""
                 if self.pending_login is not None:
@@ -1854,17 +1911,17 @@ class FritzMesh:
         with self.lock:
             return self.network[:2] == (ip, mac) and self.generation == generation
 
-    def refresh(self, ip, creds, still_ok=None):
+    def refresh(self, ip, creds, still_ok=None, iface=None):
         text, _ = fritz_soap(ip, creds["user"], creds["password"], creds["pin"],
                              "urn:dslforum-org:service:Hosts:1", "/upnp/control/hosts", "X_AVM-DE_GetMeshListPath",
-                             still_ok)
+                             still_ok, iface)
         match = re.search(r"<NewX_AVM-DE_MeshListPath>([^<]{1,200})</NewX_AVM-DE_MeshListPath>", text)
         path = match.group(1).replace("&amp;", "&") if match else ""
         if not MESH_PATH_RE.match(path):
             raise FritzError("fzNoMesh", "The FRITZ!Box sent no mesh list.")
         try:
             status, _, body, _ = bounded_http(ip, FRITZ_TLS_PORT, "GET", path, tls=True, pin=creds["pin"],
-                                              max_body=FRITZ_MAX_MESH)
+                                              max_body=FRITZ_MAX_MESH, iface=iface)
             data = json.loads(body.decode("utf-8", "replace")) if status == 200 else None
         except PermissionError:
             raise FritzError("fzCert", "The FRITZ!Box certificate changed. Connect again to trust the new one.")
@@ -1879,16 +1936,17 @@ class FritzMesh:
         """One unit of work; returns seconds until the next one is due."""
         with self.lock:
             ip, mac, is_fritz = self.network
+            iface = self.iface
             pending, self.pending_login = self.pending_login, None
             generation = self.generation
             creds = self.creds
             interval = FRITZ_POLL_OPEN if self.panel_open else FRITZ_POLL_CLOSED
             age = time.time() - self.updated
             state = self.state
-        if not ip or not mac:
+        if not ip or not mac or not iface:
             return 5.0
         if is_fritz and self.model_for != (ip, mac):
-            model = fritz_model(ip)
+            model = fritz_model(ip, iface)
             with self.lock:
                 self.model, self.model_for = model, (ip, mac)
         if pending and pending[2:] != (ip, mac, generation):
@@ -1903,15 +1961,15 @@ class FritzMesh:
             # was typed for (same generation, and the kernel still has its MAC at this address),
             # checked once more right before it is sent.
             def still_ok():
-                return self.current(ip, mac, generation) and neighbor_mac(ip) == mac
+                return self.current(ip, mac, generation) and neighbor_mac(ip, iface) == mac
             try:
                 if not still_ok():
                     raise FritzError("fzNetworkChanged", "The network changed before the login was sent.")
                 # Trust on first use: remember the certificate seen while the user logs in.
                 _, cert = fritz_soap(ip, pending[0], pending[1], None, "urn:dslforum-org:service:Hosts:1",
-                                     "/upnp/control/hosts", "X_AVM-DE_GetMeshListPath", still_ok)
+                                     "/upnp/control/hosts", "X_AVM-DE_GetMeshListPath", still_ok, iface)
                 creds = {"gateway_mac": mac, "user": pending[0], "password": pending[1], "pin": cert}
-                clients, aps = self.refresh(ip, creds, still_ok)
+                clients, aps = self.refresh(ip, creds, still_ok, iface)
             except FritzError as exc:
                 with self.lock:
                     if self.generation == generation or exc.code == "fzNetworkChanged":
@@ -1937,7 +1995,7 @@ class FritzMesh:
         try:
             # Saved credentials go only to the pinned certificate; a gateway change in between
             # still stops the request before the response is sent.
-            clients, aps = self.refresh(ip, creds, lambda: self.current(ip, mac, generation))
+            clients, aps = self.refresh(ip, creds, lambda: self.current(ip, mac, generation), iface)
         except FritzError as exc:
             with self.lock:
                 if self.generation == generation:
@@ -2215,7 +2273,7 @@ class Monitor:
 
         gateway_vendor = lookup_vendor(self.identity["gateway_mac"])
         self.fritz.set_network(None if lan_blocked else gateway_ip, self.identity["gateway_mac"],
-                               is_fritz_vendor(gateway_vendor), self.panel_open)
+                               is_fritz_vendor(gateway_vendor), self.panel_open, iface)
         fritz_info, mesh = self.fritz.snapshot()
         if lan_blocked:
             mesh = {}
