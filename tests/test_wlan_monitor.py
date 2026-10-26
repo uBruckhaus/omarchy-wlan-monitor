@@ -1307,3 +1307,16 @@ class MalformedReplyTests(unittest.TestCase):
         os.close(fd)
         self.assertIsNone(wlan_monitor.load_private_json(wlan_monitor.DEVICES_FILE, wlan_monitor.MAX_STORE_BYTES))
         self.assertEqual(wlan_monitor.load_store()["networks"], {})
+
+    def test_refresh_error_carries_its_own_code(self):
+        A, ip = "1c:23:a2:92:2a:6c", "192.168.178.1"
+        wlan_monitor.save_private_json(wlan_monitor.FRITZ_FILE, {"gateway_mac": A, "user": "u", "password": "p",
+                                                                 "pin": "c" * 64})
+        fritz = wlan_monitor.FritzMesh()
+        fritz.set_network(ip, A, True, True, "wlan0")
+        fritz.model_for = (ip, A)
+        fritz.message_code = "fzConnecting"  # left over from the login
+        with mock.patch.object(fritz, "refresh", side_effect=wlan_monitor.FritzError("fzCert", "changed")):
+            fritz.step()
+        info = fritz.snapshot()[0]
+        self.assertEqual((info["state"], info["message_code"]), ("error", "fzCert"))

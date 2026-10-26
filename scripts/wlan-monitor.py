@@ -2012,6 +2012,7 @@ class FritzMesh:
                 self.creds = creds
                 self.clients, self.aps, self.updated = clients, aps, time.time()
                 self.state, self.message = "connected", ""
+                self.message_code, self.message_args = "", []
             return interval
         if not creds or creds["gateway_mac"] != mac:
             return 5.0
@@ -2026,12 +2027,14 @@ class FritzMesh:
             with self.lock:
                 if self.generation == generation:
                     self.state, self.message, self.updated = "error", str(exc), time.time()
+                    self.message_code, self.message_args = exc.code, exc.args_
             return 5.0
         with self.lock:
             if self.generation != generation:
                 return 5.0  # the old gateway's mesh list is never shown for the new one
             self.clients, self.aps, self.updated = clients, aps, time.time()
             self.state, self.message = "connected", ""
+            self.message_code, self.message_args = "", []
         return interval
 
     def worker(self):
