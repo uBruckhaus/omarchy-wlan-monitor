@@ -40,7 +40,7 @@ While a VPN is active (NordVPN, WireGuard, Proton VPN, Mullvad, Tailscale, OpenV
 
 ## Trusted networks and scanning
 
-Discovery is **passive** on every network by default: the kernel neighbor table, mDNS announcements and single reverse-DNS lookups for devices that are already visible. Nothing sweeps the subnet automatically, so the widget behaves well on hotel, café and office Wi-Fi. The only connections it makes there on its own are single TCP connect checks of the router's web interface (ports 80 and 443) and of web interfaces that devices advertise over mDNS (before a link to them is offered), the router check while a VPN is up (see above) and the unauthenticated FRITZ!Box description. **Rescan** runs one full sweep on any network when you ask for it.
+Discovery is **passive** on every network by default: the kernel neighbor table, mDNS announcements and single reverse-DNS lookups for devices that are already visible. Nothing sweeps the subnet automatically, so the widget behaves well on hotel, café and office Wi-Fi. The only connections it makes there on its own are single TCP connect checks of the router's web interface (ports 80 and 443) and of web interfaces that devices advertise over mDNS (before a link to them is offered), the router check while a VPN is up (see above), the unauthenticated FRITZ!Box description, and an empty UDP datagram to the router's discard port (at most every 10 s, only through the monitored interface) when the kernel's entry for the router has aged out, so the trusted-network check keeps working when nothing else talks to the router (e.g. all traffic goes through a VPN). **Rescan** runs one full sweep on any network when you ask for it.
 
 Click **Trust** in the panel to allow **active** scanning on the current network (identified by SSID and router MAC address, both seen at that moment: while the router is not in the neighbour table, or after a disconnect, nothing is inherited from before):
 
@@ -51,7 +51,7 @@ Click **Trust** in the panel to allow **active** scanning on the current network
 
 ### FRITZ!Box login
 
-The login is optional and only offered when the router is a FRITZ!Box. Where to find the login:
+The login is optional and only offered when the router is a FRITZ!Box: its maker in the MAC address database says so, or, when the database does not know the router's maker, its public TR-064 description (asked once per router, on trusted networks only) names a FRITZ!Box model. Where to find the login:
 
 - There is no fixed default user name. FRITZ!OS before 7.24 asks only for a password; leave the user name empty.
 - FRITZ!OS 7.24 and newer: if you never created a user, an update created one named `fritz` plus four random digits (e.g. `fritz1234`). Log in at http://fritz.box and look under System › FRITZ!Box Users.

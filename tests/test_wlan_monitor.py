@@ -1419,3 +1419,91 @@ class StaleNetworkTests(unittest.TestCase):
                                 "prefix": 24, "cidr": "192.168.178.20/24", "mac": "02:00:00:00:00:01", "is_wireless": True})
             self.assertNotEqual(monitor.snapshot()["link"]["net_id"], first)
         self.run_snapshots(steps)
+
+
+class UnknownMakerAndGatewayRefreshTests(unittest.TestCase):
+    """0.8.2: a FRITZ!Box whose MAC prefix the database lacks still gets its login (asked once, on a
+    trusted network only), and trust does not lapse because the router's ARP entry aged out."""
+
+    GW, MAC = "192.168.178.1", "aa:bb:cc:11:22:33"
+
+    def test_fritz_maker(self):
+        self.assertIs(wlan_monitor.fritz_maker("FRITZ! Technology GmbH", False), True)
+        self.assertIs(wlan_monitor.fritz_maker("", True), None)
+        self.assertIs(wlan_monitor.fritz_maker("Private MAC", True), None)
+        self.assertIs(wlan_monitor.fritz_maker("", False), False)          # untrusted: never asked
+        self.assertIs(wlan_monitor.fritz_maker("TP-Link", True), False)    # a known other maker
+
+    def probe(self, maker, model_reply):
+        fritz = wlan_monitor.FritzMesh()
+        fritz.set_network(self.GW, self.MAC, maker, True, "wlan0")
+        with mock.patch.object(wlan_monitor, "fritz_model", return_value=model_reply) as asked:
+            fritz.step()
+            fritz.step()
+        return fritz, asked
+
+    def test_unknown_maker_is_asked_once_and_shows_the_login(self):
+        fritz, asked = self.probe(None, "FRITZ!Box 5690 Pro")
+        self.assertEqual(asked.call_count, 1)
+        info, _ = fritz.snapshot()
+        self.assertTrue(info["available"])
+        self.assertEqual(info["model"], "FRITZ!Box 5690 Pro")
+
+    def test_unknown_maker_that_is_no_fritzbox_stays_hidden(self):
+        fritz, asked = self.probe(None, "")
+        self.assertEqual(asked.call_count, 1)
+        self.assertFalse(fritz.snapshot()[0]["available"])
+
+    def test_known_other_maker_is_never_asked(self):
+        fritz, asked = self.probe(False, "FRITZ!Box 5690 Pro")
+        asked.assert_not_called()
+        self.assertFalse(fritz.snapshot()[0]["available"])
+
+    def test_poke_neighbor_refuses_public_addresses_and_bad_interfaces(self):
+        with mock.patch.object(wlan_monitor.socket, "socket") as sock:
+            self.assertFalse(wlan_monitor.poke_neighbor("8.8.8.8", "wlan0"))
+            self.assertFalse(wlan_monitor.poke_neighbor("192.168.178.1", "wlan0;rm"))
+            self.assertFalse(wlan_monitor.poke_neighbor("not-an-ip", "wlan0"))
+            sock.assert_not_called()
+
+    def test_poke_neighbor_errors_never_escape(self):
+        failing = mock.MagicMock()
+        failing.sendto.side_effect = PermissionError("blocked by a VPN")
+        with mock.patch.object(wlan_monitor.socket, "socket", return_value=failing):
+            self.assertFalse(wlan_monitor.poke_neighbor(self.GW, "wlan0"))
+        failing.close.assert_called_once()
+
+    def test_missing_gateway_entry_is_renewed_and_read_again(self):
+        mon = wlan_monitor.Monitor()
+        neighbors = {}
+        with mock.patch.object(wlan_monitor, "poke_neighbor", return_value=True) as poke, \
+                mock.patch.object(wlan_monitor, "neighbor_mac", side_effect=["", self.MAC]), \
+                mock.patch.object(wlan_monitor.time, "sleep"):
+            mon.refresh_gateway(neighbors, self.GW, "wlan0", 100.0)
+            poke.assert_called_once_with(self.GW, "wlan0")
+        self.assertEqual(neighbors[self.GW]["mac"], self.MAC)
+        # Rate-limited: a second missing entry within GATEWAY_POKE_EVERY sends nothing.
+        with mock.patch.object(wlan_monitor, "poke_neighbor", return_value=True) as poke:
+            mon.refresh_gateway({}, self.GW, "wlan0", 100.0 + wlan_monitor.GATEWAY_POKE_EVERY / 2)
+            poke.assert_not_called()
+
+    def test_fresh_gateway_entry_is_left_alone_and_stale_one_renewed_without_waiting(self):
+        mon = wlan_monitor.Monitor()
+        with mock.patch.object(wlan_monitor, "poke_neighbor", return_value=True) as poke:
+            mon.refresh_gateway({self.GW: {"mac": self.MAC, "state": "REACHABLE"}}, self.GW, "wlan0", 50.0)
+            poke.assert_not_called()
+        with mock.patch.object(wlan_monitor, "poke_neighbor", return_value=True) as poke, \
+                mock.patch.object(wlan_monitor, "neighbor_mac") as reread:
+            mon.refresh_gateway({self.GW: {"mac": self.MAC, "state": "STALE"}}, self.GW, "wlan0", 50.0)
+            poke.assert_called_once()
+            reread.assert_not_called()
+
+    def test_router_mac_not_seen_now_hides_the_login_and_drops_a_queued_one(self):
+        fritz, _ = self.probe(None, "FRITZ!Box 5690 Pro")
+        old_id = fritz.net_id
+        fritz.login("fritz1234", "pw", old_id)
+        fritz.set_network(self.GW, "", None, True, "wlan0")     # same address, router MAC unknown now
+        info, _ = fritz.snapshot()
+        self.assertFalse(info["available"])
+        self.assertIsNone(fritz.pending_login)
+        self.assertNotEqual(fritz.net_id, old_id)

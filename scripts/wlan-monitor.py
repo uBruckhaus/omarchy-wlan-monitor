@@ -707,13 +707,13 @@ def read_neighbors(iface):
     return parse_neighbors(out)
 
 
-def neighbor_mac(ip, iface):
+def neighbor_mac(ip, iface, timeout=1.5):
     """The MAC the kernel holds for `ip` on `iface` right now ("" if none): read again just before
     a login's password response is sent, so a router that took over the address in between gets
     nothing. Scoped to the interface: the same address on another network says nothing here."""
     if not IFACE_RE.match(iface or ""):
         return ""
-    out = run_cmd(["ip", "-4", "neigh", "show", "to", ip, "dev", iface])
+    out = run_cmd(["ip", "-4", "neigh", "show", "to", ip, "dev", iface], timeout=timeout)
     return parse_neighbors(out).get(ip, {}).get("mac", "")
 
 
@@ -1000,6 +1000,9 @@ VPN_HINTS = {
 }
 VPN_LINK_TYPES = {"65534", "512"}  # ARPHRD_NONE (tun, WireGuard), ARPHRD_PPP
 LAN_CHECK_EVERY = 30.0   # router check while a VPN lets the home network through
+GATEWAY_POKE_EVERY = 10.0  # at most this often: one empty datagram that renews the router's ARP entry
+GATEWAY_POKE_WAIT = (0.1, 0.1, 0.1)  # rereads of the router's MAC after a poke when it was missing
+GATEWAY_POKE_BUDGET = 0.6  # seconds the whole reread may take, `ip` included
 LAN_CHECK_BLOCKED = 8.0  # ... and while it blocks it, so a fix shows up quickly
 
 
@@ -1023,6 +1026,29 @@ def detect_vpn(active_iface, base="/sys/class/net"):
             label = label or "VPN"
             return {"iface": name, "name": label, "hint": VPN_HINTS.get(label, "Allow local network (LAN) access in your VPN settings.")}
     return None
+
+
+def poke_neighbor(ip, iface):
+    """One empty UDP datagram to `ip` (discard port 9), out of `iface` only: the kernel resolves or
+    confirms the router's MAC, so trust never lapses only because nothing else talked to the router
+    (all traffic in a VPN, say). Only a private address on a valid interface name; never raises."""
+    try:
+        if not ipaddress.IPv4Address(ip).is_private or not IFACE_RE.match(iface or ""):
+            return False
+    except ValueError:
+        return False
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    except OSError:
+        return False
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, SO_BINDTODEVICE, iface.encode())
+        sock.sendto(b"", (ip, 9))
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
 
 
 def gateway_reachable(ip, ports=(80, 53, 443), timeout=0.4):
@@ -1505,6 +1531,15 @@ def is_fritz_vendor(vendor):
     return bool(re.search(r"fritz|\bavm\b", vendor or "", re.I))
 
 
+def fritz_maker(vendor, trusted):
+    """What the router's maker says for FritzMesh: True a FRITZ!Box, None unknown (a MAC prefix the
+    database lacks, or a private one) on a trusted network, where the router's TR-064 description
+    is asked once to tell; False for everything else, which is never asked."""
+    if is_fritz_vendor(vendor):
+        return True
+    return None if trusted and vendor in ("", "Private MAC") else False
+
+
 def connect_bound(address, timeout, source_address, iface):
     """A TCP connection that leaves only through `iface` (SO_BINDTODEVICE, unprivileged since
     Linux 5.7). If the binding is refused, nothing is connected."""
@@ -1826,7 +1861,9 @@ class FritzMesh:
         self.lock = threading.Lock()
         self.wake = threading.Event()
         self.creds = load_fritz()
-        self.network = (None, "", False)  # (gateway ip, gateway mac, looks like a FRITZ!Box)
+        # (gateway ip, gateway mac, maker): True a FRITZ!Box by its maker, None maker unknown on a
+        # trusted network (its TR-064 description is asked once), False anything else.
+        self.network = (None, "", False)
         self.iface = ""  # the interface the gateway is reached through (all FRITZ!Box traffic is bound to it)
         self.panel_open = False
         self.model = ""
@@ -1912,7 +1949,7 @@ class FritzMesh:
         """The current gateway is a FRITZ!Box (its maker, or a model probed on this very gateway).
         Called with the lock held."""
         ip, mac, is_fritz = self.network
-        return bool(ip and mac and (is_fritz or (self.model and self.model_for == (ip, mac))))
+        return bool(ip and mac and (is_fritz is True or (self.model and self.model_for == (ip, mac))))
 
     def snapshot(self):
         with self.lock:
@@ -1972,7 +2009,7 @@ class FritzMesh:
             state = self.state
         if not ip or not mac or not iface:
             return 5.0
-        if is_fritz and self.model_for != (ip, mac):
+        if is_fritz is not False and self.model_for != (ip, mac):   # once per gateway
             model = fritz_model(ip, iface)
             with self.lock:
                 if self.generation == generation:  # probed while the network changed: kept for nobody
@@ -2080,7 +2117,31 @@ class Monitor:
         self.iface_cache = {}
         self.identity = None
         self.trust_identity = {"ssid": "", "gateway_mac": ""}
+        self.gateway_poked = -math.inf
         self.reset_network(None)
+
+    def refresh_gateway(self, neighbors, gateway_ip, iface, now):
+        """Trust needs the router's MAC from the kernel right now. Its entry ages out when nothing
+        talks to the router through this interface, so renew it (bounded, at most every
+        GATEWAY_POKE_EVERY seconds) and, when it was gone, read it again for a moment."""
+        entry = neighbors.get(gateway_ip)
+        if entry is not None and entry["state"] in ACTIVE_NEIGH_STATES:
+            return
+        if now - self.gateway_poked < GATEWAY_POKE_EVERY:
+            return
+        self.gateway_poked = now
+        if not poke_neighbor(gateway_ip, iface) or entry is not None:
+            return
+        deadline = time.monotonic() + GATEWAY_POKE_BUDGET
+        for pause in GATEWAY_POKE_WAIT:
+            time.sleep(pause)
+            left = deadline - time.monotonic()
+            if left <= 0.05:
+                return
+            mac = neighbor_mac(gateway_ip, iface, timeout=left)
+            if mac:
+                neighbors[gateway_ip] = {"mac": mac, "state": "REACHABLE"}
+                return
 
     def reset_network(self, identity):
         """Forget everything learned about the previous network."""
@@ -2295,6 +2356,8 @@ class Monitor:
         base = (iface, gateway_ip, str(subnet_net))
         base_changed = self.identity is None or self.identity["base"] != base
         neighbors = read_neighbors(iface)
+        if gateway_ip:
+            self.refresh_gateway(neighbors, gateway_ip, iface, now)
         wlan = self.wireless(iface, now, force=base_changed) if net["is_wireless"] else {}
         gateway_mac = neighbors.get(gateway_ip, {}).get("mac", "") if gateway_ip else ""
         identity = {"base": base, "ssid": wlan.get("ssid", ""), "gateway_mac": gateway_mac}
@@ -2330,9 +2393,11 @@ class Monitor:
             self.lan_check = (None, -math.inf, True)
         self.lan_recheck = False
 
-        gateway_vendor = lookup_vendor(self.identity["gateway_mac"])
-        self.fritz.set_network(None if lan_blocked else gateway_ip, self.identity["gateway_mac"],
-                               is_fritz_vendor(gateway_vendor), self.panel_open, iface)
+        # Only the router's MAC seen now: one remembered from before never keeps the login offered
+        # (or a typed login queued) on a network whose router cannot be told apart right now.
+        self.fritz.set_network(None if lan_blocked else gateway_ip, gateway_mac,
+                               fritz_maker(lookup_vendor(gateway_mac), trusted),
+                               self.panel_open, iface)
         fritz_info, mesh = self.fritz.snapshot()
         if lan_blocked:
             mesh = {}
