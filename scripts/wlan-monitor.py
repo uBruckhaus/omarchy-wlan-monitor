@@ -105,7 +105,7 @@ FRITZ_FILE = "fritzbox.json"
 FRITZ_LOCK_FILE = "fritzbox.lock"
 FRITZ_REV_FILE = "fritzbox-rev.json"
 FRITZ_LOCK_WAIT = 2.0
-FRITZ_REVOKE_RETRY = 30.0
+FRITZ_REVOKE_RETRY = 5.0
 FRITZ_USER_RE = re.compile(r"^[A-Za-z0-9._@-]{0,64}$")
 # The collector's id for the network it talks to right now: a random per-process part and a
 # counter that changes with every gateway change (stats.link.net_id, fritz_login "net").
@@ -1117,32 +1117,66 @@ def config_dir():
     return os.path.join(base, "ubruckhaus-wlan-monitor")
 
 
+def open_config_dir():
+    """(fd, missing): an open handle on the config directory when it is a real directory (not a
+    symlink), owned by us and not writable by group or others; else (None, True) when there is
+    none yet and (None, False) when it is refused. Every file in it is opened relative to it."""
+    try:
+        fd = os.open(config_dir(), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None, True
+    except OSError:
+        return None, False
+    try:
+        info = os.fstat(fd)
+        if stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() and not info.st_mode & 0o022:
+            return fd, False
+    except OSError:
+        pass
+    os.close(fd)
+    return None, False
+
+
 def private_config_dir():
-    """The config directory, created 0700 if missing; None unless it is a real directory of ours."""
+    """The config directory, created 0700 if missing (and made 0700 if it is ours but more open);
+    None unless it is a real directory of ours."""
     directory = config_dir()
     try:
         os.makedirs(directory, mode=0o700, exist_ok=True)
-        info = os.lstat(directory)
-        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
-            return None
-        if info.st_mode & 0o077:
-            os.chmod(directory, 0o700)
-        return directory
-    except OSError:
-        return None
-
-
-def load_private_json(filename, max_bytes=65536):
-    """Read a JSON file from the config directory; refuses symlinks, foreign or oversized files."""
-    path = os.path.join(config_dir(), filename)
-    try:
-        # O_NONBLOCK: a FIFO in its place is refused below instead of blocking the collector.
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     except OSError:
         return None
     try:
         info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_size > max_bytes:
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            return None
+        if info.st_mode & 0o077:
+            os.fchmod(fd, 0o700)
+        return directory
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def load_private_json(filename, max_bytes=65536, secret=False):
+    """Read a JSON file from the config directory (checked first, open_config_dir); refuses
+    symlinks, special, foreign or oversized files, files group or others may write, and for a
+    `secret` file (the FRITZ!Box password) any group or other access at all."""
+    dfd, _missing = open_config_dir()
+    if dfd is None:
+        return None
+    try:
+        # O_NONBLOCK: a FIFO in its place is refused below instead of blocking the collector.
+        fd = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dfd)
+    except OSError:
+        return None
+    finally:
+        os.close(dfd)
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_size > max_bytes
+                or info.st_mode & (0o077 if secret else 0o022)):
             return None
         chunks, size = [], 0
         while size <= max_bytes:
@@ -1302,10 +1336,15 @@ def store_time(value):
 
 def store_stamp():
     """What identifies the current devices.json (inode, size, mtime); None when there is none."""
+    dfd, _missing = open_config_dir()
+    if dfd is None:
+        return None
     try:
-        info = os.lstat(os.path.join(config_dir(), DEVICES_FILE))
+        info = os.stat(DEVICES_FILE, dir_fd=dfd, follow_symlinks=False)
     except OSError:
         return None
+    finally:
+        os.close(dfd)
     return (info.st_ino, info.st_size, info.st_mtime_ns)
 
 
@@ -1880,7 +1919,7 @@ def parse_mesh(data):
 def load_fritz():
     """The saved login, only while it was saved under the current revision: once any collector's
     Disconnect renewed the revision it is used nowhere, even if the file could not be deleted."""
-    data = load_private_json(FRITZ_FILE, 4096)
+    data = load_private_json(FRITZ_FILE, 4096, secret=True)
     if not isinstance(data, dict):
         return None
     mac, user, password, pin = (data.get(k) for k in ("gateway_mac", "user", "password", "pin"))
@@ -1895,12 +1934,17 @@ def load_fritz():
 
 def remove_fritz():
     """Delete the saved login; True once it is gone (or was never there)."""
+    dfd, missing = open_config_dir()
+    if dfd is None:
+        return missing
     try:
-        os.unlink(os.path.join(config_dir(), FRITZ_FILE))
+        os.unlink(FRITZ_FILE, dir_fd=dfd)
     except FileNotFoundError:
         return True
     except OSError:
         return False
+    finally:
+        os.close(dfd)
     return True
 
 
@@ -1911,10 +1955,15 @@ def private_file_lock(name, wait=None):
     the lock file is private, never followed through a symlink and never anything but a file."""
     fd = None
     try:
-        directory = private_config_dir()
-        if directory:
-            fd = os.open(os.path.join(directory, name),
-                         os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o600)
+        dfd = None
+        if private_config_dir():
+            dfd, _missing = open_config_dir()
+        if dfd is not None:
+            try:
+                fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o600,
+                             dir_fd=dfd)
+            finally:
+                os.close(dfd)
             info = os.fstat(fd)
             if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
                 raise PermissionError("not a private lock file")
@@ -1951,7 +2000,18 @@ def fritz_revision():
     rev = data.get("rev") if isinstance(data, dict) else None
     if isinstance(rev, str) and re.fullmatch(r"[0-9a-f]{32}", rev):
         return rev
-    return None if os.path.lexists(os.path.join(config_dir(), FRITZ_REV_FILE)) else ""
+    dfd, missing = open_config_dir()
+    if dfd is None:
+        return "" if missing else None
+    try:
+        os.stat(FRITZ_REV_FILE, dir_fd=dfd, follow_symlinks=False)
+        return None
+    except FileNotFoundError:
+        return ""
+    except OSError:
+        return None
+    finally:
+        os.close(dfd)
 
 
 def fritz_new_revision():
@@ -1961,13 +2021,15 @@ def fritz_new_revision():
 
 def fritz_revoke():
     """Disconnect for every collector: a new revision makes the saved login (saved with the old
-    one) unusable everywhere, and a login being saved in any collector checks it again after
-    saving. The file is then deleted unless it already holds a newer login. True once the new
+    one) unusable everywhere, and a login being saved in any collector (under the same lock)
+    sees it. The file is then deleted unless it already holds a newer login. True once the new
     revision is written; the deletion is only tidying up."""
-    if fritz_new_revision() is None:
-        return False
+    # Only under the lock that login()'s repair of an unreadable revision takes too, so neither
+    # can overwrite the other; without the lock the Disconnect stays pending and is retried.
     with fritz_file_lock() as held:
-        if held and load_fritz() is None:  # tidied only under the lock: a newer login is never hit
+        if not held or fritz_new_revision() is None:
+            return False
+        if load_fritz() is None:
             remove_fritz()
     return True
 
@@ -2248,7 +2310,7 @@ class FritzMesh:
                         return 5.0
                     saved = save_private_json(FRITZ_FILE, creds)
                     if saved and fritz_revision() != pending[5]:
-                        # A Disconnect that could not wait for the lock renewed it meanwhile: it wins.
+                        # Defensive (revisions change only under this lock): a newer revision wins.
                         remove_fritz()
                         self.state, self.message = "off", ""
                         self.message_code, self.message_args = "", []
@@ -2521,7 +2583,7 @@ class Monitor:
             net["since"] = now_wall
             changed = True
         added = {}  # mac -> record first seen in this scan (merged into the shared file below)
-        new_names = []
+        new_names = {}  # mac -> name of a device that is new on this network
         for dev in devices:
             mac = dev["mac"] if MAC_RE.match(dev.get("mac") or "") else ""
             rec = net["devices"].get(mac) if net and mac else None
@@ -2529,7 +2591,7 @@ class Monitor:
                 rec = store_device(net, mac, now_wall)
                 if now_wall - net["since"] > BASELINE_SECONDS:
                     rec["new"] = True
-                    new_names.append(dev["name"])
+                    new_names[mac] = dev["name"]
                 added[mac] = dict(rec)
                 changed = True
             dev["auto_name"] = dev["name"]
@@ -2540,19 +2602,26 @@ class Monitor:
             dev["hidden"] = bool(rec and rec["hidden"])
             dev["new"] = bool(rec and rec["new"])
             dev["can_edit"] = bool(mac and key)
+        alert = list(new_names.values())
         if changed:
             since = net["since"]
+            inserted = []
 
             def change(store):
                 fresh = store_network(store, key)
                 if fresh["since"] is None:
                     fresh["since"] = since
+                inserted.clear()
                 for mac, rec in added.items():
                     if mac not in fresh["devices"]:
                         store_device(fresh, mac, rec["first"]).update(rec)
-            self.update_store(change)
-        if new_names and self.store["alerts"]:
-            notify_new_devices(ssid, new_names, self.lang)
+                        inserted.append(mac)
+            if self.update_store(change):
+                # Written to the shared file: only devices this collector added there are announced,
+                # so another screen that saw the same device first does not announce it twice.
+                alert = [new_names[mac] for mac in inserted if mac in new_names]
+        if alert and self.store["alerts"]:
+            notify_new_devices(ssid, alert, self.lang)
         return tracking
 
     def domains(self):

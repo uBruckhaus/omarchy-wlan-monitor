@@ -258,6 +258,37 @@ class TrustTests(unittest.TestCase):
         self.assertFalse(wlan_monitor.save_trusted([{"ssid": "", "gateway_mac": "aa:bb:cc:dd:ee:ff"}]))
         self.assertEqual(os.listdir(other), [])
 
+    def test_refuses_files_others_may_change_and_a_symlinked_dir_for_reading(self):
+        nets = [{"ssid": "Home", "gateway_mac": "aa:bb:cc:dd:ee:ff"}]
+        self.assertTrue(wlan_monitor.save_trusted(nets))
+        directory = wlan_monitor.config_dir()
+        path = os.path.join(directory, wlan_monitor.TRUST_FILE)
+        os.chmod(path, 0o666)
+        self.assertEqual(wlan_monitor.load_trusted(), [])  # anyone could have added a network
+        os.chmod(path, 0o644)
+        self.assertEqual(wlan_monitor.load_trusted(), nets)  # readable by others is fine for this one
+        os.chmod(directory, 0o777)
+        self.assertEqual(wlan_monitor.load_trusted(), [])  # a directory others may change: nothing read
+        os.chmod(directory, 0o700)
+        # The FRITZ!Box login holds the password: any group or other access refuses it.
+        login = {"gateway_mac": "aa:bb:cc:dd:ee:ff", "user": "u", "password": "p", "pin": "c" * 64}
+        self.assertTrue(wlan_monitor.save_private_json(wlan_monitor.FRITZ_FILE, login))
+        self.assertEqual(wlan_monitor.load_fritz()["user"], "u")
+        os.chmod(os.path.join(directory, wlan_monitor.FRITZ_FILE), 0o640)
+        self.assertIsNone(wlan_monitor.load_fritz())
+        # A symlinked config directory is never read through, nor written.
+        os.rename(directory, directory + ".real")
+        os.symlink(directory + ".real", directory)
+        os.chmod(os.path.join(directory + ".real", wlan_monitor.FRITZ_FILE), 0o600)
+        self.assertEqual(wlan_monitor.load_trusted(), [])
+        self.assertIsNone(wlan_monitor.load_fritz())
+        self.assertIsNone(wlan_monitor.store_stamp())
+        self.assertIsNone(wlan_monitor.fritz_revision())  # unusable, never "no Disconnect yet"
+        self.assertFalse(wlan_monitor.remove_fritz())
+        with wlan_monitor.fritz_file_lock() as held:
+            self.assertFalse(held)
+        self.assertFalse(os.path.exists(os.path.join(directory + ".real", wlan_monitor.FRITZ_LOCK_FILE)))
+
     def test_ignores_malformed_entries(self):
         os.makedirs(wlan_monitor.config_dir())
         with open(os.path.join(wlan_monitor.config_dir(), wlan_monitor.TRUST_FILE), "w") as handle:
@@ -544,6 +575,21 @@ class StoreTests(unittest.TestCase):
         self.assertEqual((shown[0]["name"], shown[0]["pinned"], shown[1]["pinned"]), ("Stove", True, True))
         self.assertFalse(a.store["alerts"])
         self.assertEqual(a.store["view"]["mode"], "type")
+
+    def test_a_new_device_is_announced_by_one_screen_only(self):
+        a, b = self.monitor(), self.monitor()
+        with mock.patch.object(wlan_monitor.time, "time", return_value=1000.0):
+            a.apply_store([self.device("aa:bb:cc:dd:ee:02")], True, "Home")
+        later = 1000.0 + wlan_monitor.BASELINE_SECONDS + 1
+        with mock.patch.object(wlan_monitor.time, "time", return_value=later):
+            seen_a = [self.device("aa:bb:cc:dd:ee:03", "Stranger")]
+            seen_b = [self.device("aa:bb:cc:dd:ee:03", "Stranger")]
+            b.reload_store()
+            a.apply_store(seen_a, True, "Home")
+            with mock.patch.object(b, "reload_store"):  # B scanned before it saw A's write
+                b.apply_store(seen_b, True, "Home")
+        self.assertTrue(seen_a[0]["new"] and seen_b[0]["new"])
+        self.notified.assert_called_once_with("Home", ["Stranger"], "en")
 
     def test_store_change_without_the_lock_writes_nothing(self):
         mon = self.monitor()
@@ -1025,6 +1071,33 @@ class FritzTests(unittest.TestCase):
         first.login("fritz1234", "s3cret pass", first.net_id)
         self.assertRegex(first.pending_login[5], r"^[0-9a-f]{32}$")
         self.assertEqual(first.pending_login[5], wlan_monitor.fritz_revision())
+
+    def test_revision_repair_and_disconnect_never_overwrite_each_other(self):
+        """Screen A repairs an unreadable revision under the lock while screen B presses Disconnect:
+        B writes nothing without the lock, retries, and A's login is then not saved."""
+        first, second = self.login_pair()
+        first.pending_login = None
+        wlan_monitor.save_private_json(wlan_monitor.FRITZ_REV_FILE, {"rev": 1})
+        real_new = wlan_monitor.fritz_new_revision
+
+        def repair_while_b_disconnects():
+            with mock.patch.object(wlan_monitor, "FRITZ_LOCK_WAIT", 0.05):
+                second.logout()  # A holds the lock: B's Disconnect writes nothing yet
+            self.assertTrue(second.revoke_pending)
+            self.assertEqual(wlan_monitor.load_private_json(wlan_monitor.FRITZ_REV_FILE, 256), {"rev": 1})
+            return real_new()
+        with mock.patch.object(wlan_monitor, "fritz_new_revision", side_effect=repair_while_b_disconnects):
+            first.login("fritz1234", "s3cret pass", first.net_id)
+        repaired = first.pending_login[5]
+        self.assertEqual(wlan_monitor.fritz_revision(), repaired)
+        second.step()  # B's retry, now with the lock: a new revision
+        self.assertFalse(second.revoke_pending)
+        self.assertNotEqual(wlan_monitor.fritz_revision(), repaired)
+        with mock.patch.object(wlan_monitor, "bounded_http", side_effect=self.challenge_http([])), \
+                mock.patch.object(wlan_monitor, "neighbor_mac", return_value="1c:23:a2:92:2a:6c"):
+            first.step()
+        self.assertIsNone(wlan_monitor.load_fritz())
+        self.assertNotEqual(first.snapshot()[0]["state"], "connected")
 
     def test_lock_file_is_never_a_symlink_or_fifo(self):
         directory = wlan_monitor.private_config_dir()
