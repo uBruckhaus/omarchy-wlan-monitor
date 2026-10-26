@@ -105,6 +105,7 @@ FRITZ_FILE = "fritzbox.json"
 FRITZ_LOCK_FILE = "fritzbox.lock"
 FRITZ_REV_FILE = "fritzbox-rev.json"
 FRITZ_LOCK_WAIT = 2.0
+FRITZ_REVOKE_RETRY = 30.0
 FRITZ_USER_RE = re.compile(r"^[A-Za-z0-9._@-]{0,64}$")
 # The collector's id for the network it talks to right now: a random per-process part and a
 # counter that changes with every gateway change (stats.link.net_id, fritz_login "net").
@@ -123,6 +124,7 @@ FRITZ_MAX_MESH = 2 * 1048576
 FRITZ_MAX_NODES = 512
 MESH_PATH_RE = re.compile(r"^/meshlist\.lua\?sid=[0-9a-f]{16}$")
 TRUST_FILE = "trusted-networks.json"
+TRUST_LOCK_FILE = "trusted-networks.lock"
 MAX_TRUSTED = 64
 DEVICES_FILE = "devices.json"
 MAX_STORE_BYTES = 8 * 1024 * 1024  # holds the largest valid store (32 x 512 records, 40-char names)
@@ -1868,14 +1870,18 @@ def load_fritz():
 
 
 def remove_fritz():
+    """Delete the saved login; True once it is gone (or was never there)."""
     try:
         os.unlink(os.path.join(config_dir(), FRITZ_FILE))
+    except FileNotFoundError:
+        return True
     except OSError:
-        pass
+        return False
+    return True
 
 
 @contextlib.contextmanager
-def fritz_file_lock():
+def private_file_lock(name):
     """Exclusive lock shared by all collectors, held only for quick file work. Yields True while
     held and False if it could not be taken within FRITZ_LOCK_WAIT (callers then fail closed);
     the lock file is private, never followed through a symlink and never anything but a file."""
@@ -1883,7 +1889,7 @@ def fritz_file_lock():
     try:
         directory = private_config_dir()
         if directory:
-            fd = os.open(os.path.join(directory, FRITZ_LOCK_FILE),
+            fd = os.open(os.path.join(directory, name),
                          os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o600)
             info = os.fstat(fd)
             if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
@@ -1910,11 +1916,34 @@ def fritz_file_lock():
             os.close(fd)  # releases the lock
 
 
+def fritz_file_lock():
+    return private_file_lock(FRITZ_LOCK_FILE)
+
+
 def fritz_revision():
-    """The saved login's revision ("" before the first Disconnect); a new one on every Disconnect."""
+    """The saved login's revision: "" before the first Disconnect, a new one on every Disconnect,
+    None when the file is there but unreadable (never taken for any revision)."""
     data = load_private_json(FRITZ_REV_FILE, 256)
     rev = data.get("rev") if isinstance(data, dict) else None
-    return rev if isinstance(rev, str) and re.fullmatch(r"[0-9a-f]{32}", rev) else ""
+    if isinstance(rev, str) and re.fullmatch(r"[0-9a-f]{32}", rev):
+        return rev
+    return None if os.path.lexists(os.path.join(config_dir(), FRITZ_REV_FILE)) else ""
+
+
+def fritz_new_revision():
+    rev = secrets.token_hex(16)
+    return rev if save_private_json(FRITZ_REV_FILE, {"rev": rev}) else None
+
+
+def fritz_revoke():
+    """Disconnect for every collector. The revision is renewed first: a login being saved in any
+    collector checks it again after saving and deletes what it saved. Then the saved login is
+    deleted, under the shared lock when it can be taken (and once more after). True when both
+    the new revision and the deletion succeeded."""
+    renewed = fritz_new_revision() is not None
+    with fritz_file_lock():
+        gone = remove_fritz()
+    return remove_fritz() and gone and renewed
 
 
 class FritzMesh:
@@ -1939,6 +1968,7 @@ class FritzMesh:
         self.aps = []
         self.updated = 0.0
         self.pending_login = None
+        self.revoke_pending = False  # a Disconnect whose file work failed: retried, nothing used meanwhile
         self.generation = 0  # +1 on every gateway change or logout; work begun before it is dropped
         self.nonce = secrets.token_hex(6)
         self.net_seq = 0  # +1 on every gateway change only (net_id)
@@ -1987,9 +2017,18 @@ class FritzMesh:
         refused unless that is still the collector's current gateway, bound to that gateway's
         address and MAC, dropped when the network changes, and sent nowhere else (step)."""
         # The revision of the saved login now: if any collector disconnects before this login is
-        # saved, the revision changes and the login is dropped (step).
+        # saved, the revision changes and the login is dropped (step). An unreadable one is renewed.
         revision = fritz_revision()
+        if revision is None:
+            with fritz_file_lock():
+                revision = fritz_new_revision()
         with self.lock:
+            if self.revoke_pending or revision is None:
+                # The last Disconnect is not done yet (or the settings folder is unusable): no login.
+                self.pending_login = None
+                self.state, self.message = "error", "The login could not be stored in the settings folder."
+                self.message_code, self.message_args = "fzNotStored", []
+                return
             ip, mac, _is_fritz = self.network
             if (not ip or not mac or not net_id or net_id != f"{self.nonce}-{self.net_seq}"
                     or not self.looks_like_fritz()):
@@ -2009,11 +2048,26 @@ class FritzMesh:
             self.generation += 1
             self.clients, self.aps, self.updated = {}, [], 0.0
             self.state, self.message = "off", ""
-        # Every screen's collector: a new revision first, under the shared lock, so a login still in
-        # flight in any of them (it commits under the same lock) sees it and saves nothing.
-        with fritz_file_lock():
-            save_private_json(FRITZ_REV_FILE, {"rev": secrets.token_hex(16)})
-            remove_fritz()
+            self.message_code, self.message_args = "", []
+            self.revoke_pending = True
+        self.revoke()
+
+    def revoke(self):
+        """Finish a Disconnect (fritz_revoke); until it succeeds nothing saved is used and it is
+        retried (step)."""
+        done = fritz_revoke()
+        with self.lock:
+            if not self.revoke_pending:
+                return
+            self.creds = None
+            if done:
+                self.revoke_pending = False
+                self.state, self.message = "off", ""
+                self.message_code, self.message_args = "", []
+            else:
+                self.state = "error"
+                self.message = "The saved login could not be deleted yet. WLAN Monitor keeps trying and does not use it."
+                self.message_code, self.message_args = "fzNotDeleted", []
 
     def looks_like_fritz(self):
         """The current gateway is a FRITZ!Box (its maker, or a model probed on this very gateway).
@@ -2050,6 +2104,8 @@ class FritzMesh:
         path = match.group(1).replace("&amp;", "&") if match else ""
         if not MESH_PATH_RE.match(path):
             raise FritzError("fzNoMesh", "The FRITZ!Box sent no mesh list.")
+        if still_ok is not None and not still_ok():
+            raise FritzError("fzNetworkChanged", "The network changed before the login was sent.")
         try:
             status, _, body, _ = bounded_http(ip, FRITZ_TLS_PORT, "GET", path, tls=True, pin=creds["pin"],
                                               max_body=FRITZ_MAX_MESH, iface=iface)
@@ -2068,6 +2124,13 @@ class FritzMesh:
 
     def step(self):
         """One unit of work; returns seconds until the next one is due."""
+        with self.lock:
+            revoke = self.revoke_pending
+        if revoke:
+            self.revoke()
+            with self.lock:
+                if self.revoke_pending:
+                    return FRITZ_REVOKE_RETRY
         with self.lock:
             ip, mac, is_fritz = self.network
             iface = self.iface
@@ -2096,7 +2159,9 @@ class FritzMesh:
             # was typed for (same generation, and the kernel still has its MAC at this address),
             # checked once more right before it is sent.
             def still_ok():
-                return self.current(ip, mac, generation) and neighbor_mac(ip, iface) == mac
+                # ...and while no collector disconnected since the login was queued.
+                return (self.current(ip, mac, generation) and neighbor_mac(ip, iface) == mac
+                        and fritz_revision() == pending[5])
             try:
                 if not still_ok():
                     raise FritzError("fzNetworkChanged", "The network changed before the login was sent.")
@@ -2106,8 +2171,13 @@ class FritzMesh:
                 creds = {"gateway_mac": mac, "user": pending[0], "password": pending[1], "pin": cert}
                 clients, aps = self.refresh(ip, creds, still_ok, iface)
             except FritzError as exc:
+                revoked = fritz_revision() != pending[5]
                 with self.lock:
-                    if self.generation == generation or exc.code == "fzNetworkChanged":
+                    if revoked:  # Disconnect on another screen meanwhile: it stays disconnected
+                        if self.generation == generation:
+                            self.state, self.message = "off", ""
+                            self.message_code, self.message_args = "", []
+                    elif self.generation == generation or exc.code == "fzNetworkChanged":
                         self.state, self.message = "error", str(exc)
                         self.message_code, self.message_args = exc.code, exc.args_
                 return 5.0
@@ -2118,9 +2188,9 @@ class FritzMesh:
                         self.message_code, self.message_args = "fzNoAnswer", []
                 return 5.0
             # Saved under the lock every collector's Disconnect takes, and only while no Disconnect
-            # happened anywhere since the login was queued (same revision).
+            # happened anywhere since the login was queued (same revision, before and after saving).
             with fritz_file_lock() as held:
-                unchanged = held and fritz_revision() == pending[5]
+                unchanged = held and pending[5] is not None and fritz_revision() == pending[5]
                 with self.lock:
                     if self.network[:2] != (ip, mac) or self.generation != generation:
                         # Changed while the login was in flight: nothing from it is kept or saved.
@@ -2132,7 +2202,17 @@ class FritzMesh:
                         self.state, self.message = "off", ""
                         self.message_code, self.message_args = "", []
                         return 5.0
-                    save_private_json(FRITZ_FILE, creds)
+                    saved = save_private_json(FRITZ_FILE, creds)
+                    if saved and fritz_revision() != pending[5]:
+                        # A Disconnect that could not wait for the lock renewed it meanwhile: it wins.
+                        remove_fritz()
+                        self.state, self.message = "off", ""
+                        self.message_code, self.message_args = "", []
+                        return 5.0
+                    if not saved:
+                        self.state, self.message = "error", "The login could not be stored in the settings folder."
+                        self.message_code, self.message_args = "fzNotStored", []
+                        return 5.0
                     self.creds = creds
                     self.clients, self.aps, self.updated = clients, aps, time.time()
                     self.state, self.message = "connected", ""
@@ -2157,16 +2237,23 @@ class FritzMesh:
         due = interval if state != "error" else FRITZ_RETRY_ERROR
         if age < due:
             return min(5.0, due - age)
+        def still_saved():
+            # A gateway change or a Disconnect on any screen in between stops the request before
+            # the password-derived response (or the mesh list request) is sent.
+            return self.current(ip, mac, generation) and load_fritz() == creds
         try:
-            # Saved credentials go only to the pinned certificate; a gateway change in between
-            # still stops the request before the response is sent.
-            clients, aps = self.refresh(ip, creds, lambda: self.current(ip, mac, generation), iface)
+            # Saved credentials go only to the pinned certificate.
+            clients, aps = self.refresh(ip, creds, still_saved, iface)
         except FritzError as exc:
+            if load_fritz() != creds:
+                return 5.0  # disconnected or replaced elsewhere: followed on the next step
             with self.lock:
                 if self.generation == generation:
                     self.state, self.message, self.updated = "error", str(exc), time.time()
                     self.message_code, self.message_args = exc.code, exc.args_
             return 5.0
+        if load_fritz() != creds:
+            return 5.0  # disconnected elsewhere while it was read: never shown
         with self.lock:
             if self.generation != generation:
                 return 5.0  # the old gateway's mesh list is never shown for the new one
@@ -2189,6 +2276,7 @@ class Monitor:
     def __init__(self):
         self.lang = "en"  # set by the bar widget ("lang" command); used for notifications
         self.trusted = load_trusted()
+        self.untrusted_here = set()  # untrusted here while the shared list could not be saved
         self.store = load_store()
         self.fritz = FritzMesh()
         self.panel_open = False
@@ -2282,17 +2370,27 @@ class Monitor:
             ident = dict(self.trust_identity)
             if not ident.get("gateway_mac"):
                 return False
-            self.trusted = [
-                entry for entry in self.trusted
-                if not (entry["gateway_mac"] == ident["gateway_mac"] and entry["ssid"] == ident["ssid"])
-            ]
-            if command == "trust":
-                self.trusted.insert(0, ident)
-                self.last_full_scan = -math.inf
-            self.trusted = self.trusted[:MAX_TRUSTED]
-            save_trusted(self.trusted)
+            key = (ident["gateway_mac"], ident["ssid"])
+            # Read, changed and written under the lock all collectors share: one screen's change
+            # never undoes another's, and every collector reloads the list before it scans.
+            with private_file_lock(TRUST_LOCK_FILE):
+                networks = [entry for entry in load_trusted() if (entry["gateway_mac"], entry["ssid"]) != key]
+                if command == "trust":
+                    networks.insert(0, {"ssid": ident["ssid"], "gateway_mac": ident["gateway_mac"]})
+                    self.last_full_scan = -math.inf
+                saved = save_trusted(networks)
+            if command == "untrust" and not saved:
+                self.untrusted_here.add(key)  # never scanned actively here, whatever the file says
+            elif command == "trust":
+                self.untrusted_here.discard(key)
+            self.trusted = self.shared_trusted()
             return True
         return False
+
+    def shared_trusted(self):
+        """The trusted list as all collectors share it now (Untrust on another screen counts here)."""
+        return [entry for entry in load_trusted()
+                if (entry["gateway_mac"], entry["ssid"]) not in self.untrusted_here]
 
     def handle_device(self, command):
         """Rename, pin, hide or acknowledge one device on the current network, or toggle alerts."""
@@ -2454,6 +2552,7 @@ class Monitor:
         # Trust needs the router seen now (and the SSID on Wi-Fi), not values kept from before:
         # an unknown gateway on the same address and subnet never inherits a trusted network.
         evidence = bool(identity["gateway_mac"]) and (bool(identity["ssid"]) or not net["is_wireless"])
+        self.trusted = self.shared_trusted()
         trusted = evidence and is_trusted(self.trust_identity, self.trusted)
 
         # A VPN that blocks the home network makes every device look idle: say so instead.
