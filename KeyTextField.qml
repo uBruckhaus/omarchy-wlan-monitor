@@ -34,6 +34,8 @@ FocusScope {
   property real verticalPadding: Style.spacing.inputPaddingY
   property bool hasCursor: false
   property bool allSelected: false
+  // Corner radius of the frame; panels with a Corners setting pass its control size.
+  property real radius: Style.cornerRadius
   property font font: Qt.font({family: Style.font.family, pixelSize: Style.font.body})
   readonly property bool hovered: hover.hovered
 
@@ -99,7 +101,7 @@ FocusScope {
     anchors.fill: parent
     color: Style.controlFill(root._focused, root._hot, root.foreground, root.accent)
     borderSpec: root._borderSpec
-    radius: Style.cornerRadius
+    radius: root.radius
   }
 
   TextMetrics { id: metrics; font: root.font; text: "Ag" }
