@@ -2139,7 +2139,10 @@ Panel {
                     fontFamily: root.font
                     options: root.viewOptions
                     value: root.viewMode
-                    onChanged: function(value) { root.setViewMode(value) }
+                    onChanged: function(value) {
+                      root.setViewMode(value)
+                      devicesViewDrop.value = Qt.binding(function() { return root.viewMode })   // picking cut the binding
+                    }
                   }
                   Row {
                     id: listFoldButtons
@@ -2348,7 +2351,10 @@ Panel {
                     fontFamily: root.font
                     options: root.viewOptions
                     value: root.viewMode
-                    onChanged: function(value) { root.setViewMode(value) }
+                    onChanged: function(value) {
+                      root.setViewMode(value)
+                      mapViewDrop.value = Qt.binding(function() { return root.viewMode })   // picking cut the binding
+                    }
                   }
                   Row {
                     id: mapFoldButtons
