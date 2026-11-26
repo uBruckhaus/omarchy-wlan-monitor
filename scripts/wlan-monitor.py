@@ -35,10 +35,12 @@ import contextlib
 import fcntl
 import hashlib
 import http.client
+import importlib.util
 import ipaddress
 import json
 import math
 import os
+from pathlib import Path
 import pty
 import random
 import re
@@ -54,6 +56,27 @@ import sys
 import threading
 import time
 import urllib.parse
+
+
+def _load_sibling_module(mod_name, filename):
+    """Load a sibling .py module via importlib (works even under `python3 -I`)."""
+    path = Path(__file__).resolve().parent / filename
+    if not path.is_file():
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location(mod_name, str(path))
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception as exc:
+        print(f"wlan-monitor: failed to load {filename}: {exc}", file=sys.stderr, flush=True)
+        return None
+
+
+net_monitor_mod = _load_sibling_module("net_monitor", "net_monitor.py")
+wifi_setup_mod = _load_sibling_module("wifi_setup", "wifi_setup.py")
 
 
 def env_float(name, default, minimum):
@@ -91,10 +114,16 @@ DEFAULT_DOMAINS = ("home.arpa", "fritz.box", "speedport.ip", "localdomain", "loc
 WEB_SERVICE_TYPES = {"_http._tcp": "http", "_https._tcp": "https"}
 ADMIN_URL_SERVICE_TYPES = {"_ipp._tcp", "_ipps._tcp", "_printer._tcp", "_pdl-datastream._tcp", "_uscan._tcp"}
 COMMANDS = {"rescan", "open", "closed", "trust", "untrust", "known_all", "fritz_logout", "fritz_open"}
-JSON_COMMANDS = {"rename", "pin", "hide", "known", "alerts", "view", "fritz_login", "lang"}
+JSON_COMMANDS = {
+    "rename", "pin", "hide", "known", "alerts", "view", "fritz_login", "lang",
+    "netmon", "wifi_scan", "wifi_radio", "wifi_connect", "wifi_disconnect", "wifi_forget",
+    "conn_up", "conn_down",
+}
+WIFI_UUID_RE = re.compile(r"^[0-9a-fA-F-]{8,64}$")
+WIFI_STATUS_TTL = 10.0
 # Interface languages the panel offers; the language arrives from the bar widget ("lang" command).
 LANGS = ("en", "de", "fr", "es", "it", "pt", "nl", "pl")
-MAX_COMMAND_BYTES = 1024
+MAX_COMMAND_BYTES = 2048
 VIEW_MODES = ("list", "platform", "type", "band", "ap")
 GROUP_ID_RE = re.compile(r"^([a-z]{2,12}|([0-9a-f]{2}:){5}[0-9a-f]{2})$")
 MAX_COLLAPSED = 32
@@ -1365,6 +1394,47 @@ def parse_command(line):
         if not isinstance(net, str) or (net and not NET_ID_RE.match(net)):
             return ""
         return {"cmd": cmd, "user": user, "password": password, "net": net}
+    if cmd == "netmon":
+        on = data.get("on")
+        resolve = data.get("resolve", False)
+        if not isinstance(on, bool) or not isinstance(resolve, bool):
+            return ""
+        return {"cmd": cmd, "on": on, "resolve": resolve}
+    if cmd == "wifi_scan":
+        rescan = data.get("rescan", False)
+        if not isinstance(rescan, bool):
+            return ""
+        return {"cmd": cmd, "rescan": rescan}
+    if cmd == "wifi_radio":
+        on = data.get("on")
+        if not isinstance(on, bool):
+            return ""
+        return {"cmd": cmd, "on": on}
+    if cmd == "wifi_connect":
+        ssid = data.get("ssid", "")
+        uuid = data.get("uuid")
+        password = data.get("password")
+        if not isinstance(ssid, str) or len(ssid.encode("utf-8")) > 32 or "\n" in ssid or "\r" in ssid:
+            return ""
+        if ssid and (ssid.startswith("-") or not ssid.isprintable()):
+            return ""
+        if uuid is not None:
+            if not isinstance(uuid, str):
+                return ""
+            uuid = uuid.strip()
+            if uuid and not WIFI_UUID_RE.match(uuid):
+                return ""
+        if password is not None:
+            if not isinstance(password, str) or len(password.encode("utf-8")) > 128 or "\n" in password or "\r" in password:
+                return ""
+        if not ssid.strip() and not uuid:
+            return ""
+        return {"cmd": cmd, "ssid": ssid, "uuid": uuid or None, "password": password}
+    if cmd in ("wifi_disconnect", "wifi_forget", "conn_up", "conn_down"):
+        uuid = data.get("uuid")
+        if not isinstance(uuid, str) or not WIFI_UUID_RE.match(uuid.strip()):
+            return ""
+        return {"cmd": cmd, "uuid": uuid.strip()}
     mac = data.get("mac")
     if not isinstance(mac, str) or not MAC_RE.match(mac):
         return ""
@@ -2709,6 +2779,14 @@ class Monitor:
         self.identity = None
         self.trust_identity = {"ssid": "", "gateway_mac": ""}
         self.gateway_poked = -math.inf
+        self.net_monitor = net_monitor_mod.NetMonitor() if net_monitor_mod is not None else None
+        self.netmon_enabled = False
+        self.netmon_resolve = False
+        self._wifi_status_cache = (None, -math.inf)
+        self._wifi_worker_lock = threading.Lock()
+        self._wifi_scan_lock = threading.Lock()
+        self._wifi_scan_running = False
+        self._emit_fn = emit
         self.reset_network(None)
 
     # -- the one FRITZ!Box collector --
@@ -2926,12 +3004,126 @@ class Monitor:
         self.iw_time = -math.inf
         self.traffic_prev = None
 
+    def _wifi_radio_status(self, force=False):
+        """Fast cached NetworkManager / Wi-Fi device / radio status for every snapshot."""
+        now = time.monotonic()
+        cached, cached_at = self._wifi_status_cache
+        if not force and cached is not None and (now - cached_at) < WIFI_STATUS_TTL:
+            return dict(cached)
+        if wifi_setup_mod is None:
+            status = {"nm_available": False, "wifi_device": False, "wifi_on": False}
+        else:
+            nm_ok = wifi_setup_mod.nm_available()
+            has_dev = wifi_setup_mod.has_wifi_device()
+            radio = wifi_setup_mod.get_wifi_radio(timeout=0.8) if (nm_ok and has_dev) else False
+            if radio is None and cached is not None:
+                radio = cached.get("wifi_on", False)
+            status = {
+                "nm_available": bool(nm_ok),
+                "wifi_device": bool(has_dev),
+                "wifi_on": bool(radio),
+            }
+        self._wifi_status_cache = (status, now)
+        return dict(status)
+
+    def _run_wifi_command(self, command):
+        """Execute a Wi-Fi / NetworkManager command synchronously (called inside worker thread)."""
+        emit_fn = self._emit_fn or emit
+        cmd = command["cmd"]
+        try:
+            with self._wifi_worker_lock:
+                if wifi_setup_mod is None:
+                    if cmd != "wifi_scan":
+                        emit_fn({"event": "wifi_result", "ok": False, "action": cmd, "message": "Wi-Fi setup module unavailable."})
+                    emit_fn({
+                        "event": "wifi_state",
+                        "nm_available": False,
+                        "wifi_device": False,
+                        "wifi_on": False,
+                        "active_ssid": "",
+                        "dns": [],
+                        "known": [],
+                        "visible": [],
+                        "wired": [],
+                        "wired_devices": [],
+                        "vpn": [],
+                        "error": "Wi-Fi setup module unavailable.",
+                    })
+                    return
+                if cmd == "wifi_scan":
+                    state = wifi_setup_mod.get_wifi_state(rescan=command.get("rescan", False))
+                    self._wifi_status_cache = (
+                        {
+                            "nm_available": bool(state.get("nm_available")),
+                            "wifi_device": bool(state.get("wifi_device")),
+                            "wifi_on": bool(state.get("wifi_on")),
+                        },
+                        time.monotonic(),
+                    )
+                    emit_fn(dict(state, event="wifi_state"))
+                    return
+
+                if cmd == "wifi_radio":
+                    res = wifi_setup_mod.set_wifi_radio(command["on"])
+                elif cmd == "wifi_connect":
+                    res = wifi_setup_mod.wifi_connect(
+                        ssid=command.get("ssid", ""),
+                        password=command.get("password"),
+                        uuid=command.get("uuid"),
+                    )
+                elif cmd == "wifi_disconnect":
+                    res = wifi_setup_mod.wifi_disconnect(command["uuid"])
+                elif cmd == "wifi_forget":
+                    res = wifi_setup_mod.wifi_forget(command["uuid"])
+                elif cmd == "conn_up":
+                    res = wifi_setup_mod.connection_up(command["uuid"])
+                elif cmd == "conn_down":
+                    res = wifi_setup_mod.connection_down(command["uuid"])
+                else:
+                    return
+
+                emit_fn(dict(res, event="wifi_result"))
+                state = wifi_setup_mod.get_wifi_state(rescan=False)
+                self._wifi_status_cache = (
+                    {
+                        "nm_available": bool(state.get("nm_available")),
+                        "wifi_device": bool(state.get("wifi_device")),
+                        "wifi_on": bool(state.get("wifi_on")),
+                    },
+                    time.monotonic(),
+                )
+                emit_fn(dict(state, event="wifi_state"))
+        finally:
+            if cmd == "wifi_scan":
+                with self._wifi_scan_lock:
+                    self._wifi_scan_running = False
+
+    def _spawn_wifi_command(self, command):
+        if command["cmd"] == "wifi_scan":
+            with self._wifi_scan_lock:
+                if self._wifi_scan_running:
+                    return None
+                self._wifi_scan_running = True
+        t = threading.Thread(target=self._run_wifi_command, args=(command,), daemon=True)
+        t.start()
+        return t
+
     # -- commands from the bar widget --
     def handle(self, command):
         """Apply a stdin command; returns True when a fresh snapshot should be sent right away."""
         if isinstance(command, dict):
             if command["cmd"] == "lang":
                 self.lang = command["lang"]
+                return False
+            if command["cmd"] == "netmon":
+                self.netmon_enabled = bool(command["on"])
+                self.netmon_resolve = bool(command.get("resolve", False))
+                return self.netmon_enabled
+            if command["cmd"] in (
+                "wifi_scan", "wifi_radio", "wifi_connect", "wifi_disconnect",
+                "wifi_forget", "conn_up", "conn_down",
+            ):
+                self._spawn_wifi_command(command)
                 return False
             if command["cmd"] == "view":
                 view = {"mode": command["mode"], "collapsed": list(command["collapsed"])}
@@ -3178,13 +3370,14 @@ class Monitor:
         self.force_next = False
 
         net = detect_interface(self.iface_cache)
+        wstatus = self._wifi_radio_status()
         if not net:
             # Disconnected: forget the network (and its FRITZ!Box) so nothing of it carries over.
             if self.identity is not None:
                 self.reset_network(None)
                 self.trust_identity = {"ssid": "", "gateway_mac": ""}
             self.fritz_view(None, "", False, "")
-            return {
+            snap = {
                 "time": int(time.time()),
                 "active": False,
                 "scanning": False,
@@ -3194,7 +3387,13 @@ class Monitor:
                 "devices_rev": "",
                 "online_count": 0,
                 "total_count": 0,
+                "nm_available": wstatus["nm_available"],
+                "wifi_device": wstatus["wifi_device"],
+                "wifi_on": wstatus["wifi_on"],
             }
+            if self.netmon_enabled and self.net_monitor is not None:
+                snap["netmon"] = self.net_monitor.collect(resolve=self.netmon_resolve)
+            return snap
 
         iface = net["iface"]
         local_ip = net["ip"]
@@ -3479,7 +3678,7 @@ class Monitor:
         online_count = sum(1 for d in devices if d["online"])
         idle_count = sum(1 for d in devices if d["state"] == "idle")
 
-        return {
+        snap = {
             "time": int(time.time()),
             "active": True,
             "scanning": False,
@@ -3528,11 +3727,22 @@ class Monitor:
             "view": self.store["view"],
             "fritz": fritz_info,
             "mesh_active": bool(mesh),
+            "nm_available": wstatus["nm_available"],
+            "wifi_device": wstatus["wifi_device"],
+            "wifi_on": wstatus["wifi_on"],
         }
+        if self.netmon_enabled and self.net_monitor is not None:
+            snap["netmon"] = self.net_monitor.collect(resolve=self.netmon_resolve)
+        return snap
+
+
+_EMIT_LOCK = threading.Lock()
 
 
 def emit(obj):
-    print(json.dumps(obj), flush=True)
+    line = json.dumps(obj)
+    with _EMIT_LOCK:
+        print(line, flush=True)
 
 
 def handle_line(monitor, line):

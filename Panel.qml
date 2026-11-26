@@ -22,13 +22,20 @@ Panel {
   property var hostWidget: null
   readonly property var barIdentity: hostWidget || root
   property var stats: ({})  // pushed by BarWidget on every snapshot
+  property var wifiState: ({})  // pushed by BarWidget on wifi_state events
   readonly property var link: stats.link || ({})
   readonly property var traffic: stats.traffic || ({})
   // Only replace the device list when its content changed, so rows are not rebuilt every
   // tick, and never while a name is being edited (a rebuild would drop the text field).
   property var devices: []
   property string devicesRev: ""
-  onStatsChanged: { refreshDevices(); dropFormOfOtherNetwork() }
+  onStatsChanged: {
+    refreshDevices()
+    dropFormOfOtherNetwork()
+    if (!root.netmonPaused && root.stats && root.stats.netmon && typeof root.stats.netmon === "object") {
+      root.netmon = root.stats.netmon
+    }
+  }
   function refreshDevices() {
     if (root.editingKey !== "") return
     var rev = String(stats.devices_rev || "")
@@ -78,9 +85,387 @@ Panel {
   readonly property string vpnHint: root.vpnCommand ? root.t("allowWith", [root.vpnCommand]) : root.t("vpnHintGeneric")
   property bool vpnCopied: false
   Timer { id: vpnCopiedTimer; interval: 1600; onTriggered: root.vpnCopied = false }
-  // Second page: network map. Remembered like the group states ("mappage" in the saved list).
-  readonly property bool mapPage: (root.view.collapsed || []).indexOf("mappage") !== -1
-  function showPage(map) { if (root.mapPage !== map) root.toggleGroup("mappage") }
+  // Main view pages: "devices", "map", "monitor", "setup".
+  property string activePage: "devices"
+  readonly property bool mapPage: activePage === "map"
+  function setPage(pageName) {
+    if (pageName !== "setup" && root.wifiFormOpen) root.closeWifiForm()
+    if (root.activePage !== pageName) root.activePage = pageName
+    root.syncNetmonMode()
+    if (pageName === "setup" && root.hostWidget && typeof root.hostWidget.wifiScan === "function") {
+      root.wifiScanning = true
+      wifiBusySafetyTimer.restart()
+      root.hostWidget.wifiScan(false)
+    }
+  }
+  function showPage(map) { root.setPage(map ? "map" : "devices") }
+
+  // --- Network Monitor state ------------------------------------------------
+  property var netmon: ({})
+  property string netmonView: "connections"  // "connections", "byapp", "interfaces"
+  property string netmonSearchText: ""
+  property string netmonProto: "all"         // "all", "tcp", "udp"
+  property string netmonScope: "all"         // "all", "active", "listening", "external", "lan", "loopback"
+  property string netmonSort: "traffic"      // "traffic", "process", "state", "remote", "port"
+  property bool netmonPaused: false
+  property bool netmonResolve: false
+  property string netmonExpandedKey: ""
+  property string netmonCopiedKey: ""
+  property bool netmonTableCopied: false
+  Timer { id: netmonCopiedTimer; interval: 1500; onTriggered: root.netmonCopiedKey = "" }
+  Timer { id: netmonTableCopiedTimer; interval: 1600; onTriggered: root.netmonTableCopied = false }
+
+  function syncNetmonMode() {
+    if (!root.hostWidget || typeof root.hostWidget.setNetmonMode !== "function") return
+    var on = root.opened && !root.settingsOpen && !root.infoPageOpen && root.activePage === "monitor" && !root.netmonPaused
+    root.hostWidget.setNetmonMode(on, on && root.netmonResolve)
+  }
+  onOpenedChanged: syncNetmonMode()
+  onSettingsOpenChanged: syncNetmonMode()
+  onInfoPageOpenChanged: syncNetmonMode()
+  onActivePageChanged: syncNetmonMode()
+  onNetmonPausedChanged: syncNetmonMode()
+  onNetmonResolveChanged: syncNetmonMode()
+
+  readonly property bool netmonHasData: root.netmon && typeof root.netmon === "object" && root.netmon.summary !== undefined
+  readonly property var netmonSummary: (root.netmon && root.netmon.summary) || ({})
+  readonly property bool netmonIsFiltered: root.netmonSearchText.trim() !== "" || root.netmonProto !== "all" || root.netmonScope !== "all"
+  function clearNetmonFilters() {
+    netmonSearchField.clear()
+    root.netmonSearchText = ""
+    root.netmonProto = "all"
+    root.netmonScope = "all"
+  }
+  function nextNetmonSort() {
+    var order = ["traffic", "process", "state", "remote", "port"]
+    var idx = order.indexOf(root.netmonSort)
+    root.netmonSort = order[(idx + 1) % order.length]
+  }
+  function netmonSortLabel(mode) {
+    if (mode === "process") return root.t("sortApp")
+    if (mode === "state") return root.t("sortState")
+    if (mode === "remote") return root.t("sortRemote")
+    if (mode === "port") return root.t("sortPort")
+    return root.t("sortTraffic")
+  }
+  function connProto(c) { return String((c && (c.proto || c.protocol)) || "") }
+  function connId(c) {
+    if (!c) return ""
+    if (c.id) return String(c.id)
+    return connProto(c) + ":" + String(c.local_ip || "") + ":" + Number(c.local_port || 0)
+      + "->" + String(c.remote_ip || "") + ":" + Number(c.remote_port || 0)
+  }
+  function preferredRemote(c) {
+    if (!c) return ""
+    var host = String(c.remote_host || "")
+    return host !== "" ? host : String(c.remote_ip || "")
+  }
+  function effectivePort(c) {
+    var rp = Number((c && c.remote_port) || 0)
+    return rp > 0 ? rp : Number((c && c.local_port) || 0)
+  }
+  function connStateRank(st) {
+    if (st === "ESTABLISHED") return 0
+    if (st === "LISTEN") return 1
+    if (st === "SYN_SENT" || st === "SYN_RECV") return 2
+    if (st === "CLOSE_WAIT") return 3
+    if (st === "TIME_WAIT") return 4
+    if (st === "UNCONN") return 5
+    return 6
+  }
+  readonly property var filteredConnections: {
+    var all = (root.netmon && root.netmon.connections) || []
+    var q = root.netmonSearchText.trim().toLowerCase()
+    var protoF = root.netmonProto
+    var scopeF = root.netmonScope
+    var out = all.filter(function(c) {
+      var proto = root.connProto(c)
+      if (protoF === "tcp" && proto.indexOf("tcp") !== 0) return false
+      if (protoF === "udp" && proto.indexOf("udp") !== 0) return false
+      var st = String(c.state || "")
+      var sc = String(c.scope || "")
+      if (scopeF === "active" && st !== "ESTABLISHED" && st !== "SYN_SENT" && st !== "SYN_RECV" && st !== "UNCONN") return false
+      if (scopeF === "listening" && st !== "LISTEN") return false
+      if (scopeF === "external" && sc !== "external") return false
+      if (scopeF === "lan" && sc !== "lan") return false
+      if (scopeF === "loopback" && sc !== "loopback") return false
+      if (q !== "") {
+        var hay = [c.process, c.cmdline, c.remote_ip, c.remote_host, c.remote_port, c.local_ip, c.local_port, c.service, c.pid, st]
+          .join(" ").toLowerCase()
+        if (hay.indexOf(q) === -1) return false
+      }
+      return true
+    })
+    var sortMode = root.netmonSort
+    out.sort(function(a, b) {
+      if (sortMode === "process") {
+        var pa = String(a.process || "").toLowerCase(), pb = String(b.process || "").toLowerCase()
+        if (pa !== pb) return pa < pb ? -1 : 1
+        return Number(a.remote_port || 0) - Number(b.remote_port || 0)
+      }
+      if (sortMode === "state") {
+        var sa = root.connStateRank(String(a.state || "")), sb = root.connStateRank(String(b.state || ""))
+        if (sa !== sb) return sa - sb
+        var na = String(a.process || ""), nb = String(b.process || "")
+        return na < nb ? -1 : (na > nb ? 1 : 0)
+      }
+      if (sortMode === "remote") {
+        var ha = root.preferredRemote(a).toLowerCase(), hb = root.preferredRemote(b).toLowerCase()
+        if (ha !== hb) return ha < hb ? -1 : 1
+        return Number(a.remote_port || 0) - Number(b.remote_port || 0)
+      }
+      if (sortMode === "port") {
+        var epa = root.effectivePort(a), epb = root.effectivePort(b)
+        if (epa !== epb) return epa - epb
+        var qa = String(a.process || ""), qb = String(b.process || "")
+        return qa < qb ? -1 : (qa > qb ? 1 : 0)
+      }
+      var ra = Number(a.rx_rate || 0) + Number(a.tx_rate || 0)
+      var rb = Number(b.rx_rate || 0) + Number(b.tx_rate || 0)
+      if (rb !== ra) return rb - ra
+      var ba = Number(a.rx_bytes || 0) + Number(a.tx_bytes || 0)
+      var bb = Number(b.rx_bytes || 0) + Number(b.tx_bytes || 0)
+      if (bb !== ba) return bb - ba
+      var xa = String(a.process || ""), xb = String(b.process || "")
+      return xa < xb ? -1 : (xa > xb ? 1 : 0)
+    })
+    return out
+  }
+  readonly property var filteredProcesses: {
+    var all = (root.netmon && root.netmon.processes) || []
+    var q = root.netmonSearchText.trim().toLowerCase()
+    if (q === "") return all
+    return all.filter(function(p) { return String(p.name || "").toLowerCase().indexOf(q) !== -1 })
+  }
+  readonly property var sparklineBars: {
+    var hist = (root.netmon && root.netmon.history) || []
+    var slice = hist.slice(-30)
+    var pts = []
+    for (var pad = slice.length; pad < 30; pad++) pts.push({ rx: 0, tx: 0 })
+    for (var i = 0; i < slice.length; i++) {
+      pts.push({ rx: Number(slice[i].rx_rate || 0), tx: Number(slice[i].tx_rate || 0) })
+    }
+    var maxRate = 1024
+    for (var j = 0; j < pts.length; j++) {
+      var tot = pts[j].rx + pts[j].tx
+      if (tot > maxRate) maxRate = tot
+    }
+    return pts.map(function(p) {
+      var tot = p.rx + p.tx
+      var frac = tot <= 0 ? 0.06 : Math.max(0.10, Math.min(1.0, tot / maxRate))
+      return { frac: frac, active: tot > 0, txDominant: p.tx > p.rx }
+    })
+  }
+  function filterByApp(appName) {
+    var val = String(appName || "")
+    root.netmonView = "connections"
+    netmonSearchField.text = val
+    root.netmonSearchText = val
+  }
+  function copyNetmonTable() {
+    function cell(v) { return String(v || "").replace(/[|\r\n]/g, " ").trim() }
+    var lines = [
+      "| Process | Proto | State | Local | Remote | Service | Scope |",
+      "| --- | --- | --- | --- | --- | --- | --- |"
+    ]
+    root.filteredConnections.slice(0, 256).forEach(function(c) {
+      var pname = String(c.process || "")
+      var local = String(c.local_ip || "") + ":" + Number(c.local_port || 0)
+      var rhost = root.preferredRemote(c)
+      var rport = Number(c.remote_port || 0)
+      var remote = rport > 0 ? (rhost + ":" + rport) : rhost
+      lines.push("| " + [pname || "—", root.connProto(c), String(c.state || ""), local, remote, String(c.service || ""), String(c.scope || "")]
+        .map(cell).join(" | ") + " |")
+    })
+    if (!root.copyText(lines.join("\n") + "\n")) return
+    root.netmonTableCopied = true
+    netmonTableCopiedTimer.restart()
+  }
+  function copyConnEndpoint(id, ep) {
+    if (!root.copyText(ep)) return
+    root.netmonCopiedKey = id
+    netmonCopiedTimer.restart()
+  }
+
+  // --- Network & Wi-Fi Setup state ------------------------------------------
+  property bool wifiScanning: false
+  property bool wifiBusy: false
+  Timer {
+    id: wifiBusySafetyTimer
+    interval: 35000
+    onTriggered: { root.wifiBusy = false; root.wifiScanning = false }
+  }
+  function onCollectorReset() {
+    root.wifiBusy = false
+    root.wifiScanning = false
+    wifiBusySafetyTimer.stop()
+  }
+  property bool wifiStatusOk: true
+  property string wifiStatusText: ""
+  property string wifiSearchText: ""
+  property bool wifiFormOpen: false
+  property string wifiFormSsid: ""
+  property string wifiFormUuid: ""
+  property string wifiFormNote: ""
+  property bool wifiShowPassword: false
+
+  readonly property bool nmAvailable: root.wifiState.nm_available !== undefined
+    ? root.wifiState.nm_available === true
+    : (root.stats.nm_available !== false)
+  readonly property bool hasWifiDevice: root.wifiState.wifi_device !== undefined
+    ? root.wifiState.wifi_device === true
+    : (root.stats.wifi_device !== false)
+  readonly property bool wifiRadioOn: root.wifiState.wifi_on !== undefined
+    ? root.wifiState.wifi_on === true
+    : (root.stats.wifi_on !== false)
+  readonly property var unseenWifiNetworks: {
+    var vis = (root.wifiState && root.wifiState.visible) || []
+    return vis.filter(function(v) { return v.known !== true && String(v.ssid || "") !== "" })
+  }
+  readonly property var filteredVisibleWifi: {
+    var q = root.wifiSearchText.trim().toLowerCase()
+    return root.unseenWifiNetworks.filter(function(v) {
+      return q === "" || String(v.ssid || "").toLowerCase().indexOf(q) !== -1
+    })
+  }
+  readonly property bool allWiredUnplugged: {
+    var devs = (root.wifiState && root.wifiState.wired_devices) || []
+    return devs.length > 0 && devs.every(function(d) { return String(d.state || "") === "unavailable" })
+  }
+  function utf8ByteLength(str) {
+    var s = String(str || "")
+    var bytes = 0
+    for (var i = 0; i < s.length; i++) {
+      var code = s.charCodeAt(i)
+      if (code < 0x80) bytes += 1
+      else if (code < 0x800) bytes += 2
+      else if (code >= 0xD800 && code <= 0xDBFF) { bytes += 4; i += 1 }
+      else bytes += 3
+    }
+    return bytes
+  }
+  function wifiPasswordValid(pw) {
+    var s = String(pw || "")
+    if (s.indexOf("\n") !== -1 || s.indexOf("\r") !== -1) return false
+    var blen = root.utf8ByteLength(s)
+    if (blen >= 8 && blen <= 63) return true
+    return /^[0-9a-fA-F]{64}$/.test(s)
+  }
+  function openWifiPasswordForm(ssid, uuid, note) {
+    root.wifiFormSsid = String(ssid || "")
+    root.wifiFormUuid = String(uuid || "")
+    root.wifiFormNote = String(note || "")
+    root.wifiShowPassword = false
+    wifiPasswordField.clear()
+    root.wifiFormOpen = true
+    Qt.callLater(function() { wifiPasswordField.forceActiveFocus() })
+  }
+  function closeWifiForm() {
+    var wasOpen = root.wifiFormOpen
+    var hadFocus = wifiPasswordField.activeFocus
+    wifiPasswordField.clear()
+    root.wifiFormOpen = false
+    root.wifiFormSsid = ""
+    root.wifiFormUuid = ""
+    root.wifiFormNote = ""
+    root.wifiShowPassword = false
+    if (wasOpen && hadFocus) keyCatcher.forceActiveFocus()
+  }
+  function submitWifiPassword() {
+    if (!root.hostWidget || root.wifiBusy) return
+    var pw = wifiPasswordField.text
+    if (!root.wifiPasswordValid(pw)) return
+    root.wifiBusy = true
+    wifiBusySafetyTimer.restart()
+    root.wifiStatusText = ""
+    root.hostWidget.wifiConnect(root.wifiFormSsid, pw, root.wifiFormUuid)
+  }
+  function onWifiState(data) {
+    root.wifiScanning = false
+    if (!root.wifiBusy) wifiBusySafetyTimer.stop()
+  }
+  function onWifiResult(data) {
+    root.wifiBusy = false
+    if (!root.wifiScanning) wifiBusySafetyTimer.stop()
+    var ok = data && data.ok === true
+    var authFailed = data && data.auth_failed === true
+    var ssid = String((data && data.ssid) || "")
+    var uuid = String((data && data.uuid) || "")
+    var msg = String((data && data.message) || "")
+    if (ok) {
+      if (root.wifiFormOpen) root.closeWifiForm()
+      root.wifiStatusOk = true
+      root.wifiStatusText = msg !== "" ? msg : (ssid !== "" ? root.t("connectedToN", [ssid]) : root.t("done"))
+    } else if (authFailed && root.opened) {
+      if (root.activePage !== "setup") root.setPage("setup")
+      root.openWifiPasswordForm(ssid || root.wifiFormSsid, uuid || root.wifiFormUuid, root.t("authFailedHint"))
+      root.wifiStatusOk = false
+      root.wifiStatusText = msg !== "" ? msg : root.t("authFailedHint")
+    } else {
+      root.wifiStatusOk = false
+      root.wifiStatusText = msg !== "" ? msg : root.t("actionFailed")
+    }
+  }
+  function toggleWifiRadio(on) {
+    if (!root.hostWidget || root.wifiBusy) return
+    root.wifiBusy = true
+    wifiBusySafetyTimer.restart()
+    root.wifiStatusText = ""
+    root.hostWidget.wifiRadio(on === true)
+  }
+  function triggerWifiScan(rescan) {
+    if (!root.hostWidget || root.wifiScanning || root.wifiBusy) return
+    root.wifiScanning = true
+    wifiBusySafetyTimer.restart()
+    root.hostWidget.wifiScan(rescan === true)
+  }
+  function connectKnownWifi(uuid, ssid) {
+    if (!root.hostWidget || root.wifiBusy) return
+    root.wifiBusy = true
+    wifiBusySafetyTimer.restart()
+    root.wifiStatusText = ""
+    root.wifiFormSsid = String(ssid || "")
+    root.wifiFormUuid = String(uuid || "")
+    root.hostWidget.wifiConnect(ssid, null, uuid)
+  }
+  function connectVisibleWifi(ssid, secured) {
+    if (secured) {
+      root.openWifiPasswordForm(ssid, "", "")
+      return
+    }
+    if (!root.hostWidget || root.wifiBusy) return
+    root.wifiBusy = true
+    wifiBusySafetyTimer.restart()
+    root.wifiStatusText = ""
+    root.hostWidget.wifiConnect(ssid, null, "")
+  }
+  function disconnectWifi(uuid) {
+    if (!root.hostWidget || root.wifiBusy) return
+    root.wifiBusy = true
+    wifiBusySafetyTimer.restart()
+    root.wifiStatusText = ""
+    root.hostWidget.wifiDisconnect(uuid)
+  }
+  function forgetWifi(uuid) {
+    if (!root.hostWidget || root.wifiBusy) return
+    root.wifiBusy = true
+    wifiBusySafetyTimer.restart()
+    root.wifiStatusText = ""
+    root.hostWidget.wifiForget(uuid)
+  }
+  function toggleConn(uuid, up) {
+    if (!root.hostWidget || root.wifiBusy) return
+    root.wifiBusy = true
+    wifiBusySafetyTimer.restart()
+    root.wifiStatusText = ""
+    root.hostWidget.connToggle(uuid, up === true)
+  }
+  function openSystemNetSettings() {
+    root.close()
+    // Third-party plugins may not summon built-in panels directly, so go
+    // through the shell CLI (fixed argv, no shell string).
+    Quickshell.execDetached(["omarchy-shell", "shell", "summon", "omarchy.network", "{}"])
+  }
   // From the map: back to the Devices page, open the device's group, expand and show it.
   function groupIdOf(dev) {
     if (dev.is_gateway || dev.is_self) return ""
@@ -108,6 +493,7 @@ Panel {
     return mode === "band" ? root.bandGroupOrder : mode === "type" ? root.typeOrder : root.platformOrder
   }
   function openDevice(dev) {
+    root.setPage("devices")
     var drop = ["mappage", groupIdOf(dev)]
     var collapsed = (root.view.collapsed || []).filter(function(id) { return drop.indexOf(id) === -1 })
     root.saveView(root.viewMode, collapsed)
@@ -608,9 +994,13 @@ Panel {
   }
 
   function open() { root.controller.show() }
-  function close() { root.infoPageOpen = false;
+  function close() {
+    root.infoPageOpen = false
     root.settingsOpen = false
     root.editingKey = ""
+    if (root.wifiFormOpen) root.closeWifiForm()
+    if (root.fritzFormOpen) root.closeFritzForm()
+    if (root.hostWidget && typeof root.hostWidget.setNetmonMode === "function") root.hostWidget.setNetmonMode(false, false)
     root.controller.hide()
   }
   function toggle() { if (root.opened) root.close(); else root.open() }
@@ -1289,20 +1679,20 @@ Panel {
     }
   }
 
-  // Page switch under the title: Devices | Network map.
+  // Page switch under the title: Devices | Map | Monitor | Setup.
   component PageTab: Item {
     id: tab
     property string label: ""
     property int icon: 0
     property bool active: false
     signal activated()
-    implicitWidth: tabText.implicitWidth + Style.space(16)
+    implicitWidth: tabText.implicitWidth + Style.space(10)
     implicitHeight: tabText.implicitHeight + Style.space(10)
     Text {
       id: tabText
       anchors.centerIn: parent
       textFormat: Text.PlainText
-      text: root.glyph(tab.icon) + "  " + tab.label
+      text: root.glyph(tab.icon) + " " + tab.label
       color: tab.active ? Commons.Color.accent : (tabMouse.containsMouse ? root.fg : root.dim)
       font.family: root.font
       font.pixelSize: Style.font.bodySmall
@@ -1311,7 +1701,7 @@ Panel {
     Rectangle {
       anchors.bottom: parent.bottom
       anchors.horizontalCenter: parent.horizontalCenter
-      width: parent.width - Style.space(8)
+      width: parent.width - Style.space(6)
       height: Style.space(2)
       radius: Math.min(root.corners.small, 1)
       color: Commons.Color.accent
@@ -1323,6 +1713,228 @@ Panel {
       hoverEnabled: true
       cursorShape: Qt.PointingHandCursor
       onClicked: tab.activated()
+    }
+  }
+
+  // Compact selectable chip for Network Monitor sub-views and filters.
+  component FilterChip: Item {
+    id: chip
+    property string label: ""
+    property bool selected: false
+    signal activated()
+    implicitWidth: chipLabel.implicitWidth + Style.space(14)
+    implicitHeight: chipLabel.implicitHeight + Style.space(8)
+    Rectangle {
+      anchors.fill: parent
+      radius: root.corners.control
+      color: chip.selected
+        ? Qt.rgba(Commons.Color.accent.r, Commons.Color.accent.g, Commons.Color.accent.b, 0.20)
+        : Qt.rgba(root.fg.r, root.fg.g, root.fg.b, chipMouse.containsMouse ? 0.11 : 0.05)
+      border.width: 1
+      border.color: chip.selected
+        ? Qt.rgba(Commons.Color.accent.r, Commons.Color.accent.g, Commons.Color.accent.b, 0.7)
+        : Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.14)
+    }
+    Text {
+      id: chipLabel
+      anchors.centerIn: parent
+      textFormat: Text.PlainText
+      text: chip.label
+      color: chip.selected ? Commons.Color.accent : root.fg
+      font.family: root.font
+      font.pixelSize: Style.font.caption
+      font.bold: chip.selected
+    }
+    MouseArea {
+      id: chipMouse
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onClicked: chip.activated()
+    }
+  }
+
+  // One live connection row on the Network Monitor page; click expands details.
+  component ConnRow: Item {
+    id: crow
+    property var conn: ({})
+    readonly property string cid: root.connId(conn)
+    readonly property bool expanded: cid !== "" && root.netmonExpandedKey === cid
+    readonly property string proto: root.connProto(conn).toUpperCase()
+    readonly property string st: String(conn.state || "")
+    readonly property string procName: String(conn.process || "")
+    readonly property string appLabel: procName !== "" ? procName : root.t("systemProc")
+    readonly property string remoteHostOrIp: root.preferredRemote(conn)
+    readonly property int rport: Number(conn.remote_port || 0)
+    readonly property int lport: Number(conn.local_port || 0)
+    readonly property string endpoint: st === "LISTEN"
+      ? (":" + lport)
+      : (rport > 0 ? (remoteHostOrIp + ":" + rport) : remoteHostOrIp)
+    readonly property real rxRate: Number(conn.rx_rate || 0)
+    readonly property real txRate: Number(conn.tx_rate || 0)
+    readonly property real totalRate: rxRate + txRate
+    readonly property real rxBytes: Number(conn.rx_bytes || 0)
+    readonly property real txBytes: Number(conn.tx_bytes || 0)
+    readonly property string rightLabel: totalRate > 0
+      ? ("↓ " + root.formatRate(rxRate) + " · ↑ " + root.formatRate(txRate))
+      : ((rxBytes + txBytes) > 0
+        ? (root.formatBytes(rxBytes) + " / " + root.formatBytes(txBytes))
+        : st)
+    readonly property color dotColor: st === "ESTABLISHED"
+      ? root.signalColor(0.85)
+      : (st === "LISTEN" ? Commons.Color.accent
+        : ((st === "SYN_SENT" || st === "SYN_RECV") ? root.signalColor(0.55) : root.dim))
+    readonly property string subtitle: {
+      var scopeTag = conn.scope === "external" ? "EXT" : (conn.scope === "lan" ? "LAN" : "LO")
+      var parts = [proto, st, scopeTag]
+      if (conn.service) parts.push(String(conn.service))
+      if (conn.rtt_ms !== null && conn.rtt_ms !== undefined && Number(conn.rtt_ms) > 0)
+        parts.push(Number(conn.rtt_ms).toFixed(1) + " ms")
+      return parts.join("  ·  ")
+    }
+    height: connCol.implicitHeight + Style.space(8)
+
+    Rectangle {
+      anchors.fill: parent
+      radius: root.corners.control
+      color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, crow.expanded ? 0.08 : (connMouse.containsMouse ? 0.07 : 0.03))
+      border.width: crow.expanded ? 1 : 0
+      border.color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.14)
+    }
+
+    Column {
+      id: connCol
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.leftMargin: Style.space(6)
+      anchors.rightMargin: Style.space(6)
+      y: Style.space(4)
+      spacing: Style.space(2)
+
+      Item {
+        width: parent.width
+        height: Math.max(connApp.implicitHeight, connRight.implicitHeight)
+        Rectangle {
+          id: connDot
+          anchors.left: parent.left
+          anchors.verticalCenter: parent.verticalCenter
+          width: Style.space(7)
+          height: width
+          radius: Math.min(root.corners.pill, width / 2)
+          color: crow.dotColor
+        }
+        Text {
+          id: connApp
+          textFormat: Text.PlainText
+          anchors.left: connDot.right
+          anchors.leftMargin: Style.space(6)
+          anchors.verticalCenter: parent.verticalCenter
+          text: crow.appLabel
+          color: root.fg
+          font.family: root.font
+          font.pixelSize: Style.font.caption
+          font.bold: true
+        }
+        Text {
+          id: connEp
+          textFormat: Text.PlainText
+          anchors.left: connApp.right
+          anchors.leftMargin: Style.space(6)
+          anchors.right: connRight.left
+          anchors.rightMargin: Style.space(6)
+          anchors.verticalCenter: parent.verticalCenter
+          elide: Text.ElideRight
+          text: crow.endpoint
+          color: root.dim
+          font.family: root.font
+          font.pixelSize: Style.font.caption
+        }
+        Text {
+          id: connRight
+          textFormat: Text.PlainText
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+          text: crow.rightLabel
+          color: crow.totalRate > 0 ? Commons.Color.accent : root.dim
+          font.family: root.font
+          font.pixelSize: Style.font.caption
+        }
+      }
+
+      Text {
+        textFormat: Text.PlainText
+        width: parent.width
+        leftPadding: Style.space(13)
+        elide: Text.ElideRight
+        text: crow.subtitle
+        color: root.dim
+        font.family: root.font
+        font.pixelSize: Style.font.caption
+      }
+
+      Column {
+        id: connDetails
+        visible: crow.expanded
+        width: parent.width
+        leftPadding: Style.space(13)
+        topPadding: Style.space(4)
+        bottomPadding: Style.space(2)
+        spacing: Style.space(3)
+
+        readonly property string localEp: String(crow.conn.local_ip || "") + ":" + crow.lport
+        readonly property string remoteEp: crow.rport > 0
+          ? (String(crow.conn.remote_ip || "") + ":" + crow.rport)
+          : String(crow.conn.remote_ip || "")
+
+        Repeater {
+          model: [
+            [root.t("connLocal"), connDetails.localEp],
+            [root.t("connRemote"), connDetails.remoteEp],
+            [root.t("connHost"), crow.conn.remote_host && crow.conn.remote_host !== crow.conn.remote_ip ? String(crow.conn.remote_host) : ""],
+            ["PID", crow.conn.pid && Number(crow.conn.pid) > 0 ? String(crow.conn.pid) : ""],
+            [root.t("connCommand"), String(crow.conn.cmdline || "")],
+            [root.t("connTraffic"), (crow.rxBytes + crow.txBytes) > 0 ? ("↓ " + root.formatBytes(crow.rxBytes) + " · ↑ " + root.formatBytes(crow.txBytes)) : ""]
+          ].filter(function(item) { return item[1] !== "" })
+          delegate: Text {
+            required property var modelData
+            textFormat: Text.PlainText
+            width: parent ? parent.width - Style.space(13) : 0
+            wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+            text: modelData[0] + ":  " + modelData[1]
+            color: root.dim
+            font.family: root.font
+            font.pixelSize: Style.font.caption
+          }
+        }
+        Flow {
+          width: parent.width - Style.space(13)
+          topPadding: Style.space(2)
+          spacing: Style.space(12)
+          LinkAction {
+            visible: crow.procName !== ""
+            icon: root.glyph(0xF0349)
+            label: root.t("filterByApp")
+            onActivated: root.filterByApp(crow.procName)
+          }
+          LinkAction {
+            readonly property bool copiedNow: root.netmonCopiedKey === crow.cid
+            icon: root.glyph(copiedNow ? 0xF012C : 0xF018F)
+            label: copiedNow ? root.t("copied") : root.t("copyEndpoint")
+            onActivated: root.copyConnEndpoint(crow.cid, crow.st === "LISTEN"
+              ? (String(crow.conn.local_ip || "") + ":" + crow.lport)
+              : crow.endpoint)
+          }
+        }
+      }
+    }
+
+    MouseArea {
+      id: connMouse
+      z: -1
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onClicked: root.netmonExpandedKey = crow.expanded ? "" : crow.cid
     }
   }
 
@@ -1339,7 +1951,7 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: keyCatcher
-    contentWidth: panel.fittedContentWidth(Style.space(410))
+    contentWidth: panel.fittedContentWidth(Style.space(430))
     // At least as tall as the screenshot note overlay while it shows.
     contentHeight: panel.fittedContentHeight(Math.max(column.implicitHeight, shot.neededHeight))
 
@@ -1364,14 +1976,29 @@ Panel {
         anchors.fill: parent
         // Text fields need every key while they have focus.
         // Typing in the note overlay must reach its field.
-        blocked: shot.overlayOpen || searchField.activeFocus || root.editingKey !== "" || fritzUser.activeFocus || fritzPassword.activeFocus
+        blocked: shot.overlayOpen || searchField.activeFocus || root.editingKey !== ""
+          || fritzUser.activeFocus || fritzPassword.activeFocus
+          || netmonSearchField.activeFocus || wifiSearchField.activeFocus || wifiPasswordField.activeFocus
           || devicesViewDrop.popupOpen || mapViewDrop.popupOpen
-        onCloseRequested: { if (root.infoPageOpen) root.infoPageOpen = false; else if (root.settingsOpen) root.settingsOpen = false; else root.close() }
+        onCloseRequested: {
+          if (root.infoPageOpen) root.infoPageOpen = false
+          else if (root.settingsOpen) root.settingsOpen = false
+          else if (root.wifiFormOpen) root.closeWifiForm()
+          else if (root.fritzFormOpen) root.closeFritzForm()
+          else if (root.activePage === "monitor" && root.netmonIsFiltered) root.clearNetmonFilters()
+          else if (root.activePage === "setup" && root.wifiSearchText !== "") wifiSearchField.clear()
+          else if (root.activePage === "devices" && root.filterText !== "") searchField.clear()
+          else root.close()
+        }
         onTabRequested: function(direction) { root.switchPanel(direction) }
         onTextKey: function(t) {
           if (t === "\b" && root.infoPageOpen) { root.infoPageOpen = false; return }
-          if (t === "\b" && root.settingsOpen) root.settingsOpen = false
-          else if (t === "/" && root.showSearch && !root.settingsOpen) searchField.forceActiveFocus()
+          if (t === "\b" && root.settingsOpen) { root.settingsOpen = false; return }
+          if (t === "/" && !root.settingsOpen && !root.infoPageOpen) {
+            if (root.activePage === "devices" && root.showSearch) searchField.forceActiveFocus()
+            else if (root.activePage === "monitor" && root.netmonView !== "interfaces") netmonSearchField.forceActiveFocus()
+            else if (root.activePage === "setup" && wifiSearchField.visible) wifiSearchField.forceActiveFocus()
+          }
         }
 
         Flickable {
@@ -1699,19 +2326,32 @@ Panel {
               width: parent.width
               spacing: Style.space(10)
 
-              Row {
-                spacing: Style.space(6)
+              Flow {
+                width: parent.width
+                spacing: Style.space(2)
                 PageTab {
                   label: root.t("tabDevices")
                   icon: 0xF0279
-                  active: !root.mapPage
-                  onActivated: root.showPage(false)
+                  active: root.activePage === "devices"
+                  onActivated: root.setPage("devices")
                 }
                 PageTab {
-                  label: root.t("tabMap")
+                  label: root.t("tabMapShort")
                   icon: 0xF0003
-                  active: root.mapPage
-                  onActivated: root.showPage(true)
+                  active: root.activePage === "map"
+                  onActivated: root.setPage("map")
+                }
+                PageTab {
+                  label: root.t("tabMonitor")
+                  icon: 0xF012A
+                  active: root.activePage === "monitor"
+                  onActivated: root.setPage("monitor")
+                }
+                PageTab {
+                  label: root.t("tabSetup")
+                  icon: 0xF05A9
+                  active: root.activePage === "setup"
+                  onActivated: root.setPage("setup")
                 }
               }
 
@@ -1797,11 +2437,74 @@ Panel {
 
               Column {
                 id: devicesPage
-                visible: !root.mapPage
+                visible: root.activePage === "devices"
                 width: parent.width
                 spacing: column.spacing
 
                 PanelSeparator { width: parent.width; foreground: root.fg }
+
+                // Disconnected guidance card: explains Wi-Fi off vs not connected and offers 1-click actions.
+                Rectangle {
+                  visible: root.stats && root.stats.time !== undefined && root.stats.active !== true
+                  width: parent.width
+                  height: disconnectedCol.implicitHeight + Style.space(16)
+                  radius: root.corners.radius
+                  color: Qt.rgba(Commons.Color.accent.r, Commons.Color.accent.g, Commons.Color.accent.b, 0.12)
+                  border.width: 1
+                  border.color: Qt.rgba(Commons.Color.accent.r, Commons.Color.accent.g, Commons.Color.accent.b, 0.5)
+                  Column {
+                    id: disconnectedCol
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    anchors.margins: Style.space(8)
+                    spacing: Style.space(6)
+                    Text {
+                      textFormat: Text.PlainText
+                      width: parent.width
+                      wrapMode: Text.WordWrap
+                      text: root.glyph(0xF05A9) + "  " + root.t("notConnected")
+                      color: root.fg
+                      font.family: root.font
+                      font.pixelSize: Style.font.bodySmall
+                      font.bold: true
+                    }
+                    Text {
+                      textFormat: Text.PlainText
+                      width: parent.width
+                      wrapMode: Text.WordWrap
+                      text: (root.hasWifiDevice && !root.wifiRadioOn) ? root.t("wifiOffHint") : root.t("disconnectedHint")
+                      color: root.dim
+                      font.family: root.font
+                      font.pixelSize: Style.font.caption
+                    }
+                    Flow {
+                      width: parent.width
+                      spacing: Style.space(8)
+                      Button {
+                        visible: root.hasWifiDevice && !root.wifiRadioOn
+                        radius: root.corners.control
+                        text: root.t("turnWifiOn")
+                        iconText: root.glyph(0xF05A9)
+                        bordered: true
+                        foreground: root.fg
+                        fontFamily: root.font
+                        enabled: !root.wifiBusy
+                        onClicked: root.toggleWifiRadio(true)
+                      }
+                      Button {
+                        radius: root.corners.control
+                        text: (root.hasWifiDevice && root.wifiRadioOn) ? root.t("connectWifi") : root.t("wifiSetup")
+                        iconText: root.glyph(0xF05A9)
+                        bordered: true
+                        foreground: root.fg
+                        fontFamily: root.font
+                        onClicked: root.setPage("setup")
+                      }
+                    }
+                  }
+                }
+
                 PanelSectionHeader { text: root.t("connection").toUpperCase(); foreground: root.fg; fontFamily: root.font }
 
                 Item {
@@ -2432,12 +3135,1229 @@ Panel {
                 }
               }
 
+              // ---------------------------------------------------------------- monitor page
+              Column {
+                id: monitorPageColumn
+                visible: root.activePage === "monitor"
+                width: parent.width
+                spacing: Style.space(8)
+
+                PanelSeparator { width: parent.width; foreground: root.fg }
+
+                // Live summary, 30-sample sparkline, sub-view chips, pause & DNS toggles.
+                Rectangle {
+                  width: parent.width
+                  height: monitorSummaryCol.implicitHeight + Style.space(16)
+                  radius: root.corners.radius
+                  color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.05)
+                  border.width: 1
+                  border.color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.14)
+
+                  Column {
+                    id: monitorSummaryCol
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    anchors.margins: Style.space(8)
+                    spacing: Style.space(6)
+
+                    Item {
+                      width: parent.width
+                      height: Math.max(liveTitle.implicitHeight, liveRates.implicitHeight)
+                      Text {
+                        id: liveTitle
+                        textFormat: Text.PlainText
+                        anchors.left: parent.left
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: root.t("liveTraffic")
+                        color: root.fg
+                        font.family: root.font
+                        font.pixelSize: Style.font.bodySmall
+                        font.bold: true
+                      }
+                      Text {
+                        id: liveRates
+                        textFormat: Text.PlainText
+                        anchors.right: parent.right
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: "↓ " + root.formatRate(root.netmonSummary.rx_rate) + "  ·  ↑ " + root.formatRate(root.netmonSummary.tx_rate)
+                        color: root.fg
+                        font.family: root.font
+                        font.pixelSize: Style.font.caption
+                      }
+                    }
+
+                    // 30-bar throughput sparkline.
+                    Row {
+                      id: sparkRow
+                      width: parent.width
+                      height: Style.space(34)
+                      spacing: Style.space(2)
+                      Repeater {
+                        model: root.sparklineBars
+                        delegate: Item {
+                          required property var modelData
+                          width: Math.max(2, (sparkRow.width - 29 * sparkRow.spacing) / 30)
+                          height: sparkRow.height
+                          Rectangle {
+                            anchors.left: parent.left
+                            anchors.right: parent.right
+                            anchors.bottom: parent.bottom
+                            height: Math.max(Style.space(2), Math.round(parent.height * modelData.frac))
+                            radius: Math.min(root.corners.small, 2)
+                            color: modelData.active
+                              ? (modelData.txDominant ? Commons.Color.accent : root.signalColor(0.85))
+                              : Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.14)
+                          }
+                        }
+                      }
+                    }
+
+                    Item {
+                      width: parent.width
+                      height: Math.max(monCountsText.implicitHeight, monTotalText.implicitHeight)
+                      Text {
+                        id: monCountsText
+                        textFormat: Text.PlainText
+                        anchors.left: parent.left
+                        anchors.right: monTotalText.left
+                        anchors.rightMargin: Style.space(8)
+                        anchors.verticalCenter: parent.verticalCenter
+                        elide: Text.ElideRight
+                        text: root.t("monCounts", [
+                          Number(root.netmonSummary.established || 0),
+                          Number(root.netmonSummary.listening || 0),
+                          Number(root.netmonSummary.external || 0)
+                        ])
+                        color: root.dim
+                        font.family: root.font
+                        font.pixelSize: Style.font.caption
+                      }
+                      Text {
+                        id: monTotalText
+                        textFormat: Text.PlainText
+                        anchors.right: parent.right
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: root.netmonPaused ? root.t("paused") : root.t("totalN", [Number(root.netmonSummary.total || 0)])
+                        color: root.netmonPaused ? Commons.Color.accent : root.dim
+                        font.family: root.font
+                        font.pixelSize: Style.font.caption
+                        font.bold: root.netmonPaused
+                      }
+                    }
+
+                    Flow {
+                      width: parent.width
+                      spacing: Style.space(4)
+                      FilterChip {
+                        label: root.t("monConnections")
+                        selected: root.netmonView === "connections"
+                        onActivated: root.netmonView = "connections"
+                      }
+                      FilterChip {
+                        label: root.t("monByApp")
+                        selected: root.netmonView === "byapp"
+                        onActivated: root.netmonView = "byapp"
+                      }
+                      FilterChip {
+                        label: root.t("monInterfaces")
+                        selected: root.netmonView === "interfaces"
+                        onActivated: root.netmonView = "interfaces"
+                      }
+                      Button {
+                        radius: root.corners.control
+                        iconText: root.glyph(root.netmonPaused ? 0xF040A : 0xF03E4)
+                        bordered: true
+                        foreground: root.fg
+                        fontFamily: root.font
+                        tooltipText: root.netmonPaused ? root.t("resumeTip") : root.t("pauseTip")
+                        onClicked: root.netmonPaused = !root.netmonPaused
+                      }
+                      Button {
+                        radius: root.corners.control
+                        text: root.netmonResolve ? root.t("dnsOn") : root.t("dnsOff")
+                        bordered: true
+                        foreground: root.netmonResolve ? Commons.Color.accent : root.fg
+                        fontFamily: root.font
+                        tooltipText: root.t("dnsResolveTip")
+                        onClicked: root.netmonResolve = !root.netmonResolve
+                      }
+                    }
+                  }
+                }
+
+                KeyTextField {
+                  id: netmonSearchField
+                  radius: root.corners.control
+                  visible: root.netmonView !== "interfaces"
+                  width: parent.width
+                  placeholderText: root.glyph(0xF0349) + "  " + root.t("monSearch")
+                  maximumLength: 64
+                  foreground: root.fg
+                  font: Qt.font({ family: root.font, pixelSize: Style.font.caption })
+                  onTextChanged: root.netmonSearchText = text
+                  Keys.onPressed: function(event) {
+                    if (event.key === Qt.Key_Escape) {
+                      netmonSearchField.clear()
+                      keyCatcher.forceActiveFocus()
+                      event.accepted = true
+                    }
+                  }
+                }
+
+                // Sub-view 1: Connections
+                Column {
+                  visible: root.netmonView === "connections"
+                  width: parent.width
+                  spacing: Style.space(6)
+
+                  Item {
+                    width: parent.width
+                    height: Math.max(protoChips.implicitHeight, sortBtn.implicitHeight)
+                    Row {
+                      id: protoChips
+                      anchors.left: parent.left
+                      anchors.verticalCenter: parent.verticalCenter
+                      spacing: Style.space(4)
+                      FilterChip { label: root.t("filterAll"); selected: root.netmonProto === "all"; onActivated: root.netmonProto = "all" }
+                      FilterChip { label: "TCP"; selected: root.netmonProto === "tcp"; onActivated: root.netmonProto = "tcp" }
+                      FilterChip { label: "UDP"; selected: root.netmonProto === "udp"; onActivated: root.netmonProto = "udp" }
+                    }
+                    Button {
+                      id: sortBtn
+                      radius: root.corners.control
+                      anchors.right: parent.right
+                      anchors.verticalCenter: parent.verticalCenter
+                      text: root.t("sortByN", [root.netmonSortLabel(root.netmonSort)])
+                      bordered: true
+                      foreground: root.fg
+                      fontFamily: root.font
+                      onClicked: root.nextNetmonSort()
+                    }
+                  }
+
+                  Flow {
+                    width: parent.width
+                    spacing: Style.space(4)
+                    FilterChip { label: root.t("filterAll"); selected: root.netmonScope === "all"; onActivated: root.netmonScope = "all" }
+                    FilterChip { label: root.t("filterActive"); selected: root.netmonScope === "active"; onActivated: root.netmonScope = "active" }
+                    FilterChip { label: root.t("filterListening"); selected: root.netmonScope === "listening"; onActivated: root.netmonScope = "listening" }
+                    FilterChip { label: root.t("filterExternal"); selected: root.netmonScope === "external"; onActivated: root.netmonScope = "external" }
+                    FilterChip { label: "LAN"; selected: root.netmonScope === "lan"; onActivated: root.netmonScope = "lan" }
+                    FilterChip { label: root.t("filterLocal"); selected: root.netmonScope === "loopback"; onActivated: root.netmonScope = "loopback" }
+                  }
+
+                  Item {
+                    width: parent.width
+                    height: Math.max(showingCountText.implicitHeight, clearFiltersAction.implicitHeight)
+                    Text {
+                      id: showingCountText
+                      textFormat: Text.PlainText
+                      anchors.left: parent.left
+                      anchors.verticalCenter: parent.verticalCenter
+                      text: root.t("showingConns", [root.filteredConnections.length, ((root.netmon && root.netmon.connections) || []).length])
+                      color: root.dim
+                      font.family: root.font
+                      font.pixelSize: Style.font.caption
+                    }
+                    LinkAction {
+                      id: clearFiltersAction
+                      visible: root.netmonIsFiltered
+                      anchors.right: parent.right
+                      anchors.verticalCenter: parent.verticalCenter
+                      icon: root.glyph(0xF0156)
+                      label: root.t("clearFilters")
+                      onActivated: root.clearNetmonFilters()
+                    }
+                  }
+
+                  Text {
+                    visible: !root.netmonHasData
+                    textFormat: Text.PlainText
+                    width: parent.width
+                    wrapMode: Text.WordWrap
+                    text: root.t("collectingConns")
+                    color: root.dim
+                    font.family: root.font
+                    font.pixelSize: Style.font.caption
+                  }
+
+                  Text {
+                    visible: root.netmonHasData && root.filteredConnections.length === 0
+                    textFormat: Text.PlainText
+                    width: parent.width
+                    wrapMode: Text.WordWrap
+                    text: root.t("noConnsMatch")
+                    color: root.dim
+                    font.family: root.font
+                    font.pixelSize: Style.font.caption
+                  }
+
+                  Repeater {
+                    model: root.filteredConnections.slice(0, 150)
+                    delegate: ConnRow {
+                      required property var modelData
+                      width: monitorPageColumn.width
+                      conn: modelData
+                    }
+                  }
+
+                  Text {
+                    visible: root.filteredConnections.length > 150
+                    textFormat: Text.PlainText
+                    width: parent.width
+                    wrapMode: Text.WordWrap
+                    text: root.t("showingFirst150", [root.filteredConnections.length])
+                    color: root.dim
+                    font.family: root.font
+                    font.pixelSize: Style.font.caption
+                  }
+                }
+
+                // Sub-view 2: By app
+                Column {
+                  visible: root.netmonView === "byapp"
+                  width: parent.width
+                  spacing: Style.space(5)
+
+                  Text {
+                    visible: root.filteredProcesses.length === 0
+                    textFormat: Text.PlainText
+                    width: parent.width
+                    wrapMode: Text.WordWrap
+                    text: root.netmonHasData ? root.t("noAppsMatch") : root.t("collectingConns")
+                    color: root.dim
+                    font.family: root.font
+                    font.pixelSize: Style.font.caption
+                  }
+
+                  Repeater {
+                    model: root.filteredProcesses
+                    delegate: Item {
+                      id: appRow
+                      required property var modelData
+                      width: monitorPageColumn.width
+                      height: appCol.implicitHeight + Style.space(8)
+                      readonly property string pname: String(modelData.name || "")
+                      readonly property real rxR: Number(modelData.rx_rate || 0)
+                      readonly property real txR: Number(modelData.tx_rate || 0)
+                      readonly property real rxB: Number(modelData.rx_bytes || 0)
+                      readonly property real txB: Number(modelData.tx_bytes || 0)
+                      readonly property int connsN: Number(modelData.connections || 0)
+                      readonly property string rightText: (rxR + txR) > 0
+                        ? ("↓ " + root.formatRate(rxR) + " · ↑ " + root.formatRate(txR))
+                        : ((rxB + txB) > 0
+                          ? ("↓ " + root.formatBytes(rxB) + " · ↑ " + root.formatBytes(txB))
+                          : root.t("connsShortN", [connsN]))
+                      readonly property string subText: {
+                        var parts = [root.t("connsN", [connsN])]
+                        if (Number(modelData.external || 0) > 0) parts.push(root.t("extN", [Number(modelData.external)]))
+                        if (Number(modelData.lan || 0) > 0) parts.push(Number(modelData.lan) + " LAN")
+                        if (Number(modelData.listening || 0) > 0) parts.push(root.t("listenN", [Number(modelData.listening)]))
+                        return parts.join("  ·  ")
+                      }
+
+                      Rectangle {
+                        anchors.fill: parent
+                        radius: root.corners.control
+                        color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, appMouse.containsMouse ? 0.08 : 0.03)
+                      }
+                      Column {
+                        id: appCol
+                        anchors.left: parent.left
+                        anchors.right: parent.right
+                        anchors.leftMargin: Style.space(6)
+                        anchors.rightMargin: Style.space(6)
+                        y: Style.space(4)
+                        spacing: Style.space(2)
+                        Item {
+                          width: parent.width
+                          height: Math.max(appNameText.implicitHeight, appRightText.implicitHeight)
+                          Text {
+                            id: appIcon
+                            textFormat: Text.PlainText
+                            anchors.left: parent.left
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: root.glyph(0xF08C6)
+                            color: Commons.Color.accent
+                            font.family: root.font
+                            font.pixelSize: Style.font.caption
+                          }
+                          Text {
+                            id: appNameText
+                            textFormat: Text.PlainText
+                            anchors.left: appIcon.right
+                            anchors.leftMargin: Style.space(6)
+                            anchors.right: appRightText.left
+                            anchors.rightMargin: Style.space(6)
+                            anchors.verticalCenter: parent.verticalCenter
+                            elide: Text.ElideRight
+                            text: appRow.pname !== "" ? appRow.pname : root.t("systemOther")
+                            color: root.fg
+                            font.family: root.font
+                            font.pixelSize: Style.font.bodySmall
+                            font.bold: true
+                          }
+                          Text {
+                            id: appRightText
+                            textFormat: Text.PlainText
+                            anchors.right: parent.right
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: appRow.rightText
+                            color: Commons.Color.accent
+                            font.family: root.font
+                            font.pixelSize: Style.font.caption
+                          }
+                        }
+                        Text {
+                          textFormat: Text.PlainText
+                          width: parent.width
+                          leftPadding: Style.space(18)
+                          elide: Text.ElideRight
+                          text: appRow.subText
+                          color: root.dim
+                          font.family: root.font
+                          font.pixelSize: Style.font.caption
+                        }
+                      }
+                      MouseArea {
+                        id: appMouse
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        enabled: appRow.pname !== ""
+                        cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+                        onClicked: root.filterByApp(appRow.pname)
+                      }
+                    }
+                  }
+                }
+
+                // Sub-view 3: Interfaces & DNS
+                Column {
+                  visible: root.netmonView === "interfaces"
+                  width: parent.width
+                  spacing: Style.space(6)
+
+                  Text {
+                    visible: ((root.netmon && root.netmon.interfaces) || []).length === 0
+                    textFormat: Text.PlainText
+                    width: parent.width
+                    wrapMode: Text.WordWrap
+                    text: root.t("collectingIfaces")
+                    color: root.dim
+                    font.family: root.font
+                    font.pixelSize: Style.font.caption
+                  }
+
+                  Repeater {
+                    model: (root.netmon && root.netmon.interfaces) || []
+                    delegate: Rectangle {
+                      id: ifaceCard
+                      required property var modelData
+                      width: monitorPageColumn.width
+                      height: ifaceCol.implicitHeight + Style.space(14)
+                      radius: root.corners.radius
+                      color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.05)
+                      border.width: 1
+                      border.color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.12)
+                      readonly property bool isUp: String(modelData.state || "") === "up"
+                      readonly property int kindCode: modelData.kind === "wifi" ? 0xF05A9
+                        : (modelData.kind === "ethernet" ? 0xF0200
+                          : (modelData.kind === "vpn" ? 0xF099D : 0xF048B))
+                      readonly property string metaLine: {
+                        var parts = []
+                        if (modelData.ip) parts.push("IPv4 " + modelData.ip)
+                        if (modelData.ipv6) parts.push("IPv6 " + modelData.ipv6)
+                        if (modelData.mac) parts.push("MAC " + modelData.mac)
+                        return parts.join("  ·  ")
+                      }
+                      readonly property int errs: Number(modelData.rx_errors || 0) + Number(modelData.tx_errors || 0)
+                      readonly property int drops: Number(modelData.rx_dropped || 0) + Number(modelData.tx_dropped || 0)
+
+                      Column {
+                        id: ifaceCol
+                        anchors.left: parent.left
+                        anchors.right: parent.right
+                        anchors.verticalCenter: parent.verticalCenter
+                        anchors.margins: Style.space(7)
+                        spacing: Style.space(3)
+                        Item {
+                          width: parent.width
+                          height: Math.max(ifaceName.implicitHeight, ifaceState.implicitHeight)
+                          Text {
+                            id: ifaceIcon
+                            textFormat: Text.PlainText
+                            anchors.left: parent.left
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: root.glyph(ifaceCard.kindCode)
+                            color: ifaceCard.isUp ? Commons.Color.accent : root.dim
+                            font.family: root.font
+                            font.pixelSize: Style.font.bodySmall
+                          }
+                          Text {
+                            id: ifaceName
+                            textFormat: Text.PlainText
+                            anchors.left: ifaceIcon.right
+                            anchors.leftMargin: Style.space(6)
+                            anchors.right: ifaceState.left
+                            anchors.rightMargin: Style.space(6)
+                            anchors.verticalCenter: parent.verticalCenter
+                            elide: Text.ElideRight
+                            text: String(ifaceCard.modelData.name || "")
+                            color: root.fg
+                            font.family: root.font
+                            font.pixelSize: Style.font.bodySmall
+                            font.bold: true
+                          }
+                          Text {
+                            id: ifaceState
+                            textFormat: Text.PlainText
+                            anchors.right: parent.right
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: ifaceCard.isUp ? root.t("ifaceUp") : root.t("ifaceDown")
+                            color: ifaceCard.isUp ? Commons.Color.accent : root.dim
+                            font.family: root.font
+                            font.pixelSize: Style.font.caption
+                            font.bold: ifaceCard.isUp
+                          }
+                        }
+                        Text {
+                          textFormat: Text.PlainText
+                          width: parent.width
+                          wrapMode: Text.WordWrap
+                          text: "↓ " + root.formatRate(ifaceCard.modelData.rx_rate) + "  ·  ↑ " + root.formatRate(ifaceCard.modelData.tx_rate)
+                            + "   (" + root.formatBytes(ifaceCard.modelData.rx_bytes) + " / " + root.formatBytes(ifaceCard.modelData.tx_bytes) + ")"
+                          color: root.dim
+                          font.family: root.font
+                          font.pixelSize: Style.font.caption
+                        }
+                        Text {
+                          visible: ifaceCard.metaLine !== ""
+                          textFormat: Text.PlainText
+                          width: parent.width
+                          wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+                          text: ifaceCard.metaLine
+                          color: root.dim
+                          font.family: root.font
+                          font.pixelSize: Style.font.caption
+                        }
+                        Text {
+                          visible: ifaceCard.errs > 0 || ifaceCard.drops > 0
+                          textFormat: Text.PlainText
+                          width: parent.width
+                          text: root.t("errorsDropped", [ifaceCard.errs, ifaceCard.drops])
+                          color: Commons.Color.urgent
+                          font.family: root.font
+                          font.pixelSize: Style.font.caption
+                        }
+                      }
+                    }
+                  }
+
+                  Rectangle {
+                    visible: ((root.netmon && root.netmon.dns) || []).length > 0
+                    width: parent.width
+                    height: dnsCol.implicitHeight + Style.space(14)
+                    radius: root.corners.radius
+                    color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.05)
+                    border.width: 1
+                    border.color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.12)
+                    Column {
+                      id: dnsCol
+                      anchors.left: parent.left
+                      anchors.right: parent.right
+                      anchors.verticalCenter: parent.verticalCenter
+                      anchors.margins: Style.space(7)
+                      spacing: Style.space(3)
+                      PanelSectionHeader { text: root.t("dnsServers").toUpperCase(); foreground: root.fg; fontFamily: root.font }
+                      Text {
+                        textFormat: Text.PlainText
+                        width: parent.width
+                        wrapMode: Text.WordWrap
+                        text: ((root.netmon && root.netmon.dns) || []).join(", ")
+                        color: root.fg
+                        font.family: root.font
+                        font.pixelSize: Style.font.caption
+                      }
+                    }
+                  }
+                }
+              }
+
+              // ---------------------------------------------------------------- setup page
+              Column {
+                id: setupPageColumn
+                visible: root.activePage === "setup"
+                width: parent.width
+                spacing: Style.space(8)
+
+                PanelSeparator { width: parent.width; foreground: root.fg }
+
+                // NetworkManager unavailable warning card.
+                Rectangle {
+                  visible: !root.nmAvailable
+                  width: parent.width
+                  height: nmMissingCol.implicitHeight + Style.space(16)
+                  radius: root.corners.radius
+                  color: Qt.rgba(Commons.Color.urgent.r, Commons.Color.urgent.g, Commons.Color.urgent.b, 0.14)
+                  border.width: 1
+                  border.color: Qt.rgba(Commons.Color.urgent.r, Commons.Color.urgent.g, Commons.Color.urgent.b, 0.5)
+                  Column {
+                    id: nmMissingCol
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    anchors.margins: Style.space(8)
+                    spacing: Style.space(6)
+                    Text {
+                      textFormat: Text.PlainText
+                      width: parent.width
+                      wrapMode: Text.WordWrap
+                      text: root.t("nmUnavailable")
+                      color: root.fg
+                      font.family: root.font
+                      font.pixelSize: Style.font.bodySmall
+                      font.bold: true
+                    }
+                    Text {
+                      textFormat: Text.PlainText
+                      width: parent.width
+                      wrapMode: Text.WordWrap
+                      text: root.t("nmUnavailableHint")
+                      color: root.dim
+                      font.family: root.font
+                      font.pixelSize: Style.font.caption
+                    }
+                    Button {
+                      radius: root.corners.control
+                      text: root.t("sysNetSettings")
+                      iconText: root.glyph(0xF05A9)
+                      bordered: true
+                      foreground: root.fg
+                      fontFamily: root.font
+                      onClicked: root.openSystemNetSettings()
+                    }
+                  }
+                }
+
+                Column {
+                  visible: root.nmAvailable
+                  width: parent.width
+                  spacing: Style.space(8)
+
+                  // Action status / error banner.
+                  Rectangle {
+                    readonly property string errFallback: String(root.wifiState.error || "")
+                    readonly property string bannerMsg: root.wifiStatusText !== "" ? root.wifiStatusText : errFallback
+                    readonly property bool isOk: root.wifiStatusText !== "" && root.wifiStatusOk
+                    visible: bannerMsg !== ""
+                    width: parent.width
+                    height: statusBannerText.implicitHeight + Style.space(14)
+                    radius: root.corners.radius
+                    readonly property color tint: isOk ? root.signalColor(0.85) : Commons.Color.urgent
+                    color: Qt.rgba(tint.r, tint.g, tint.b, 0.14)
+                    border.width: 1
+                    border.color: Qt.rgba(tint.r, tint.g, tint.b, 0.55)
+                    Text {
+                      id: statusBannerText
+                      textFormat: Text.PlainText
+                      anchors.left: parent.left
+                      anchors.right: parent.right
+                      anchors.verticalCenter: parent.verticalCenter
+                      anchors.margins: Style.space(7)
+                      wrapMode: Text.WordWrap
+                      text: root.glyph(parent.isOk ? 0xF012C : 0xF0026) + "  " + parent.bannerMsg
+                      color: root.fg
+                      font.family: root.font
+                      font.pixelSize: Style.font.caption
+                    }
+                  }
+
+                  // Wi-Fi Radio & Controls card.
+                  Rectangle {
+                    width: parent.width
+                    height: radioCardCol.implicitHeight + Style.space(14)
+                    radius: root.corners.radius
+                    color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.05)
+                    border.width: 1
+                    border.color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.12)
+                    Column {
+                      id: radioCardCol
+                      anchors.left: parent.left
+                      anchors.right: parent.right
+                      anchors.verticalCenter: parent.verticalCenter
+                      anchors.margins: Style.space(7)
+                      spacing: Style.space(6)
+
+                      Item {
+                        visible: root.hasWifiDevice
+                        width: parent.width
+                        height: Math.max(wifiRadioLabel.implicitHeight, wifiRadioSwitch.implicitHeight, rescanWifiBtn.implicitHeight)
+                        Text {
+                          id: wifiRadioLabel
+                          textFormat: Text.PlainText
+                          anchors.left: parent.left
+                          anchors.verticalCenter: parent.verticalCenter
+                          text: root.glyph(0xF05A9) + "  " + root.t("wifiLabel")
+                          color: root.fg
+                          font.family: root.font
+                          font.pixelSize: Style.font.bodySmall
+                          font.bold: true
+                        }
+                        ToggleSwitch {
+                          id: wifiRadioSwitch
+                          anchors.left: wifiRadioLabel.right
+                          anchors.leftMargin: Style.space(10)
+                          anchors.verticalCenter: parent.verticalCenter
+                          cursorRing: false
+                          rounded: root.corners.pill > 0
+                          checked: root.wifiRadioOn
+                          enabled: !root.wifiBusy
+                          foreground: root.fg
+                          onToggled: root.toggleWifiRadio(!root.wifiRadioOn)
+                        }
+                        Button {
+                          id: rescanWifiBtn
+                          radius: root.corners.control
+                          anchors.right: parent.right
+                          anchors.verticalCenter: parent.verticalCenter
+                          text: root.wifiScanning ? root.t("scanningWifi") : root.t("rescanWifi")
+                          iconText: root.glyph(0xF0450)
+                          iconSpinning: root.wifiScanning
+                          bordered: true
+                          foreground: root.fg
+                          fontFamily: root.font
+                          enabled: !root.wifiScanning && !root.wifiBusy && root.wifiRadioOn
+                          onClicked: root.triggerWifiScan(true)
+                        }
+                      }
+
+                      Text {
+                        visible: !root.hasWifiDevice
+                        textFormat: Text.PlainText
+                        width: parent.width
+                        wrapMode: Text.WordWrap
+                        text: root.t("noWifiAdapter")
+                        color: root.dim
+                        font.family: root.font
+                        font.pixelSize: Style.font.caption
+                      }
+
+                      Text {
+                        visible: root.stats.active === true
+                        textFormat: Text.PlainText
+                        width: parent.width
+                        wrapMode: Text.WordWrap
+                        text: {
+                          var parts = [(root.link.ssid || root.link.iface || "") + (root.link.ip ? " · " + root.link.ip : "")]
+                          if (root.link.gateway) parts.push(root.t("router") + " " + root.link.gateway)
+                          var dnsList = (root.wifiState && root.wifiState.dns) || []
+                          if (dnsList.length > 0) parts.push("DNS " + dnsList.join(", "))
+                          return parts.join("  ·  ")
+                        }
+                        color: root.dim
+                        font.family: root.font
+                        font.pixelSize: Style.font.caption
+                      }
+                    }
+                  }
+
+                  // Inline Wi-Fi Password Form (secured network, change password, or auth_failed re-prompt).
+                  Rectangle {
+                    visible: root.wifiFormOpen
+                    width: parent.width
+                    height: wifiFormCol.implicitHeight + Style.space(16)
+                    radius: root.corners.radius
+                    color: Qt.rgba(Commons.Color.accent.r, Commons.Color.accent.g, Commons.Color.accent.b, 0.12)
+                    border.width: 1
+                    border.color: Qt.rgba(Commons.Color.accent.r, Commons.Color.accent.g, Commons.Color.accent.b, 0.6)
+                    Column {
+                      id: wifiFormCol
+                      anchors.left: parent.left
+                      anchors.right: parent.right
+                      anchors.verticalCenter: parent.verticalCenter
+                      anchors.margins: Style.space(8)
+                      spacing: Style.space(6)
+
+                      Text {
+                        textFormat: Text.PlainText
+                        width: parent.width
+                        wrapMode: Text.WordWrap
+                        text: root.glyph(0xF05A9) + "  " + root.t("connectToN", [root.wifiFormSsid])
+                        color: root.fg
+                        font.family: root.font
+                        font.pixelSize: Style.font.bodySmall
+                        font.bold: true
+                      }
+
+                      Text {
+                        visible: root.wifiFormNote !== ""
+                        textFormat: Text.PlainText
+                        width: parent.width
+                        wrapMode: Text.WordWrap
+                        text: root.wifiFormNote
+                        color: Commons.Color.urgent
+                        font.family: root.font
+                        font.pixelSize: Style.font.caption
+                      }
+
+                      KeyTextField {
+                        id: wifiPasswordField
+                        radius: root.corners.control
+                        width: parent.width
+                        password: !root.wifiShowPassword
+                        maximumLength: 64
+                        placeholderText: root.t("wifiPasswordHint")
+                        foreground: root.fg
+                        font: Qt.font({ family: root.font, pixelSize: Style.font.caption })
+                        onAccepted: root.submitWifiPassword()
+                        Keys.onPressed: function(event) {
+                          if (event.key === Qt.Key_Escape) {
+                            root.closeWifiForm()
+                            event.accepted = true
+                          }
+                        }
+                        Text {
+                          id: wifiEyeIcon
+                          textFormat: Text.PlainText
+                          anchors.right: parent.right
+                          anchors.rightMargin: Style.space(8)
+                          anchors.verticalCenter: parent.verticalCenter
+                          text: root.glyph(root.wifiShowPassword ? 0xF0209 : 0xF0208)
+                          color: wifiEyeMouse.containsMouse ? Commons.Color.accent : root.dim
+                          font.family: root.font
+                          font.pixelSize: Style.font.body
+                          MouseArea {
+                            id: wifiEyeMouse
+                            anchors.fill: parent
+                            anchors.margins: -Style.space(4)
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: {
+                              root.wifiShowPassword = !root.wifiShowPassword
+                              wifiPasswordField.forceActiveFocus()
+                            }
+                          }
+                          PanelToolTip {
+                            visible: wifiEyeMouse.containsMouse
+                            text: root.wifiShowPassword ? root.t("hidePassword") : root.t("showPassword")
+                            fontFamily: root.font
+                          }
+                        }
+                      }
+
+                      Flow {
+                        width: parent.width
+                        spacing: Style.space(8)
+                        Button {
+                          radius: root.corners.control
+                          text: root.wifiBusy ? root.t("connecting") : root.t("connect")
+                          iconText: root.glyph(0xF0306)
+                          bordered: true
+                          foreground: root.fg
+                          fontFamily: root.font
+                          enabled: !root.wifiBusy && root.wifiPasswordValid(wifiPasswordField.text)
+                          onClicked: root.submitWifiPassword()
+                        }
+                        Button {
+                          radius: root.corners.control
+                          text: root.t("cancel")
+                          bordered: true
+                          foreground: root.fg
+                          fontFamily: root.font
+                          onClicked: root.closeWifiForm()
+                        }
+                      }
+                    }
+                  }
+
+                  // Saved Wi-Fi networks
+                  Column {
+                    visible: root.hasWifiDevice && ((root.wifiState.known || []).length > 0)
+                    width: parent.width
+                    spacing: Style.space(5)
+                    PanelSectionHeader { text: root.t("savedWifi").toUpperCase(); foreground: root.fg; fontFamily: root.font }
+
+                    Repeater {
+                      model: (root.wifiState && root.wifiState.known) || []
+                      delegate: Rectangle {
+                        id: knownCard
+                        required property var modelData
+                        width: setupPageColumn.width
+                        height: knownRow.implicitHeight + Style.space(12)
+                        radius: root.corners.control
+                        color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.04)
+                        border.width: 1
+                        border.color: modelData.active === true
+                          ? Qt.rgba(Commons.Color.accent.r, Commons.Color.accent.g, Commons.Color.accent.b, 0.45)
+                          : Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.10)
+                        Item {
+                          id: knownRow
+                          anchors.left: parent.left
+                          anchors.right: parent.right
+                          anchors.verticalCenter: parent.verticalCenter
+                          anchors.leftMargin: Style.space(7)
+                          anchors.rightMargin: Style.space(7)
+                          implicitHeight: Math.max(knownInfo.implicitHeight, knownActions.implicitHeight)
+
+                          Text {
+                            id: knownIcon
+                            textFormat: Text.PlainText
+                            anchors.left: parent.left
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: root.glyph(0xF05A9)
+                            color: knownCard.modelData.active === true ? Commons.Color.accent : root.dim
+                            font.family: root.font
+                            font.pixelSize: Style.font.body
+                          }
+                          Column {
+                            id: knownInfo
+                            anchors.left: knownIcon.right
+                            anchors.leftMargin: Style.space(6)
+                            anchors.right: knownActions.left
+                            anchors.rightMargin: Style.space(6)
+                            anchors.verticalCenter: parent.verticalCenter
+                            spacing: Style.space(1)
+                            Text {
+                              textFormat: Text.PlainText
+                              width: parent.width
+                              elide: Text.ElideRight
+                              text: String(knownCard.modelData.name || "")
+                              color: root.fg
+                              font.family: root.font
+                              font.pixelSize: Style.font.bodySmall
+                              font.bold: true
+                            }
+                            Text {
+                              textFormat: Text.PlainText
+                              width: parent.width
+                              elide: Text.ElideRight
+                              text: knownCard.modelData.active === true ? root.t("stConnected") : root.t("stSaved")
+                              color: knownCard.modelData.active === true ? Commons.Color.accent : root.dim
+                              font.family: root.font
+                              font.pixelSize: Style.font.caption
+                            }
+                          }
+                          Row {
+                            id: knownActions
+                            anchors.right: parent.right
+                            anchors.verticalCenter: parent.verticalCenter
+                            spacing: Style.space(4)
+                            Button {
+                              radius: root.corners.control
+                              text: knownCard.modelData.active === true ? root.t("disconnect") : root.t("connect")
+                              bordered: true
+                              foreground: root.fg
+                              fontFamily: root.font
+                              enabled: !root.wifiBusy
+                              onClicked: {
+                                if (knownCard.modelData.active === true) root.disconnectWifi(knownCard.modelData.uuid)
+                                else root.connectKnownWifi(knownCard.modelData.uuid, knownCard.modelData.ssid || knownCard.modelData.name)
+                              }
+                            }
+                            Button {
+                              radius: root.corners.control
+                              iconText: root.glyph(0xF03EB)
+                              bordered: true
+                              foreground: root.fg
+                              fontFamily: root.font
+                              enabled: !root.wifiBusy
+                              tooltipText: root.t("changePassword")
+                              onClicked: root.openWifiPasswordForm(knownCard.modelData.ssid || knownCard.modelData.name, knownCard.modelData.uuid, root.t("changePwHint"))
+                            }
+                            Button {
+                              radius: root.corners.control
+                              iconText: root.glyph(0xF0A7A)
+                              bordered: true
+                              foreground: root.fg
+                              fontFamily: root.font
+                              enabled: !root.wifiBusy
+                              tooltipText: root.t("forget")
+                              onClicked: root.forgetWifi(knownCard.modelData.uuid)
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+
+                  // Available Wi-Fi networks
+                  Column {
+                    visible: root.hasWifiDevice && root.wifiRadioOn
+                    width: parent.width
+                    spacing: Style.space(5)
+                    PanelSectionHeader { text: root.t("availableNetworks").toUpperCase(); foreground: root.fg; fontFamily: root.font }
+
+                    KeyTextField {
+                      id: wifiSearchField
+                      radius: root.corners.control
+                      visible: root.unseenWifiNetworks.length > 8 || root.wifiSearchText !== ""
+                      width: parent.width
+                      placeholderText: root.glyph(0xF0349) + "  " + root.t("filterWifi")
+                      maximumLength: 40
+                      foreground: root.fg
+                      font: Qt.font({ family: root.font, pixelSize: Style.font.caption })
+                      onTextChanged: root.wifiSearchText = text
+                      Keys.onPressed: function(event) {
+                        if (event.key === Qt.Key_Escape) {
+                          wifiSearchField.clear()
+                          keyCatcher.forceActiveFocus()
+                          event.accepted = true
+                        }
+                      }
+                    }
+
+                    Text {
+                      visible: root.filteredVisibleWifi.length === 0
+                      textFormat: Text.PlainText
+                      width: parent.width
+                      wrapMode: Text.WordWrap
+                      text: root.wifiScanning ? root.t("scanningForWifi") : root.t("noOtherWifi")
+                      color: root.dim
+                      font.family: root.font
+                      font.pixelSize: Style.font.caption
+                    }
+
+                    Repeater {
+                      model: root.filteredVisibleWifi
+                      delegate: Rectangle {
+                        id: visCard
+                        required property var modelData
+                        width: setupPageColumn.width
+                        height: visRow.implicitHeight + Style.space(12)
+                        radius: root.corners.control
+                        color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.04)
+                        border.width: 1
+                        border.color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.10)
+                        readonly property string sec: String(modelData.security || "")
+                        readonly property bool isOpen: sec.trim() === "" || sec === "--"
+                        readonly property bool isEnterprise: sec.toUpperCase().indexOf("802.1X") !== -1
+                        readonly property string metaText: {
+                          var parts = [isOpen ? root.t("openNetwork") : sec]
+                          if (modelData.band) parts.push(String(modelData.band))
+                          if (modelData.channel !== null && modelData.channel !== undefined && String(modelData.channel) !== "")
+                            parts.push(root.t("chN", [modelData.channel]))
+                          parts.push(Math.round(Number(modelData.signal || 0)) + " %")
+                          return parts.join(" · ")
+                        }
+
+                        Item {
+                          id: visRow
+                          anchors.left: parent.left
+                          anchors.right: parent.right
+                          anchors.verticalCenter: parent.verticalCenter
+                          anchors.leftMargin: Style.space(7)
+                          anchors.rightMargin: Style.space(7)
+                          implicitHeight: Math.max(visInfo.implicitHeight, visBtn.implicitHeight)
+
+                          SignalBars {
+                            id: visBars
+                            anchors.left: parent.left
+                            anchors.verticalCenter: parent.verticalCenter
+                            quality: Number(visCard.modelData.signal || 0)
+                          }
+                          Column {
+                            id: visInfo
+                            anchors.left: visBars.right
+                            anchors.leftMargin: Style.space(8)
+                            anchors.right: visBtn.left
+                            anchors.rightMargin: Style.space(6)
+                            anchors.verticalCenter: parent.verticalCenter
+                            spacing: Style.space(1)
+                            Text {
+                              textFormat: Text.PlainText
+                              width: parent.width
+                              elide: Text.ElideRight
+                              text: String(visCard.modelData.ssid || "")
+                              color: root.fg
+                              font.family: root.font
+                              font.pixelSize: Style.font.bodySmall
+                              font.bold: true
+                            }
+                            Text {
+                              textFormat: Text.PlainText
+                              width: parent.width
+                              elide: Text.ElideRight
+                              text: visCard.metaText
+                              color: root.dim
+                              font.family: root.font
+                              font.pixelSize: Style.font.caption
+                            }
+                          }
+                          Button {
+                            id: visBtn
+                            radius: root.corners.control
+                            anchors.right: parent.right
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: visCard.isEnterprise ? root.t("settings") : root.t("connect")
+                            bordered: true
+                            foreground: root.fg
+                            fontFamily: root.font
+                            enabled: visCard.isEnterprise || !root.wifiBusy
+                            onClicked: {
+                              if (visCard.isEnterprise) root.openSystemNetSettings()
+                              else root.connectVisibleWifi(visCard.modelData.ssid, !visCard.isOpen)
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+
+                  // Wired (Ethernet) connections
+                  Column {
+                    visible: ((root.wifiState.wired || []).length > 0) || ((root.wifiState.wired_devices || []).length > 0)
+                    width: parent.width
+                    spacing: Style.space(5)
+                    PanelSectionHeader { text: root.t("wired").toUpperCase(); foreground: root.fg; fontFamily: root.font }
+
+                    Text {
+                      visible: root.allWiredUnplugged
+                      textFormat: Text.PlainText
+                      width: parent.width
+                      wrapMode: Text.WordWrap
+                      text: root.t("noCable")
+                      color: root.dim
+                      font.family: root.font
+                      font.pixelSize: Style.font.caption
+                    }
+
+                    Repeater {
+                      model: (root.wifiState && root.wifiState.wired) || []
+                      delegate: Rectangle {
+                        id: wiredCard
+                        required property var modelData
+                        width: setupPageColumn.width
+                        height: wiredRow.implicitHeight + Style.space(12)
+                        radius: root.corners.control
+                        color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.04)
+                        border.width: 1
+                        border.color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.10)
+                        Item {
+                          id: wiredRow
+                          anchors.left: parent.left
+                          anchors.right: parent.right
+                          anchors.verticalCenter: parent.verticalCenter
+                          anchors.leftMargin: Style.space(7)
+                          anchors.rightMargin: Style.space(7)
+                          implicitHeight: Math.max(wiredName.implicitHeight, wiredToggle.implicitHeight)
+                          Text {
+                            id: wiredIcon
+                            textFormat: Text.PlainText
+                            anchors.left: parent.left
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: root.glyph(0xF0200)
+                            color: wiredCard.modelData.active === true ? Commons.Color.accent : root.dim
+                            font.family: root.font
+                            font.pixelSize: Style.font.body
+                          }
+                          Text {
+                            id: wiredName
+                            textFormat: Text.PlainText
+                            anchors.left: wiredIcon.right
+                            anchors.leftMargin: Style.space(8)
+                            anchors.right: wiredToggle.left
+                            anchors.rightMargin: Style.space(8)
+                            anchors.verticalCenter: parent.verticalCenter
+                            elide: Text.ElideRight
+                            text: String(wiredCard.modelData.name || "")
+                            color: root.fg
+                            font.family: root.font
+                            font.pixelSize: Style.font.bodySmall
+                            font.bold: true
+                          }
+                          ToggleSwitch {
+                            id: wiredToggle
+                            anchors.right: parent.right
+                            anchors.verticalCenter: parent.verticalCenter
+                            cursorRing: false
+                            rounded: root.corners.pill > 0
+                            checked: wiredCard.modelData.active === true
+                            enabled: !root.wifiBusy
+                            foreground: root.fg
+                            onToggled: root.toggleConn(wiredCard.modelData.uuid, !(wiredCard.modelData.active === true))
+                          }
+                        }
+                      }
+                    }
+                  }
+
+                  // VPN connections
+                  Column {
+                    visible: (root.wifiState.vpn || []).length > 0
+                    width: parent.width
+                    spacing: Style.space(5)
+                    PanelSectionHeader { text: root.t("vpnLabel").toUpperCase(); foreground: root.fg; fontFamily: root.font }
+
+                    Repeater {
+                      model: (root.wifiState && root.wifiState.vpn) || []
+                      delegate: Rectangle {
+                        id: vpnCard
+                        required property var modelData
+                        width: setupPageColumn.width
+                        height: vpnCardRow.implicitHeight + Style.space(12)
+                        radius: root.corners.control
+                        color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.04)
+                        border.width: 1
+                        border.color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.10)
+                        Item {
+                          id: vpnCardRow
+                          anchors.left: parent.left
+                          anchors.right: parent.right
+                          anchors.verticalCenter: parent.verticalCenter
+                          anchors.leftMargin: Style.space(7)
+                          anchors.rightMargin: Style.space(7)
+                          implicitHeight: Math.max(vpnNameText.implicitHeight, vpnToggle.implicitHeight)
+                          Text {
+                            id: vpnCardIcon
+                            textFormat: Text.PlainText
+                            anchors.left: parent.left
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: root.glyph(0xF099D)
+                            color: vpnCard.modelData.active === true ? Commons.Color.accent : root.dim
+                            font.family: root.font
+                            font.pixelSize: Style.font.body
+                          }
+                          Text {
+                            id: vpnNameText
+                            textFormat: Text.PlainText
+                            anchors.left: vpnCardIcon.right
+                            anchors.leftMargin: Style.space(8)
+                            anchors.right: vpnToggle.left
+                            anchors.rightMargin: Style.space(8)
+                            anchors.verticalCenter: parent.verticalCenter
+                            elide: Text.ElideRight
+                            text: String(vpnCard.modelData.name || "")
+                            color: root.fg
+                            font.family: root.font
+                            font.pixelSize: Style.font.bodySmall
+                            font.bold: true
+                          }
+                          ToggleSwitch {
+                            id: vpnToggle
+                            anchors.right: parent.right
+                            anchors.verticalCenter: parent.verticalCenter
+                            cursorRing: false
+                            rounded: root.corners.pill > 0
+                            checked: vpnCard.modelData.active === true
+                            enabled: !root.wifiBusy
+                            foreground: root.fg
+                            onToggled: root.toggleConn(vpnCard.modelData.uuid, !(vpnCard.modelData.active === true))
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+
               PanelSeparator { width: parent.width; foreground: root.fg }
 
               Flow {
                 width: parent.width
                 spacing: Style.space(8)
                 Button {
+                  visible: root.activePage === "devices" || root.activePage === "map"
                   radius: root.corners.control
                   // Same label and glyph while scanning (the icon just spins), so the
                   // button keeps its width and the buttons next to it do not move.
@@ -2452,8 +4372,9 @@ Panel {
                   onClicked: if (root.hostWidget) root.hostWidget.rescan()
                 }
                 Button {
+                  visible: (root.activePage === "devices" || root.activePage === "map")
+                    && root.gatewayDevice !== null && String(root.gatewayDevice.web_url || "") !== ""
                   radius: root.corners.control
-                  visible: root.gatewayDevice !== null && String(root.gatewayDevice.web_url || "") !== ""
                   text: root.t("kRouter")
                   iconText: root.glyph(0xF0469)
                   bordered: true
@@ -2463,8 +4384,8 @@ Panel {
                   onClicked: if (root.gatewayDevice) root.openWeb(root.gatewayDevice.web_url)
                 }
                 Button {
+                  visible: (root.activePage === "devices" || root.activePage === "map") && root.stats.active === true
                   radius: root.corners.control
-                  visible: root.stats.active === true
                   text: root.trusted ? root.t("untrust") : root.t("trust")
                   iconText: root.glyph(root.trusted ? 0xF099C : 0xF0565)
                   bordered: true
@@ -2477,18 +4398,46 @@ Panel {
                   onClicked: if (root.hostWidget) root.hostWidget.setTrusted(!root.trusted)
                 }
                 Button {
+                  visible: root.activePage === "devices" || root.activePage === "map"
                   radius: root.corners.control
                   iconText: root.glyph(0xF05A9)
                   bordered: true
                   foreground: root.fg
                   fontFamily: root.font
                   tooltipText: root.t("wifiTip")
-                  onClicked: {
-                    root.close()
-                    // Third-party plugins may not summon built-in panels directly, so go
-                    // through the shell CLI (fixed argv, no shell string).
-                    Quickshell.execDetached(["omarchy-shell", "shell", "summon", "omarchy.network", "{}"])
-                  }
+                  onClicked: root.openSystemNetSettings()
+                }
+                Button {
+                  visible: root.activePage === "monitor"
+                  radius: root.corners.control
+                  text: root.netmonPaused ? root.t("resume") : root.t("pause")
+                  iconText: root.glyph(root.netmonPaused ? 0xF040A : 0xF03E4)
+                  bordered: true
+                  foreground: root.fg
+                  fontFamily: root.font
+                  tooltipText: root.netmonPaused ? root.t("resumeTip") : root.t("pauseTip")
+                  onClicked: root.netmonPaused = !root.netmonPaused
+                }
+                Button {
+                  visible: root.activePage === "monitor"
+                  radius: root.corners.control
+                  text: root.netmonTableCopied ? root.t("copied") : root.t("copyTable")
+                  iconText: root.glyph(root.netmonTableCopied ? 0xF012C : 0xF018F)
+                  bordered: true
+                  foreground: root.fg
+                  fontFamily: root.font
+                  onClicked: root.copyNetmonTable()
+                }
+                Button {
+                  visible: root.activePage === "setup"
+                  radius: root.corners.control
+                  text: root.t("sysNetSettings")
+                  iconText: root.glyph(0xF05A9)
+                  bordered: true
+                  foreground: root.fg
+                  fontFamily: root.font
+                  tooltipText: root.t("wifiTip")
+                  onClicked: root.openSystemNetSettings()
                 }
               }
             }

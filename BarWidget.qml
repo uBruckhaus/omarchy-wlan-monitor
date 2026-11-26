@@ -20,6 +20,8 @@ Ui.BarWidget {
   property var stats: ({})
   // Push every snapshot into the panel; never let it read from an older widget instance.
   onStatsChanged: if (panelLoader.item && "stats" in panelLoader.item) panelLoader.item.stats = root.stats
+  property var wifiState: ({})
+  onWifiStateChanged: if (panelLoader.item && "wifiState" in panelLoader.item) panelLoader.item.wifiState = root.wifiState
   readonly property bool active: stats.active === true
   readonly property int onlineCount: Number(stats.online_count || 0)
   readonly property int totalCount: Number(stats.total_count || 0)
@@ -141,8 +143,20 @@ Ui.BarWidget {
     send("rescan")
   }
   function setTrusted(trust) { send(trust ? "trust" : "untrust") }
-  // Per-device commands; JSON.stringify keeps them on one line, the collector validates them.
+  // Per-device and feature commands; JSON.stringify keeps them on one line, the collector validates them.
   function sendJson(payload) { send(JSON.stringify(payload)) }
+  function setNetmonMode(on, resolve) { sendJson({ cmd: "netmon", on: on === true, resolve: resolve === true }) }
+  function wifiScan(rescan) { sendJson({ cmd: "wifi_scan", rescan: rescan === true }) }
+  function wifiRadio(on) { sendJson({ cmd: "wifi_radio", on: on === true }) }
+  function wifiConnect(ssid, password, uuid) {
+    var payload = { cmd: "wifi_connect", ssid: String(ssid || "") }
+    if (uuid !== null && uuid !== undefined && String(uuid) !== "") payload.uuid = String(uuid)
+    if (password !== null && password !== undefined) payload.password = String(password)
+    sendJson(payload)
+  }
+  function wifiDisconnect(uuid) { sendJson({ cmd: "wifi_disconnect", uuid: String(uuid || "") }) }
+  function wifiForget(uuid) { sendJson({ cmd: "wifi_forget", uuid: String(uuid || "") }) }
+  function connToggle(uuid, up) { sendJson({ cmd: up === true ? "conn_up" : "conn_down", uuid: String(uuid || "") }) }
 
   // Background collector streaming a JSON snapshot every 3 s (panel open) / 6 s (closed).
   Process {
@@ -155,6 +169,15 @@ Ui.BarWidget {
         try {
           var data = JSON.parse(line)
           if (data.event === "scanning") { root.scanBusy = true; return }
+          if (data.event === "wifi_state") {
+            root.wifiState = data
+            if (panelLoader.item && typeof panelLoader.item.onWifiState === "function") panelLoader.item.onWifiState(data)
+            return
+          }
+          if (data.event === "wifi_result") {
+            if (panelLoader.item && typeof panelLoader.item.onWifiResult === "function") panelLoader.item.onWifiResult(data)
+            return
+          }
           if (data.error) return
           root.stats = data
           root.scanBusy = false
@@ -164,12 +187,24 @@ Ui.BarWidget {
     }
     onRunningChanged: if (running) Qt.callLater(function() {
       root.sendJson({ cmd: "lang", lang: root.lang })
-      if (root.opened) root.send("open")
+      if (root.opened) {
+        root.send("open")
+        if (panelLoader.item && typeof panelLoader.item.syncNetmonMode === "function") panelLoader.item.syncNetmonMode()
+      }
     })
-    onExited: { root.scanBusy = false; root.rescanPending = false; restart.start() }
+    onExited: {
+      root.scanBusy = false
+      root.rescanPending = false
+      if (panelLoader.item && typeof panelLoader.item.onCollectorReset === "function") panelLoader.item.onCollectorReset()
+      restart.start()
+    }
   }
   Timer { id: restart; interval: 5000; onTriggered: collector.running = true }
-  onOpenedChanged: send(opened ? "open" : "closed")
+  onOpenedChanged: {
+    send(opened ? "open" : "closed")
+    if (!opened) setNetmonMode(false, false)
+    else if (panelLoader.item && typeof panelLoader.item.syncNetmonMode === "function") panelLoader.item.syncNetmonMode()
+  }
 
   function injectPanel() {
     var target = panelLoader.item
@@ -178,6 +213,7 @@ Ui.BarWidget {
     if ("anchorItem" in target) target.anchorItem = button
     if ("hostWidget" in target) target.hostWidget = root
     if ("stats" in target) target.stats = root.stats
+    if ("wifiState" in target) target.wifiState = root.wifiState
   }
 
   // Shape contract for shell summon/hide/toggle routing.
