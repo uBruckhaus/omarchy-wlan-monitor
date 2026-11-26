@@ -335,6 +335,7 @@ class McpProtocolTests(unittest.TestCase):
             monitor=self.mon,
             net_monitor=self.net,
             wifi_setup_module=self.wifi,
+            allow_changes=True,
         )
 
     def _call_tool(self, name, arguments=None):
@@ -351,7 +352,7 @@ class McpProtocolTests(unittest.TestCase):
         )
         self.assertEqual(init["result"]["protocolVersion"], "2025-03-26")
         self.assertEqual(init["result"]["serverInfo"]["name"], "omarchy-wlan-monitor")
-        self.assertEqual(init["result"]["serverInfo"]["version"], "0.11.0")
+        self.assertEqual(init["result"]["serverInfo"]["version"], wlan_mcp.SERVER_VERSION)
 
         # Unknown protocol falls back to default
         init2 = self.server.handle_message(
@@ -461,7 +462,7 @@ class McpProtocolTests(unittest.TestCase):
         self.wifi.get_wifi_state.assert_called_with(rescan=True)
         self.assertEqual(wlist["active_ssid"], "FRITZ!Box 7690")
 
-        err, resc = self._call_tool("wlan_rescan")
+        err, resc = self._call_tool("wlan_rescan", {"confirm": True})
         self.assertFalse(err)
         self.assertEqual(self.mon.force_scans, 1)
 
@@ -472,32 +473,32 @@ class McpProtocolTests(unittest.TestCase):
 
     def test_mutation_tools_and_password_policy(self):
         # wlan_set_device
-        err, upd = self._call_tool("wlan_set_device", {"target": "Living Room TV", "name": "OLED TV", "pinned": False, "known": True})
+        err, upd = self._call_tool("wlan_set_device", {"target": "Living Room TV", "name": "OLED TV", "pinned": False, "known": True, "confirm": True})
         self.assertFalse(err)
         self.assertEqual(upd["device"]["name"], "OLED TV")
         self.assertFalse(upd["device"]["pinned"])
 
         # Conflict pinned + hidden
-        err, bad = self._call_tool("wlan_set_device", {"target": "OLED TV", "pinned": True, "hidden": True})
+        err, bad = self._call_tool("wlan_set_device", {"target": "OLED TV", "pinned": True, "hidden": True, "confirm": True})
         self.assertTrue(err)
 
         # wlan_set_trust
-        err, tr = self._call_tool("wlan_set_trust", {"trusted": False, "alerts": False})
+        err, tr = self._call_tool("wlan_set_trust", {"trusted": False, "alerts": False, "confirm": True})
         self.assertFalse(err)
         self.assertFalse(tr["trusted"])
         self.assertFalse(tr["alerts"])
 
         # wlan_wifi_radio
         self.wifi.set_wifi_radio.return_value = {"ok": True, "action": "radio", "wifi_on": False, "message": "Wi-Fi disabled."}
-        err, rad = self._call_tool("wlan_wifi_radio", {"on": False})
+        err, rad = self._call_tool("wlan_wifi_radio", {"on": False, "confirm": True})
         self.assertFalse(err)
         self.assertFalse(rad["wifi_on"])
 
         # wlan_wifi_connect refuses password over MCP (must enter in Setup UI) and redacts secret
         secret = "UltraSecretPass99!"
-        err, rejected = self._call_tool("wlan_wifi_connect", {"ssid": "Office", "password": secret})
+        err, rejected = self._call_tool("wlan_wifi_connect", {"ssid": "Office", "password": secret, "confirm": True})
         self.assertTrue(err)
-        self.assertIn("Setup UI", rejected["error"])
+        self.assertIn("password", rejected["error"])
         self.assertNotIn(secret, json.dumps(rejected))
         self.wifi.wifi_connect.assert_not_called()
 
@@ -514,7 +515,7 @@ class McpProtocolTests(unittest.TestCase):
             "uuid": UUID_WIFI,
             "message": "Secrets were required",
         }
-        err, conn = self._call_tool("wlan_wifi_connect", {"uuid": UUID_WIFI})
+        err, conn = self._call_tool("wlan_wifi_connect", {"uuid": UUID_WIFI, "confirm": True})
         self.assertTrue(err)
         self.assertTrue(conn["auth_failed"])
         self.wifi.wifi_connect.assert_called_with(ssid="", password=None, uuid=UUID_WIFI)
@@ -527,20 +528,66 @@ class McpProtocolTests(unittest.TestCase):
             "uuid": "",
             "message": "Connected to OpenCafe.",
         }
-        err, conn_ok = self._call_tool("wlan_wifi_connect", {"ssid": "OpenCafe"})
+        err, conn_ok = self._call_tool("wlan_wifi_connect", {"ssid": "OpenCafe", "confirm": True})
         self.assertFalse(err)
         self.assertTrue(conn_ok["ok"])
 
         # wlan_wifi_disconnect & forget
-        self.wifi.connection_down.return_value = {"ok": True, "action": "conn_down", "uuid": UUID_WIFI, "message": "Disconnected"}
-        err, disc = self._call_tool("wlan_wifi_disconnect", {"uuid": UUID_WIFI})
+        self.wifi.wifi_disconnect.return_value = {"ok": True, "action": "disconnect", "uuid": UUID_WIFI, "message": "Disconnected"}
+        err, disc = self._call_tool("wlan_wifi_disconnect", {"uuid": UUID_WIFI, "confirm": True})
         self.assertFalse(err)
         self.assertTrue(disc["ok"])
+        self.wifi.connection_down.assert_not_called()  # Wi-Fi only: Ethernet/VPN never touched
 
         self.wifi.wifi_forget.return_value = {"ok": True, "action": "forget", "uuid": UUID_WIFI, "message": "Forgot"}
-        err, forg = self._call_tool("wlan_wifi_forget", {"uuid": UUID_WIFI})
+        err, wrong = self._call_tool("wlan_wifi_forget", {"uuid": UUID_WIFI, "ssid": "Other", "confirm": True})
+        self.assertTrue(err)
+        self.wifi.wifi_forget.assert_not_called()
+        err, forg = self._call_tool("wlan_wifi_forget", {"uuid": UUID_WIFI, "ssid": "FRITZ!Box 7690", "confirm": True})
         self.assertFalse(err)
         self.assertTrue(forg["ok"])
+
+    def test_writes_need_confirm(self):
+        err, out = self._call_tool("wlan_wifi_radio", {"on": False})
+        self.assertTrue(err)
+        self.assertIn("confirm", out["error"])
+        self.wifi.set_wifi_radio.assert_not_called()
+
+    def test_unknown_argument_keys_rejected_without_values(self):
+        err, out = self._call_tool("wlan_status", {"psk": "TopSecret123", "refresh": True})
+        self.assertTrue(err)
+        self.assertIn("psk", out["error"])
+        self.assertNotIn("TopSecret123", json.dumps(out))
+
+    def test_read_only_by_default(self):
+        srv = wlan_mcp.WlanMCPServer(monitor=self.mon, net_monitor=self.net, wifi_setup_module=self.wifi)
+        resp = srv.handle_message({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        names = {t["name"] for t in resp["result"]["tools"]}
+        self.assertFalse(names & wlan_mcp.WRITE_TOOLS)
+        for name, args in (("wlan_wifi_forget", {"uuid": UUID_WIFI, "ssid": "FRITZ!Box 7690", "confirm": True}),
+                           ("wlan_rescan", {"confirm": True}),
+                           ("wlan_list_devices", {"rescan": True})):
+            resp = srv.handle_message({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                                       "params": {"name": name, "arguments": args}})
+            self.assertTrue(resp["result"]["isError"], name)
+        self.wifi.wifi_forget.assert_not_called()
+        self.assertEqual(self.mon.force_scans, 0)
+
+    def test_server_is_never_the_fritz_leader(self):
+        wmod = wlan_mcp.load_wlan_module()
+        with mock.patch.object(wmod, "Monitor") as monitor_cls:
+            wlan_mcp.WlanMCPServer(wlan_module=wmod, net_monitor=self.net, wifi_setup_module=self.wifi)
+        monitor_cls.assert_called_once_with(can_lead=False)
+        bare = wmod.Monitor.__new__(wmod.Monitor)
+        bare.can_lead, bare.fritz = False, None
+        with mock.patch.object(wmod, "take_leader_lock") as take:
+            self.assertFalse(bare.lead())
+        take.assert_not_called()
+
+    def test_tools_carry_annotations(self):
+        for tool in wlan_mcp.TOOLS:
+            ann = tool["annotations"]
+            self.assertEqual(ann["readOnlyHint"], tool["name"] not in wlan_mcp.WRITE_TOOLS)
 
     def test_stdio_transport_framing_and_safety(self):
         lines = [

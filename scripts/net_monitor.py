@@ -28,6 +28,8 @@ RDNS_CACHE_MAX = 512
 RDNS_TTL = 600.0
 RDNS_NEGATIVE_TTL = 120.0
 RDNS_QUEUE_MAX = 64
+MAX_CONNECTIONS = 500   # rows sent per snapshot (the summary still counts all)
+MAX_PROCESSES = 128
 
 WELL_KNOWN_SERVICES = {
     20: "FTP-Data",
@@ -302,14 +304,28 @@ def parse_addr_port(token):
     return ip_clean, port, is_v6
 
 
+def own_process(pid, proc_root="/proc"):
+    """True only for a process of this user (another account's command line is never shown)."""
+    try:
+        return os.stat(os.path.join(proc_root, str(pid))).st_uid == os.getuid()
+    except OSError:
+        return False
+
+
 def read_cmdline(pid, proc_root="/proc"):
-    """Read and sanitize /proc/<pid>/cmdline, truncated to 160 chars."""
+    """Read and sanitize /proc/<pid>/cmdline of one of this user's processes, truncated to 160
+    chars. The owner is checked before and after the read, so a PID reused meanwhile by another
+    account's process is never read."""
     if not isinstance(pid, int) or pid <= 0:
+        return ""
+    if not own_process(pid, proc_root):
         return ""
     try:
         with open(os.path.join(proc_root, str(pid), "cmdline"), "rb") as handle:
             raw = handle.read(4096)
     except OSError:
+        return ""
+    if not own_process(pid, proc_root):
         return ""
     if not raw:
         return ""
@@ -437,6 +453,8 @@ def build_inode_pid_map(proc_root="/proc"):
         if not entry.isdigit():
             continue
         pid = int(entry)
+        if not own_process(pid, proc_root):
+            continue
         fd_dir = os.path.join(proc_root, entry, "fd")
         try:
             fds = os.listdir(fd_dir)
@@ -765,7 +783,11 @@ class NetMonitor:
     # -- bounded non-blocking reverse DNS
 
     def _lookup_rdns_cached(self, ip_str, now):
-        if not ip_str or ip_str in ("*", "0.0.0.0", "::") or classify_scope(ip_str) == "loopback":
+        try:
+            ip_str = str(ipaddress.ip_address(ip_str))  # only real IP literals are looked up
+        except ValueError:
+            return ""
+        if ip_str in ("0.0.0.0", "::") or classify_scope(ip_str) == "loopback":
             return ""
         with self._rdns_lock:
             entry = self._rdns_cache.get(ip_str)
@@ -775,8 +797,11 @@ class NetMonitor:
                 return entry[1] if entry is not None else ""
             self._rdns_pending.add(ip_str)
 
-        t = threading.Thread(target=self._rdns_worker, args=(ip_str,), daemon=True)
-        t.start()
+        try:
+            threading.Thread(target=self._rdns_worker, args=(ip_str,), daemon=True).start()
+        except RuntimeError:  # no thread available: the slot is freed, nothing is looked up
+            with self._rdns_lock:
+                self._rdns_pending.discard(ip_str)
         return ""
 
     def _rdns_worker(self, ip_str):
@@ -784,7 +809,7 @@ class NetMonitor:
         try:
             name, _, _ = socket.gethostbyaddr(ip_str)
             host = clean(name, 80)
-        except (OSError, socket.herror, socket.gaierror):
+        except Exception:  # any failure is a negative answer; the slot is always freed below
             host = ""
         now = time.monotonic()
         ttl = RDNS_TTL if host else RDNS_NEGATIVE_TTL
@@ -969,11 +994,12 @@ class NetMonitor:
             "tx_bytes": total_tx_bytes,
         }
 
+        summary["shown"] = min(len(connections), MAX_CONNECTIONS)
         return {
             "time": int(time.time()),
             "summary": summary,
-            "connections": connections,
-            "processes": processes,
+            "connections": connections[:MAX_CONNECTIONS],
+            "processes": processes[:MAX_PROCESSES],
             "interfaces": interfaces,
             "dns": read_dns_servers(self.resolv_path),
             "history": list(self.history),

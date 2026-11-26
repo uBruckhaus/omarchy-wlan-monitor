@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "ubruckhaus.wlan-monitor",
   "name": "WLAN Monitor",
-  "version": "0.11.0",
+  "version": "0.11.1",
   "author": "uBruckhaus",
   "description": "See who is on your Wi-Fi from the bar: every device with a type icon and plain-language status, your own names, new-device alerts, groups by platform, type or Wi-Fi band, a network map, live Network Monitor (active connections, per-app traffic, interfaces, filters), built-in Network & Wi-Fi Setup (safe NetworkManager integration), FRITZ!Box mesh details, VPN detection, and a local MCP server. Automatic subnet sweeps only on networks you trust (or when you click Rescan).",
   "kinds": [

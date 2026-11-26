@@ -148,6 +148,7 @@ Item {
 
       Text {
         id: chevron
+        textFormat: Text.PlainText
         anchors.right: parent.right
         anchors.verticalCenter: parent.verticalCenter
         anchors.rightMargin: trigger.borderRight + Style.spacing.controlGap

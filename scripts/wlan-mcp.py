@@ -3,7 +3,12 @@
 
 Reuses scripts/wlan-monitor.py, scripts/net_monitor.py, and scripts/wifi_setup.py directly
 (zero external dependencies, Python 3 stdlib only, works with `python3 -I`).
-FRITZ!Box passwords and Wi-Fi passphrases are never read, echoed, or exposed.
+FRITZ!Box passwords and Wi-Fi passphrases are never read, echoed, or exposed: the server is
+never the FRITZ!Box collector (Monitor(can_lead=False)), so it never opens the saved login.
+
+Read-only by default. Tools that change anything (device names/flags, trust, alerts, Wi-Fi
+radio, connect, disconnect, forget) and active network scans are listed and callable only when
+the server is started with --allow-changes, and each such call must pass "confirm": true.
 """
 
 import difflib
@@ -16,7 +21,7 @@ import time
 
 
 SERVER_NAME = "omarchy-wlan-monitor"
-SERVER_VERSION = "0.11.0"
+SERVER_VERSION = "0.11.1"
 DEFAULT_PROTOCOL_VERSION = "2024-11-05"
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05", "2025-03-26")
 STATE_RESOURCE_URI = "wlan://state"
@@ -231,7 +236,7 @@ TOOLS = [
                 "group": {"type": "string", "description": "Filter by device group (e.g. 'apple', 'android', 'media', 'network', 'smarthome', 'office', 'other')."},
                 "search": {"type": "string", "description": "Case-insensitive substring search across name, hostname, IP, MAC, vendor, and model."},
                 "include_hidden": {"type": "boolean", "description": "When true, include devices the user marked as hidden (default false)."},
-                "rescan": {"type": "boolean", "description": "Trigger an active subnet/mDNS rescan before listing."},
+                "rescan": {"type": "boolean", "description": "Run an active subnet/mDNS scan before listing (needs --allow-changes)."},
             },
             "additionalProperties": False,
         },
@@ -243,7 +248,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "target": {"type": "string", "description": "Device IP address, MAC address, or case-insensitive name."},
-                "rescan": {"type": "boolean", "description": "Trigger a fresh rescan before resolving."},
+                "rescan": {"type": "boolean", "description": "Run an active scan before resolving (needs --allow-changes)."},
             },
             "required": ["target"],
             "additionalProperties": False,
@@ -306,10 +311,13 @@ TOOLS = [
     },
     {
         "name": "wlan_rescan",
-        "description": "Trigger a fresh local network device scan (mDNS, neighbor table, and active probe) and return the updated summary and devices.",
+        "description": "Run an ACTIVE local network scan now (ping and reverse-DNS sweep of the subnet, mDNS, neighbour table), even on a network that is not trusted, and return the updated summary and devices. Needs --allow-changes and confirm: true.",
         "inputSchema": {
             "type": "object",
-            "properties": {},
+            "properties": {
+                "confirm": {"type": "boolean", "description": "Must be true: the user asked for an active scan."},
+            },
+            "required": ["confirm"],
             "additionalProperties": False,
         },
     },
@@ -324,8 +332,9 @@ TOOLS = [
                 "pinned": {"type": "boolean", "description": "Pin or unpin the device in the list."},
                 "hidden": {"type": "boolean", "description": "Hide or unhide the device."},
                 "known": {"type": "boolean", "description": "Mark the device as known (true clears 'new' badge, false marks as new)."},
+                "confirm": {"type": "boolean", "description": "Must be true: the user asked for exactly this change."},
             },
-            "required": ["target"],
+            "required": ["target", "confirm"],
             "additionalProperties": False,
         },
     },
@@ -337,7 +346,9 @@ TOOLS = [
             "properties": {
                 "trusted": {"type": "boolean", "description": "Trust (true) or untrust (false) the current network."},
                 "alerts": {"type": "boolean", "description": "Enable (true) or disable (false) new-device notifications."},
+                "confirm": {"type": "boolean", "description": "Must be true: the user asked for exactly this change."},
             },
+            "required": ["confirm"],
             "additionalProperties": False,
         },
     },
@@ -348,8 +359,9 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "on": {"type": "boolean", "description": "Enable (true) or disable (false) Wi-Fi radio."},
+                "confirm": {"type": "boolean", "description": "Must be true: the user asked for exactly this change."},
             },
-            "required": ["on"],
+            "required": ["on", "confirm"],
             "additionalProperties": False,
         },
     },
@@ -361,19 +373,22 @@ TOOLS = [
             "properties": {
                 "ssid": {"type": "string", "description": "Open or already-saved Wi-Fi network SSID to connect to."},
                 "uuid": {"type": "string", "description": "Saved NetworkManager Wi-Fi connection UUID."},
+                "confirm": {"type": "boolean", "description": "Must be true: the user asked for exactly this change."},
             },
+            "required": ["confirm"],
             "additionalProperties": False,
         },
     },
     {
         "name": "wlan_wifi_disconnect",
-        "description": "Disconnect an active NetworkManager connection (Wi-Fi, Ethernet, or VPN) by UUID.",
+        "description": "Disconnect an active Wi-Fi connection by UUID (Wi-Fi only; Ethernet and VPN are never touched).",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "uuid": {"type": "string", "description": "Active NetworkManager connection UUID."},
+                "uuid": {"type": "string", "description": "Active NetworkManager Wi-Fi connection UUID."},
+                "confirm": {"type": "boolean", "description": "Must be true: the user asked for exactly this change."},
             },
-            "required": ["uuid"],
+            "required": ["uuid", "confirm"],
             "additionalProperties": False,
         },
     },
@@ -384,14 +399,32 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "uuid": {"type": "string", "description": "Saved NetworkManager Wi-Fi profile UUID."},
+                "ssid": {"type": "string", "description": "The profile's network name, repeated as a check (must match)."},
+                "confirm": {"type": "boolean", "description": "Must be true: the user asked for exactly this change."},
             },
-            "required": ["uuid"],
+            "required": ["uuid", "ssid", "confirm"],
             "additionalProperties": False,
         },
     },
 ]
 
+# Tools that change something, or scan actively: only with --allow-changes and confirm: true.
+WRITE_TOOLS = frozenset({
+    "wlan_rescan", "wlan_set_device", "wlan_set_trust", "wlan_wifi_radio",
+    "wlan_wifi_connect", "wlan_wifi_disconnect", "wlan_wifi_forget",
+})
+DESTRUCTIVE_TOOLS = frozenset({"wlan_wifi_radio", "wlan_wifi_disconnect", "wlan_wifi_forget", "wlan_set_trust"})
+OPEN_WORLD_TOOLS = frozenset({"wlan_rescan", "wlan_wifi_connect", "wlan_wifi_list"})
+for _tool in TOOLS:
+    _name = _tool["name"]
+    _tool["annotations"] = {
+        "readOnlyHint": _name not in WRITE_TOOLS,
+        "destructiveHint": _name in DESTRUCTIVE_TOOLS,
+        "openWorldHint": _name in OPEN_WORLD_TOOLS,
+    }
+
 TOOL_NAMES = frozenset(t["name"] for t in TOOLS)
+TOOL_PROPERTIES = {t["name"]: frozenset(t["inputSchema"].get("properties", {})) for t in TOOLS}
 
 RESOURCES = [
     {
@@ -429,7 +462,9 @@ class WlanMCPServer:
         net_monitor_module=None,
         wifi_setup_module=None,
         stale_seconds=DEFAULT_STALE_SECONDS,
+        allow_changes=False,
     ):
+        self.allow_changes = bool(allow_changes)
         self.wlan_mod = wlan_module if wlan_module is not None else load_wlan_module()
         self.net_mod = (
             net_monitor_module
@@ -441,7 +476,8 @@ class WlanMCPServer:
             if wifi_setup_module is not None
             else load_wifi_setup_module(wlan_module=self.wlan_mod)
         )
-        self.monitor = monitor if monitor is not None else self.wlan_mod.Monitor()
+        # Never the FRITZ!Box collector: no leader lock, no saved login, no request socket.
+        self.monitor = monitor if monitor is not None else self.wlan_mod.Monitor(can_lead=False)
         self.net_monitor = net_monitor if net_monitor is not None else self.net_mod.NetMonitor()
         self.stale_seconds = float(stale_seconds)
         self._last_snapshot = None
@@ -826,7 +862,7 @@ class WlanMCPServer:
         uuid = args.get("uuid")
         if not isinstance(uuid, str) or not uuid.strip():
             raise ToolError("uuid must be a non-empty NetworkManager connection UUID.")
-        res = self.wifi_mod.connection_down(uuid.strip())
+        res = self.wifi_mod.wifi_disconnect(uuid.strip())
         self._last_snapshot = None
         if not res.get("ok"):
             raise ToolError(res.get("message") or "Failed to disconnect connection.")
@@ -836,6 +872,13 @@ class WlanMCPServer:
         uuid = args.get("uuid")
         if not isinstance(uuid, str) or not uuid.strip():
             raise ToolError("uuid must be a non-empty NetworkManager Wi-Fi connection UUID.")
+        ssid = args.get("ssid")
+        if not isinstance(ssid, str) or not ssid:
+            raise ToolError("ssid must name the saved network to forget.")
+        known = self.wifi_mod.get_wifi_state(rescan=False).get("known") or []
+        match = next((k for k in known if k.get("uuid") == uuid.strip()), None)
+        if match is None or ssid not in (match.get("ssid"), match.get("name")):
+            raise ToolError("No saved Wi-Fi profile with this uuid and ssid.")
         res = self.wifi_mod.wifi_forget(uuid.strip())
         self._last_snapshot = None
         if not res.get("ok"):
@@ -855,6 +898,21 @@ class WlanMCPServer:
         handler = getattr(self, "_tool_" + name, None)
         if handler is None:
             raise RpcError(-32602, "Unknown tool: %s" % name)
+        unknown = sorted(k for k in arguments if k not in TOOL_PROPERTIES[name])
+        if unknown:
+            # Only the key names are reported (cut short), never a value that might be a secret.
+            names = ", ".join(_clean(str(k), 40) for k in unknown[:5])
+            return {"content": [{"type": "text", "text": json.dumps({"error": "Unknown argument(s): " + names})}],
+                    "isError": True}
+        if name in WRITE_TOOLS or (name in ("wlan_list_devices", "wlan_get_device") and arguments.get("rescan") is True):
+            if not self.allow_changes:
+                return {"content": [{"type": "text", "text": json.dumps(
+                    {"error": "This server is read-only. Start it with --allow-changes to allow changes and active scans."})}],
+                    "isError": True}
+            if name in WRITE_TOOLS and arguments.get("confirm") is not True:
+                return {"content": [{"type": "text", "text": json.dumps(
+                    {"error": "Pass confirm: true once the user has asked for exactly this change."})}],
+                    "isError": True}
 
         extra_secrets = ()
         if isinstance(arguments.get("password"), str) and arguments["password"]:
@@ -927,7 +985,7 @@ class WlanMCPServer:
             elif method == "ping":
                 result = {}
             elif method == "tools/list":
-                result = {"tools": TOOLS}
+                result = {"tools": [t for t in TOOLS if self.allow_changes or t["name"] not in WRITE_TOOLS]}
             elif method == "tools/call":
                 tname = params.get("name")
                 if not isinstance(tname, str) or not tname:
@@ -1020,14 +1078,22 @@ def _terminate(signum, _frame):
     sys.exit(128 + signum)
 
 
-def main():
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    unknown = [a for a in argv if a != "--allow-changes"]
+    if unknown:
+        sys.stderr.write("usage: wlan-mcp.py [--allow-changes]\n")
+        return 2
     signal.signal(signal.SIGTERM, _terminate)
-    server = WlanMCPServer()
+    server = WlanMCPServer(allow_changes="--allow-changes" in argv)
     try:
         server.serve_stdio()
     except (KeyboardInterrupt, BrokenPipeError):
         pass
+    finally:
+        server.monitor.close()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

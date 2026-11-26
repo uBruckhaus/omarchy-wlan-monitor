@@ -10,21 +10,42 @@ import contextlib
 import ipaddress
 import os
 import re
+import secrets
+import select
 import shutil
+import signal
 import stat
 import subprocess
-import tempfile
+import threading
+import time
 
 
 NMCLI_TIMEOUT = 15.0
 CONNECT_TIMEOUT = 25.0
 NMCLI_WAIT_SECONDS = "20"
 RADIO_TIMEOUT = 0.8
-UUID_RE = re.compile(r"^[0-9a-fA-F-]{8,64}$")
+UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 UUID_FIND_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 PSK_HEX_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 ALLOWED_CONN_TYPES = frozenset({"802-11-wireless", "802-3-ethernet", "vpn", "wireguard", "tun"})
 ENTERPRISE_KEY_MGMTS = frozenset({"wpa-eap", "wpa-eap-suite-b-192", "ieee8021x"})
+OPEN_KEY_MGMTS = frozenset({"", "none", "owe"})
+
+# nmcli output is read with hard caps (a beacon flood can list thousands of networks).
+NMCLI_MAX_STDOUT = 512 * 1024
+NMCLI_MAX_STDERR = 64 * 1024
+MAX_VISIBLE = 128
+MAX_KNOWN = 64        # saved Wi-Fi profiles listed (each costs one `nmcli connection show`)
+MAX_WIRED = 32
+MAX_VPN = 64
+SSID_MAX_BYTES = 32
+SECRET_DIR_NAME = "ubruckhaus-wlan-monitor-secrets"
+STALE_SECRET_AGE = 120.0
+
+# Running nmcli children and passwd-files in flight, so a SIGTERM can end and remove them.
+_ACTIVE_LOCK = threading.Lock()
+_ACTIVE_PROCS = set()
+_ACTIVE_SECRETS = set()
 
 AUTH_FAILURE_MARKERS = (
     "secrets were required",
@@ -45,9 +66,14 @@ def clean(text, limit=120):
 
 
 def clean_ssid(text, limit=64):
-    """Sanitize an SSID by stripping only control characters (preserves '&', '<', '>', spaces)."""
-    raw = "".join(ch for ch in str(text or "") if ord(ch) >= 32 and ord(ch) != 127)
-    return raw[:limit]
+    """Sanitize an SSID for display: keeps '&', '<', '>' and spaces (every consumer renders plain
+    text), drops all control, format (BiDi) and separator characters except the space, and cuts
+    the result to 32 UTF-8 bytes (the 802.11 maximum)."""
+    raw = "".join(ch for ch in str(text or "") if ch == " " or ch.isprintable())
+    raw = raw[:limit]
+    while len(raw.encode("utf-8")) > SSID_MAX_BYTES:
+        raw = raw[:-1]
+    return raw
 
 
 def nm_terse_split(line):
@@ -91,7 +117,7 @@ def validate_ssid(ssid):
 
 
 def validate_uuid(uuid):
-    """Validate a NetworkManager connection UUID (`^[0-9a-fA-F-]{8,64}$`)."""
+    """Validate a NetworkManager connection UUID (canonical 8-4-4-4-12 hex form only)."""
     if not isinstance(uuid, str):
         return None
     u = uuid.strip()
@@ -156,8 +182,96 @@ def _redact(text, secret=None):
     return clean(raw, 200)
 
 
+def _owned_private_dir(path, create=False):
+    """True if `path` is (or was just created as) a real directory owned by this user with no
+    group/other bits; never follows a symlink."""
+    if create:
+        try:
+            os.mkdir(path, 0o700)
+        except FileExistsError:
+            pass
+        except OSError:
+            return False
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return False
+    try:
+        info = os.fstat(fd)
+        return stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() and not (info.st_mode & 0o077)
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def secret_dir():
+    """The private folder for nmcli passwd-files: <runtime dir>/ubruckhaus-wlan-monitor-secrets, or
+    /tmp/ubruckhaus-wlan-monitor-secrets-<uid> without a usable runtime dir. None (and no Wi-Fi
+    password is ever written) unless it is a real 0700 directory owned by this user."""
+    parent = _private_runtime_parent()
+    path = (os.path.join(parent, SECRET_DIR_NAME) if parent
+            else "/tmp/%s-%d" % (SECRET_DIR_NAME, os.getuid()))
+    return path if _owned_private_dir(path, create=True) else None
+
+
+def sweep_stale_secrets(now=None, max_age=STALE_SECRET_AGE):
+    """Remove passwd-file folders left behind by a collector that was killed (older than
+    `max_age`, so another screen's connect in flight is never touched)."""
+    folder = secret_dir()
+    if not folder:
+        return 0
+    now = time.time() if now is None else now
+    removed = 0
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return 0
+    for name in names:
+        if not name.startswith("wlan-wifi-"):
+            continue
+        sub = os.path.join(folder, name)
+        try:
+            info = os.lstat(sub)
+        except OSError:
+            continue
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or now - info.st_mtime < max_age:
+            continue
+        try:
+            os.unlink(os.path.join(sub, "secrets"))
+        except OSError:
+            pass
+        try:
+            os.rmdir(sub)
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+def cleanup_active():
+    """End running nmcli children and delete passwd-files in flight (the collector's SIGTERM)."""
+    with _ACTIVE_LOCK:
+        procs = list(_ACTIVE_PROCS)
+        paths = list(_ACTIVE_SECRETS)
+    for proc in procs:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    for path in paths:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        try:
+            os.rmdir(os.path.dirname(path))
+        except OSError:
+            pass
+
+
 def _private_runtime_parent():
-    """Return validated owner-only $XDG_RUNTIME_DIR if safe, else None (caller falls back to tempfile)."""
+    """Return validated owner-only $XDG_RUNTIME_DIR if safe, else None."""
     xdg = os.environ.get("XDG_RUNTIME_DIR", "").strip()
     if not xdg or not os.path.isabs(xdg):
         return None
@@ -183,11 +297,15 @@ def _write_passwd_file(password):
     nmcli reads `setting.property:value` literally (without backslash unescaping), so the
     passphrase is written verbatim.
     """
-    parent = _private_runtime_parent()
-    tmp_dir = tempfile.mkdtemp(prefix="wlan-wifi-", dir=parent)
+    folder = secret_dir()
+    if not folder:
+        raise OSError("No private folder for the Wi-Fi password.")
+    tmp_dir = os.path.join(folder, "wlan-wifi-%d-%s" % (os.getpid(), secrets.token_hex(8)))
+    os.mkdir(tmp_dir, 0o700)
     secret_path = os.path.join(tmp_dir, "secrets")
+    with _ACTIVE_LOCK:
+        _ACTIVE_SECRETS.add(secret_path)
     try:
-        os.chmod(tmp_dir, 0o700)
         fd = os.open(
             secret_path,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
@@ -211,30 +329,80 @@ def _write_passwd_file(password):
             os.rmdir(tmp_dir)
         except OSError:
             pass
+        with _ACTIVE_LOCK:
+            _ACTIVE_SECRETS.discard(secret_path)
 
 
-def _run_nmcli(args, timeout=NMCLI_TIMEOUT):
-    """Run `nmcli` with fixed argv (no shell) and C locale. Returns (rc, stdout, stderr)."""
+def _run_nmcli(args, timeout=NMCLI_TIMEOUT, max_out=NMCLI_MAX_STDOUT, max_err=NMCLI_MAX_STDERR):
+    """Run `nmcli` with fixed argv (no shell) and C locale. Returns (rc, stdout, stderr).
+
+    Output is read with byte caps and one overall deadline; on overflow or timeout the child is
+    killed (124 = timed out, 125 = output too large)."""
     env = dict(os.environ)
     env["LC_ALL"] = "C"
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             ["nmcli", *args],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=timeout,
             env=env,
-            text=True,
-            errors="replace",
+            start_new_session=True,
         )
-        return proc.returncode, proc.stdout, proc.stderr
     except FileNotFoundError:
         return 127, "", "nmcli not found"
-    except subprocess.TimeoutExpired:
-        return 124, "", "nmcli timed out"
     except OSError as exc:
         return 1, "", str(exc)
+    with _ACTIVE_LOCK:
+        _ACTIVE_PROCS.add(proc)
+    out_fd, err_fd = proc.stdout.fileno(), proc.stderr.fileno()
+    bufs = {out_fd: bytearray(), err_fd: bytearray()}
+    caps = {out_fd: max_out, err_fd: max_err}
+    open_fds = set(bufs)
+    deadline = time.monotonic() + timeout
+    failure = None
+    try:
+        while open_fds:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                failure = (124, "nmcli timed out")
+                break
+            ready, _, _ = select.select(list(open_fds), [], [], left)
+            for fd in ready:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    open_fds.discard(fd)
+                    continue
+                bufs[fd].extend(chunk)
+                if len(bufs[fd]) > caps[fd]:
+                    failure = (125, "nmcli output too large")
+                    break
+            if failure:
+                break
+        if failure:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+        try:
+            rc = proc.wait(timeout=max(0.1, deadline - time.monotonic()) if not failure else 2.0)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            proc.wait()
+            failure = failure or (124, "nmcli timed out")
+            rc = 124
+    finally:
+        proc.stdout.close()
+        proc.stderr.close()
+        with _ACTIVE_LOCK:
+            _ACTIVE_PROCS.discard(proc)
+    if failure:
+        return failure[0], "", failure[1]
+    return (rc, bytes(bufs[out_fd]).decode("utf-8", "replace"),
+            bytes(bufs[err_fd]).decode("utf-8", "replace"))
 
 
 def nm_available():
@@ -353,6 +521,7 @@ def _find_saved_wifi_uuid(target_ssid):
     if rc != 0:
         return None
     fallback_uuid = None
+    looked = 0
     for line in out.splitlines():
         parts = nm_terse_split(line)
         if len(parts) < 3:
@@ -360,6 +529,9 @@ def _find_saved_wifi_uuid(target_ssid):
         cname, cuuid, ctype = parts[0], parts[1], parts[2]
         if ctype != "802-11-wireless" or not validate_uuid(cuuid):
             continue
+        looked += 1
+        if looked > MAX_KNOWN:
+            break
         prof_ssid = _get_wifi_profile_ssid(cuuid)
         if prof_ssid:
             if prof_ssid == target_ssid:
@@ -443,7 +615,7 @@ def get_wifi_state(rescan=False, resolv_path="/etc/resolv.conf", sys_net="/sys/c
                 state["wifi_device"] = True
                 if dstate == "connected" and dconn and not device_active_conn:
                     device_active_conn = clean_ssid(dconn, 64)
-            elif dtype == "ethernet":
+            elif dtype == "ethernet" and len(state["wired_devices"]) < MAX_WIRED:
                 state["wired_devices"].append(
                     {
                         "device": clean(dev, 32),
@@ -470,6 +642,8 @@ def get_wifi_state(rescan=False, resolv_path="/etc/resolv.conf", sys_net="/sys/c
             dev_clean = "" if cdev == "--" else clean(cdev, 32)
             name_clean = clean_ssid(cname, 64)
             if ctype == "802-11-wireless":
+                if len(state["known"]) >= MAX_KNOWN:
+                    continue
                 prof_ssid = _get_wifi_profile_ssid(cuuid) or name_clean
                 known_ssids.add(prof_ssid)
                 if active and not state["active_ssid"]:
@@ -485,6 +659,8 @@ def get_wifi_state(rescan=False, resolv_path="/etc/resolv.conf", sys_net="/sys/c
                     }
                 )
             elif ctype == "802-3-ethernet":
+                if len(state["wired"]) >= MAX_WIRED:
+                    continue
                 state["wired"].append(
                     {
                         "name": clean(cname, 64),
@@ -494,6 +670,8 @@ def get_wifi_state(rescan=False, resolv_path="/etc/resolv.conf", sys_net="/sys/c
                     }
                 )
             elif ctype in ("vpn", "wireguard", "tun"):
+                if len(state["vpn"]) >= MAX_VPN:
+                    continue
                 state["vpn"].append(
                     {
                         "name": clean(cname, 64),
@@ -559,6 +737,8 @@ def get_wifi_state(rescan=False, resolv_path="/etc/resolv.conf", sys_net="/sys/c
                 }
                 prev = by_ssid.get(ssid)
                 if prev is None:
+                    if len(by_ssid) >= 4 * MAX_VISIBLE and not in_use:
+                        continue  # a beacon flood: the strongest are kept below, the rest ignored
                     by_ssid[ssid] = entry
                 else:
                     # Keep in-use AP, otherwise strongest signal
@@ -566,7 +746,7 @@ def get_wifi_state(rescan=False, resolv_path="/etc/resolv.conf", sys_net="/sys/c
                         by_ssid[ssid] = entry
             visible = list(by_ssid.values())
             visible.sort(key=lambda item: (item["in_use"], item["signal"]), reverse=True)
-            state["visible"] = visible
+            state["visible"] = visible[:MAX_VISIBLE]
         elif err_w and not state["error"]:
             state["error"] = clean(err_w, 200)
 
@@ -668,6 +848,15 @@ def wifi_connect(ssid="", password=None, uuid=None):
             }
 
         key_mgmt, psk_flags = _get_wifi_security_props(valid_uuid)
+        if key_mgmt in OPEN_KEY_MGMTS:
+            return {
+                "ok": False,
+                "auth_failed": False,
+                "action": "connect",
+                "ssid": label,
+                "uuid": valid_uuid,
+                "message": "This saved network has no password (open or OWE); connect without one.",
+            }
         if key_mgmt in ENTERPRISE_KEY_MGMTS:
             return {
                 "ok": False,
@@ -824,17 +1013,22 @@ def wifi_connect(ssid="", password=None, uuid=None):
             "message": _redact(err_add or out_add or "Failed to create Wi-Fi profile.", valid_pw),
         }
 
-    if detected_sec == "owe":
-        rc_up, out_up, err_up = _run_nmcli(
-            ["--wait", NMCLI_WAIT_SECONDS, "connection", "up", "uuid", new_uuid],
-            timeout=CONNECT_TIMEOUT,
-        )
-    else:
-        with _write_passwd_file(valid_pw) as pfile:
+    try:
+        if detected_sec == "owe":
             rc_up, out_up, err_up = _run_nmcli(
-                ["--wait", NMCLI_WAIT_SECONDS, "connection", "up", "uuid", new_uuid, "passwd-file", pfile],
+                ["--wait", NMCLI_WAIT_SECONDS, "connection", "up", "uuid", new_uuid],
                 timeout=CONNECT_TIMEOUT,
             )
+        else:
+            with _write_passwd_file(valid_pw) as pfile:
+                rc_up, out_up, err_up = _run_nmcli(
+                    ["--wait", NMCLI_WAIT_SECONDS, "connection", "up", "uuid", new_uuid, "passwd-file", pfile],
+                    timeout=CONNECT_TIMEOUT,
+                )
+    except Exception:
+        # Never leave a half-configured profile behind (e.g. no private folder for the password).
+        _run_nmcli(["connection", "delete", "uuid", new_uuid], timeout=8.0)
+        raise
     if rc_up == 0:
         return {
             "ok": True,

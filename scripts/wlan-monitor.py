@@ -47,6 +47,7 @@ import re
 import secrets
 import select
 import shutil
+import signal
 import socket
 import ssl
 import stat
@@ -119,7 +120,7 @@ JSON_COMMANDS = {
     "netmon", "wifi_scan", "wifi_radio", "wifi_connect", "wifi_disconnect", "wifi_forget",
     "conn_up", "conn_down",
 }
-WIFI_UUID_RE = re.compile(r"^[0-9a-fA-F-]{8,64}$")
+WIFI_UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 WIFI_STATUS_TTL = 10.0
 # Interface languages the panel offers; the language arrives from the bar widget ("lang" command).
 LANGS = ("en", "de", "fr", "es", "it", "pt", "nl", "pl")
@@ -2754,7 +2755,10 @@ def read_fritz_state(ip, mac, iface, now_wall=None):
 
 
 class Monitor:
-    def __init__(self):
+    def __init__(self, can_lead=True):
+        # can_lead=False (the MCP server): never the FRITZ!Box collector, so it never takes the
+        # leader lock, never reads the saved login and never opens the request socket.
+        self.can_lead = can_lead
         self.lang = "en"  # set by the bar widget ("lang" command); used for notifications
         self.trusted = load_trusted()
         self.untrusted_here = set()  # untrusted here while the shared list could not be saved
@@ -2786,6 +2790,7 @@ class Monitor:
         self._wifi_worker_lock = threading.Lock()
         self._wifi_scan_lock = threading.Lock()
         self._wifi_scan_running = False
+        self._wifi_busy = False  # one network change at a time; more are refused, never queued
         self._emit_fn = emit
         self.reset_network(None)
 
@@ -2793,6 +2798,8 @@ class Monitor:
     def lead(self):
         """True when this collector is (or just became) the FRITZ!Box collector: the first to
         take the leader lock, kept until it ends; then it alone reads and writes the login."""
+        if not self.can_lead:
+            return False
         if self.fritz is not None:
             if self.request_sock is None:
                 self.open_requests()
@@ -3004,6 +3011,13 @@ class Monitor:
         self.iw_time = -math.inf
         self.traffic_prev = None
 
+    def collect_netmon(self):
+        """The Network Monitor's part of a snapshot; its failure never drops the device list."""
+        try:
+            return self.net_monitor.collect(resolve=self.netmon_resolve)
+        except Exception:
+            return {"ok": False, "error": "The Network Monitor could not read the connections."}
+
     def _wifi_radio_status(self, force=False):
         """Fast cached NetworkManager / Wi-Fi device / radio status for every snapshot."""
         now = time.monotonic()
@@ -3093,10 +3107,21 @@ class Monitor:
                     time.monotonic(),
                 )
                 emit_fn(dict(state, event="wifi_state"))
+        except Exception:
+            # Never a traceback (it could carry the password) and never a Setup page left busy.
+            if cmd != "wifi_scan":
+                try:
+                    emit_fn({"event": "wifi_result", "ok": False, "action": cmd,
+                             "message": "The network change failed."})
+                except Exception:
+                    pass
         finally:
             if cmd == "wifi_scan":
                 with self._wifi_scan_lock:
                     self._wifi_scan_running = False
+            else:
+                with self._wifi_scan_lock:
+                    self._wifi_busy = False
 
     def _spawn_wifi_command(self, command):
         if command["cmd"] == "wifi_scan":
@@ -3104,6 +3129,17 @@ class Monitor:
                 if self._wifi_scan_running:
                     return None
                 self._wifi_scan_running = True
+        else:
+            with self._wifi_scan_lock:
+                busy, self._wifi_busy = self._wifi_busy, True
+            if busy:
+                # A change still running: this one is refused now instead of running late.
+                try:
+                    (self._emit_fn or emit)({"event": "wifi_result", "ok": False, "action": command["cmd"],
+                                             "message": "Another network change is still running."})
+                except Exception:
+                    pass
+                return None
         t = threading.Thread(target=self._run_wifi_command, args=(command,), daemon=True)
         t.start()
         return t
@@ -3392,7 +3428,7 @@ class Monitor:
                 "wifi_on": wstatus["wifi_on"],
             }
             if self.netmon_enabled and self.net_monitor is not None:
-                snap["netmon"] = self.net_monitor.collect(resolve=self.netmon_resolve)
+                snap["netmon"] = self.collect_netmon()
             return snap
 
         iface = net["iface"]
@@ -3732,7 +3768,7 @@ class Monitor:
             "wifi_on": wstatus["wifi_on"],
         }
         if self.netmon_enabled and self.net_monitor is not None:
-            snap["netmon"] = self.net_monitor.collect(resolve=self.netmon_resolve)
+            snap["netmon"] = self.collect_netmon()
         return snap
 
 
@@ -3755,6 +3791,22 @@ def handle_line(monitor, line):
 
 def main():
     monitor = Monitor()
+
+    def on_term(_signum, _frame):
+        # A widget reload or shell restart: end nmcli children, remove passwd-files in flight,
+        # give up the FRITZ!Box role and its socket, then exit.
+        if wifi_setup_mod is not None:
+            wifi_setup_mod.cleanup_active()
+        try:
+            monitor.close()
+        finally:
+            os._exit(0)
+    signal.signal(signal.SIGTERM, on_term)
+    if wifi_setup_mod is not None:
+        try:
+            wifi_setup_mod.sweep_stale_secrets()
+        except Exception:
+            pass
     if "--once" in sys.argv:
         net = detect_interface(monitor.iface_cache)
         if net:

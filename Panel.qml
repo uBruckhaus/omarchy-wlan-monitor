@@ -120,7 +120,14 @@ Panel {
     var on = root.opened && !root.settingsOpen && !root.infoPageOpen && root.activePage === "monitor" && !root.netmonPaused
     root.hostWidget.setNetmonMode(on, on && root.netmonResolve)
   }
-  onOpenedChanged: syncNetmonMode()
+  onOpenedChanged: {
+    syncNetmonMode()
+    // Closed by an outside click or a switch to another popout (not close()): typed passwords go too.
+    if (!opened) {
+      if (root.wifiFormOpen) root.closeWifiForm()
+      if (root.fritzFormOpen) root.closeFritzForm()
+    }
+  }
   onSettingsOpenChanged: syncNetmonMode()
   onInfoPageOpenChanged: syncNetmonMode()
   onActivePageChanged: syncNetmonMode()
@@ -234,8 +241,8 @@ Panel {
   readonly property var filteredProcesses: {
     var all = (root.netmon && root.netmon.processes) || []
     var q = root.netmonSearchText.trim().toLowerCase()
-    if (q === "") return all
-    return all.filter(function(p) { return String(p.name || "").toLowerCase().indexOf(q) !== -1 })
+    if (q === "") return all.slice(0, 128)
+    return all.filter(function(p) { return String(p.name || "").toLowerCase().indexOf(q) !== -1 }).slice(0, 128)
   }
   readonly property var sparklineBars: {
     var hist = (root.netmon && root.netmon.history) || []
@@ -428,7 +435,20 @@ Panel {
     root.wifiFormUuid = String(uuid || "")
     root.hostWidget.wifiConnect(ssid, null, uuid)
   }
+  // The collector accepts only SSIDs nmcli cannot misread: 1-32 UTF-8 bytes, printable, no leading
+  // "-". Others are refused here at once, so the Setup page never waits for an answer that never comes.
+  function ssidSendable(ssid) {
+    var text = String(ssid || "")
+    if (text.trim() === "" || text.charAt(0) === "-" || /[\u0000-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]/.test(text)) return false
+    var bytes = unescape(encodeURIComponent(text)).length
+    return bytes >= 1 && bytes <= 32
+  }
   function connectVisibleWifi(ssid, secured) {
+    if (!root.ssidSendable(ssid)) {
+      root.wifiStatusOk = false
+      root.wifiStatusText = root.t("actionFailed")
+      return
+    }
     if (secured) {
       root.openWifiPasswordForm(ssid, "", "")
       return
@@ -620,6 +640,7 @@ Panel {
     root.fritzUserNet = root.networkId()
     root.fritzFormNet = root.networkId()
     root.fritzFormNetId = String(root.link.net_id || "")
+    root.fritzFormDropped = false
     root.fritzFormOpen = true
   }
   // A saved login that only a new login can fix: shown as a banner at the top, not only in the
@@ -645,9 +666,15 @@ Panel {
     // A user name typed for another router is not offered on this one either.
     if (root.fritzFormOpen && root.fritzFormNet !== root.networkId()) root.closeFritzForm(true)
   }
+  property bool fritzFormDropped: false  // the last login was not sent: shown under the network line
   function fritzConnect() {
     if (!root.hostWidget || fritzPassword.text === "") return
-    if (root.fritzFormNetId !== "" && root.fritzFormNet === root.networkId())
+    var sameNet = root.fritzFormNetId !== "" && root.fritzFormNet === root.networkId()
+    console.warn("WLAN Monitor: FRITZ!Box login " + (sameNet ? "sent" : "not sent")
+      + " (form net id " + (root.fritzFormNetId !== "" ? "set" : "empty")
+      + ", network " + (root.fritzFormNet === root.networkId() ? "unchanged" : "changed") + ")")
+    root.fritzFormDropped = !sameNet
+    if (sameNet)
       root.hostWidget.sendJson({ cmd: "fritz_login", user: fritzUser.text.trim(), password: fritzPassword.text,
         net: root.fritzFormNetId })
     root.closeFritzForm()
@@ -2690,6 +2717,16 @@ Panel {
                         baseColor: root.dim
                         onActivated: if (root.hostWidget) root.hostWidget.send("fritz_logout")
                       }
+                    }
+                    Text {
+                      textFormat: Text.PlainText
+                      visible: root.fritzFormDropped && !root.fritzFormOpen && root.fritz.state !== "connected"
+                      width: parent.width
+                      wrapMode: Text.WordWrap
+                      text: root.t("fzNetworkChanged")
+                      color: Commons.Color.accent
+                      font.family: root.font
+                      font.pixelSize: Style.font.caption
                     }
                     Text {
                       textFormat: Text.PlainText
