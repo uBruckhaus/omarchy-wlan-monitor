@@ -2227,6 +2227,11 @@ class FritzMesh:
         self.aps = []
         self.updated = 0.0
         self.pending_login = None
+        # (code, message, args) of the last login typed in the panel that failed. Kept on screen
+        # until a login succeeds, another is typed, Disconnect or a gateway change: the retry with
+        # the older saved login must never hide why the new one failed (e.g. a wrong password
+        # behind a "certificate changed" message).
+        self.login_failure = None
         # A Disconnect whose file could not be deleted yet (here or by a collector before this
         # one, see fritz_revoked): retried, and the login is never used meanwhile.
         self.remove_pending = fritz_marker_set()
@@ -2250,6 +2255,7 @@ class FritzMesh:
                     self.model_for = None
                 self.iface = iface
                 self.clients, self.aps, self.updated = {}, [], 0.0
+                self.login_failure = None
                 self.state, self.message = "off", ""
                 if self.pending_login is not None:
                     # A login typed for the old gateway never goes to the new one.
@@ -2293,6 +2299,7 @@ class FritzMesh:
                 return
             self.generation += 1  # a login still in flight (typed on another screen) is superseded
             self.attempts += 1
+            self.login_failure = None
             self.pending_login = (user, password, ip, mac, self.generation)
             self.state, self.message = "connecting", "Connecting to the FRITZ!Box…"
             self.message_code, self.message_args = "fzConnecting", []
@@ -2304,6 +2311,7 @@ class FritzMesh:
         with self.lock:
             self.creds = None
             self.pending_login = None
+            self.login_failure = None
             self.generation += 1
             self.attempts += 1
             self.clients, self.aps, self.updated = {}, [], 0.0
@@ -2446,12 +2454,16 @@ class FritzMesh:
                                                             or exc.code == "fzNetworkChanged"):
                         self.state, self.message = "error", str(exc)
                         self.message_code, self.message_args = exc.code, exc.args_
+                        self.login_failure = (exc.code, str(exc), list(exc.args_))
+                        self.updated = time.time()  # the saved login is retried only later
                 return 5.0
             except Exception:  # anything unexpected ends the login too: never stuck at "connecting"
                 with self.lock:
                     if self.generation == generation:
                         self.state, self.message = "error", "The FRITZ!Box did not answer."
                         self.message_code, self.message_args = "fzNoAnswer", []
+                        self.login_failure = ("fzNoAnswer", "The FRITZ!Box did not answer.", [])
+                        self.updated = time.time()
                 return 5.0
             with self.lock:
                 if self.network[:2] != (ip, mac) or self.generation != generation:
@@ -2473,6 +2485,7 @@ class FritzMesh:
                     return 5.0
                 self.remove_pending = False
                 self.creds = creds
+                self.login_failure = None
                 self.clients, self.aps, self.updated = clients, aps, time.time()
                 self.state, self.message = "connected", ""
                 self.message_code, self.message_args = "", []
@@ -2492,6 +2505,7 @@ class FritzMesh:
                 self.creds, creds = disk, disk
                 self.generation += 1
                 generation = self.generation
+                self.login_failure = None  # a login saved from outside replaces the failed one
                 self.clients, self.aps, self.updated = {}, [], 0.0
                 self.state, self.message = "off", ""
                 self.message_code, self.message_args = "", []
@@ -2510,13 +2524,18 @@ class FritzMesh:
                 return 5.0  # removed meanwhile: followed on the next step
             with self.lock:
                 if self.generation == generation and not self.remove_pending:
-                    self.state, self.message, self.updated = "error", str(exc), time.time()
-                    self.message_code, self.message_args = exc.code, exc.args_
+                    self.state, self.updated = "error", time.time()
+                    if self.login_failure is not None:
+                        # The newer, typed login failed: its reason stays on screen.
+                        self.message_code, self.message, self.message_args = self.login_failure
+                    else:
+                        self.message, self.message_code, self.message_args = str(exc), exc.code, exc.args_
             return 5.0
         with self.lock:
             if self.generation != generation or self.remove_pending:
                 return 5.0  # the old gateway's mesh list (or one read after a Disconnect) is never shown
             self.clients, self.aps, self.updated = clients, aps, time.time()
+            self.login_failure = None
             self.state, self.message = "connected", ""
             self.message_code, self.message_args = "", []
         return interval

@@ -885,6 +885,51 @@ class FritzTests(unittest.TestCase):
         fritz.logout()
         self.assertFalse(os.path.exists(path))
 
+    def test_a_failed_typed_login_is_not_hidden_by_the_saved_login_retry(self):
+        """Certificate renewed: the saved login fails with fzCert. The user types a login that
+        fails (wrong password); the later retry of the saved login must not replace that reason
+        with "certificate changed" again. A correct login then connects and clears it."""
+        soap_ok = ("<s:Envelope><NewX_AVM-DE_MeshListPath>/meshlist.lua?sid=0123456789abcdef"
+                   "</NewX_AVM-DE_MeshListPath></s:Envelope>")
+        mesh_json = __import__("json").dumps(self.MESH).encode()
+        cert = ["c" * 64]
+        wrong = [False]
+
+        def fake_http(ip, port, method, path, body=None, headers=None, tls=False, pin=None, **kw):
+            if pin is not None and pin != cert[0]:
+                raise PermissionError("pinned certificate changed")
+            if method == "POST" and "Authorization" not in (headers or {}):
+                return 401, {"www-authenticate": 'Digest realm="F!Box SOAP-Auth", nonce="N1", qop="auth"'}, b"", cert[0]
+            if method == "POST":
+                return (401, {}, b"", cert[0]) if wrong[0] else (200, {}, soap_ok.encode(), cert[0])
+            return 200, {}, mesh_json, cert[0]
+
+        fritz = wlan_monitor.FritzMesh()
+        fritz.set_network("192.168.178.1", "1c:11:22:33:44:6c", True, True, "wlan0")
+        fritz.model_for = ("192.168.178.1", "1c:11:22:33:44:6c")
+        with mock.patch.object(wlan_monitor, "bounded_http", side_effect=fake_http):
+            fritz.login("fritz1234", "right", fritz.net_id)
+            fritz.step()
+            self.assertEqual(fritz.snapshot()[0]["state"], "connected")
+            cert[0] = "d" * 64                      # the box renewed its certificate
+            fritz.updated = 0.0
+            fritz.step()
+            self.assertEqual(fritz.snapshot()[0]["message_code"], "fzCert")
+            wrong[0] = True                          # the typed login fails
+            fritz.login("fritz1234", "typo", fritz.net_id)
+            fritz.step()
+            self.assertEqual(fritz.snapshot()[0]["message_code"], "fzWrongLogin")
+            fritz.updated -= 1000                    # the saved login is retried later ...
+            fritz.step()
+            info = fritz.snapshot()[0]
+            self.assertEqual((info["state"], info["message_code"]), ("error", "fzWrongLogin"))  # ... reason kept
+            wrong[0] = False                         # typed again, correctly
+            fritz.login("fritz1234", "right", fritz.net_id)
+            fritz.step()
+            self.assertEqual(fritz.snapshot()[0]["state"], "connected")
+            self.assertIsNone(fritz.login_failure)
+        self.assertEqual(wlan_monitor.load_fritz()["pin"], "d" * 64)
+
     def test_a_queued_login_never_goes_to_another_gateway(self):
         """Typed for router A, the network changes to router B (even at the same address) before
         the login is sent: nothing is sent to B, nothing is saved, the user is told."""

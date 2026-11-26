@@ -670,9 +670,6 @@ Panel {
   function fritzConnect() {
     if (!root.hostWidget || fritzPassword.text === "") return
     var sameNet = root.fritzFormNetId !== "" && root.fritzFormNet === root.networkId()
-    console.warn("WLAN Monitor: FRITZ!Box login " + (sameNet ? "sent" : "not sent")
-      + " (form net id " + (root.fritzFormNetId !== "" ? "set" : "empty")
-      + ", network " + (root.fritzFormNet === root.networkId() ? "unchanged" : "changed") + ")")
     root.fritzFormDropped = !sameNet
     if (sameNet)
       root.hostWidget.sendJson({ cmd: "fritz_login", user: fritzUser.text.trim(), password: fritzPassword.text,
