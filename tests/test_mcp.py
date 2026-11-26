@@ -577,7 +577,7 @@ class McpProtocolTests(unittest.TestCase):
         wmod = wlan_mcp.load_wlan_module()
         with mock.patch.object(wmod, "Monitor") as monitor_cls:
             wlan_mcp.WlanMCPServer(wlan_module=wmod, net_monitor=self.net, wifi_setup_module=self.wifi)
-        monitor_cls.assert_called_once_with(can_lead=False)
+        monitor_cls.assert_called_once_with(can_lead=False, passive=True)
         bare = wmod.Monitor.__new__(wmod.Monitor)
         bare.can_lead, bare.fritz = False, None
         with mock.patch.object(wmod, "take_leader_lock") as take:

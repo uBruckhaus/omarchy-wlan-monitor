@@ -117,8 +117,8 @@ class WifiSetupHardening(unittest.TestCase):
 
     def test_sweep_removes_only_old_leftovers(self):
         folder = wifi.secret_dir()
-        old = os.path.join(folder, "wlan-wifi-1-aaaa")
-        new = os.path.join(folder, "wlan-wifi-2-bbbb")
+        old = os.path.join(folder, wifi.SECRET_PREFIX + "1-aaaa")
+        new = os.path.join(folder, wifi.SECRET_PREFIX + "2-bbbb")
         for d in (old, new):
             os.mkdir(d, 0o700)
             with open(os.path.join(d, "secrets"), "w") as fh:
@@ -266,6 +266,35 @@ class CollectorHardening(unittest.TestCase):
     def test_wifi_uuid_regex_canonical(self):
         self.assertIsNone(self.wm.WIFI_UUID_RE.match("--------"))
         self.assertTrue(self.wm.WIFI_UUID_RE.match("f4aff26e-1193-43cc-8418-9e72a62e952e"))
+
+    def test_passive_monitor_overlays_but_never_records_or_notifies(self):
+        mon = self.wm.Monitor.__new__(self.wm.Monitor)
+        mon.passive = True
+        mon.trust_identity = {"ssid": "Home", "gateway_mac": "aa:bb:cc:dd:ee:01"}
+        mon.lang = "en"
+        key = self.wm.network_key(mon.trust_identity)
+        mon.store = {"alerts": True, "view": {}, "networks": {key: {"since": 1.0, "devices": {
+            "aa:bb:cc:dd:ee:10": {"name": "Saved TV", "pinned": True, "hidden": False, "new": False, "first": 1.0}}}}}
+        devices = [{"mac": "aa:bb:cc:dd:ee:10", "name": "lgtv", "is_self": False},
+                   {"mac": "aa:bb:cc:dd:ee:99", "name": "stranger", "is_self": False}]
+        with mock.patch.object(mon, "reload_store"), \
+                mock.patch.object(mon, "update_store") as update, \
+                mock.patch.object(self.wm, "notify_new_devices") as notify:
+            mon.apply_store(devices, True, "Home")
+        update.assert_not_called()
+        notify.assert_not_called()
+        self.assertEqual(devices[0]["name"], "Saved TV")
+        self.assertFalse(devices[1]["new"])
+        self.assertNotIn("aa:bb:cc:dd:ee:99", mon.store["networks"][key]["devices"])
+
+    def test_cleanup_skips_reaped_child(self):
+        proc = mock.MagicMock()
+        proc.returncode = 0
+        proc.pid = 999999
+        with mock.patch.object(wifi, "_ACTIVE_PROCS", (proc,)), \
+                mock.patch.object(wifi.os, "killpg") as killpg:
+            wifi.cleanup_active()
+        killpg.assert_not_called()
 
     def test_netmon_failure_does_not_drop_snapshot(self):
         mon = self.wm.Monitor.__new__(self.wm.Monitor)

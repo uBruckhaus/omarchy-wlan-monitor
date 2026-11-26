@@ -268,6 +268,8 @@ def cleanup_active():
     Lock-free: reads the current tuples only."""
     procs, paths = _ACTIVE_PROCS, _ACTIVE_SECRETS
     for proc in procs:
+        if proc.returncode is not None:  # already reaped: its pid may belong to someone else now
+            continue
         try:
             os.killpg(proc.pid, signal.SIGKILL)
         except OSError:

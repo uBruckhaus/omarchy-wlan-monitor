@@ -2758,10 +2758,13 @@ def read_fritz_state(ip, mac, iface, now_wall=None):
 
 
 class Monitor:
-    def __init__(self, can_lead=True):
+    def __init__(self, can_lead=True, passive=False):
         # can_lead=False (the MCP server): never the FRITZ!Box collector, so it never takes the
         # leader lock, never reads the saved login and never opens the request socket.
         self.can_lead = can_lead
+        # passive=True (the MCP server): no automatic sweeps (only an explicit force_scan), and
+        # saved names/flags are shown without writing devices.json or announcing new devices.
+        self.passive = passive
         self.lang = "en"  # set by the bar widget ("lang" command); used for notifications
         self.trusted = load_trusted()
         self.untrusted_here = set()  # untrusted here while the shared list could not be saved
@@ -3319,11 +3322,12 @@ class Monitor:
         """Overlay saved names / pins / hidden flags; on trusted networks remember MACs and flag new ones."""
         key = network_key(self.trust_identity)
         tracking = bool(trusted and key)
+        record = tracking and not self.passive  # a passive reader only overlays what is saved
         now_wall = time.time()
         changed = False
         self.reload_store()
-        net = store_network(self.store, key, create=tracking) if key else None
-        if tracking and net["since"] is None:
+        net = store_network(self.store, key, create=record) if key else None
+        if record and net["since"] is None:
             net["since"] = now_wall
             changed = True
         added = {}  # mac -> record first seen in this scan (merged into the shared file below)
@@ -3331,7 +3335,7 @@ class Monitor:
         for dev in devices:
             mac = dev["mac"] if MAC_RE.match(dev.get("mac") or "") else ""
             rec = net["devices"].get(mac) if net and mac else None
-            if tracking and mac and rec is None and not dev["is_self"]:
+            if record and mac and rec is None and not dev["is_self"]:
                 rec = store_device(net, mac, now_wall)
                 if now_wall - net["since"] > BASELINE_SECONDS:
                     rec["new"] = True
@@ -3515,6 +3519,8 @@ class Monitor:
         do_known = not do_full and trusted and self.known and now - self.last_known_scan >= KNOWN_SCAN_EVERY
         if lan_blocked:  # probes would only be dropped by the VPN firewall
             do_full = do_known = False
+        if self.passive:  # the MCP server: only an explicit wlan_rescan probes the network
+            do_full, do_known = force_scan, False
 
         mdns_every = MDNS_EVERY_OPEN if self.panel_open else MDNS_EVERY_CLOSED
         if do_full or now - self.mdns_time >= mdns_every:
@@ -3838,43 +3844,49 @@ def main():
     monitor.lead()
 
     stdin_fd = sys.stdin.fileno() if sys.stdin else None
-    pending = b""
-    next_tick = 0.0
-    while True:
-        run_now = False
-        timeout = max(0.0, next_tick - time.monotonic())
-        if stdin_fd is not None:
-            try:
-                ready, _, _ = select.select([stdin_fd], [], [], timeout)
-            except (OSError, ValueError):
-                ready = [stdin_fd]
-            if ready:
+    try:
+        pending = b""
+        next_tick = 0.0
+        while True:
+            run_now = False
+            timeout = max(0.0, next_tick - time.monotonic())
+            if stdin_fd is not None:
                 try:
-                    data = os.read(stdin_fd, 1024)
+                    ready, _, _ = select.select([stdin_fd], [], [], timeout)
                 except (OSError, ValueError):
-                    data = b""
-                if not data:  # EOF: keep running, stop listening
-                    stdin_fd = None
-                else:
-                    pending = (pending + data)[-4096:]
-                    *lines, pending = pending.split(b"\n")
-                    for line in lines:
-                        run_now = handle_line(monitor, line.decode("utf-8", "replace")) or run_now
-            if not run_now and time.monotonic() < next_tick:
-                continue
-        elif timeout:
-            time.sleep(timeout)
+                    ready = [stdin_fd]
+                if ready:
+                    try:
+                        data = os.read(stdin_fd, 1024)
+                    except (OSError, ValueError):
+                        data = b""
+                    if not data:  # EOF: keep running, stop listening
+                        stdin_fd = None
+                    else:
+                        pending = (pending + data)[-4096:]
+                        *lines, pending = pending.split(b"\n")
+                        for line in lines:
+                            run_now = handle_line(monitor, line.decode("utf-8", "replace")) or run_now
+                if not run_now and time.monotonic() < next_tick:
+                    continue
+            elif timeout:
+                time.sleep(timeout)
 
-        try:
-            emit(monitor.snapshot(emit=emit))
-        except BrokenPipeError:
-            return 0
-        except Exception as exc:
             try:
-                emit({"error": clean(str(exc), 200)})
+                emit(monitor.snapshot(emit=emit))
             except BrokenPipeError:
                 return 0
-        next_tick = time.monotonic() + (INTERVAL_OPEN if monitor.panel_open else INTERVAL_CLOSED)
+            except Exception as exc:
+                try:
+                    emit({"error": clean(str(exc), 200)})
+                except BrokenPipeError:
+                    return 0
+            next_tick = time.monotonic() + (INTERVAL_OPEN if monitor.panel_open else INTERVAL_CLOSED)
+    finally:
+        # Also when stdout closes without a SIGTERM: no passwd-file or nmcli child outlives us.
+        if wifi_setup_mod is not None:
+            wifi_setup_mod.cleanup_active()
+        monitor.close()
 
 
 if __name__ == "__main__":

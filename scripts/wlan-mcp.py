@@ -21,7 +21,7 @@ import time
 
 
 SERVER_NAME = "omarchy-wlan-monitor"
-SERVER_VERSION = "0.11.2"
+SERVER_VERSION = "0.11.3"
 DEFAULT_PROTOCOL_VERSION = "2024-11-05"
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05", "2025-03-26")
 STATE_RESOURCE_URI = "wlan://state"
@@ -412,7 +412,7 @@ WRITE_TOOLS = frozenset({
     "wlan_wifi_connect", "wlan_wifi_disconnect", "wlan_wifi_forget",
 })
 DESTRUCTIVE_TOOLS = frozenset({"wlan_wifi_radio", "wlan_wifi_disconnect", "wlan_wifi_forget", "wlan_set_trust"})
-OPEN_WORLD_TOOLS = frozenset({"wlan_rescan", "wlan_wifi_connect", "wlan_wifi_list"})
+OPEN_WORLD_TOOLS = frozenset({"wlan_rescan", "wlan_wifi_connect", "wlan_wifi_list", "wlan_network_monitor"})
 for _tool in TOOLS:
     _name = _tool["name"]
     _tool["annotations"] = {
@@ -475,7 +475,7 @@ class WlanMCPServer:
             else load_wifi_setup_module(wlan_module=self.wlan_mod)
         )
         # Never the FRITZ!Box collector: no leader lock, no saved login, no request socket.
-        self.monitor = monitor if monitor is not None else self.wlan_mod.Monitor(can_lead=False)
+        self.monitor = monitor if monitor is not None else self.wlan_mod.Monitor(can_lead=False, passive=True)
         self.net_monitor = net_monitor if net_monitor is not None else self.net_mod.NetMonitor()
         self.stale_seconds = float(stale_seconds)
         self._last_snapshot = None
