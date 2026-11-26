@@ -56,7 +56,7 @@ class WifiSetupHardening(unittest.TestCase):
             rc, out, err = wifi._run_nmcli(["x"], timeout=5.0, max_out=4096)
         self.assertEqual(rc, 125)
         self.assertEqual(out, "")
-        self.assertFalse(wifi._ACTIVE_PROCS)
+        self.assertEqual(wifi._ACTIVE_PROCS, ())
 
     def test_runner_deadline(self):
         real = wifi.subprocess.Popen
@@ -141,10 +141,37 @@ class WifiSetupHardening(unittest.TestCase):
                 mock.patch.object(wifi, "nm_available", return_value=True), \
                 mock.patch.object(wifi, "_find_saved_wifi_uuid", return_value=None), \
                 mock.patch.object(wifi, "_detect_visible_security", return_value="wpa-psk"), \
-                mock.patch.object(wifi, "secret_dir", return_value=None):
+                mock.patch.object(wifi, "_write_passwd_file", side_effect=OSError("disk full")):
             with self.assertRaises(OSError):
                 wifi.wifi_connect(ssid="Cafe", password="password123")
         self.assertIn(["connection", "delete", "uuid", "f4aff26e-1193-43cc-8418-9e72a62e952e"], calls)
+
+    def test_no_private_folder_changes_nothing(self):
+        with mock.patch.object(wifi, "nm_available", return_value=True), \
+                mock.patch.object(wifi, "_find_saved_wifi_uuid", return_value=None), \
+                mock.patch.object(wifi, "_detect_visible_security", return_value="wpa-psk"), \
+                mock.patch.object(wifi, "secret_dir", return_value=None), \
+                mock.patch.object(wifi, "_run_nmcli") as run:
+            res = wifi.wifi_connect(ssid="Cafe", password="password123")
+        self.assertFalse(res["ok"])
+        run.assert_not_called()  # no profile added
+        with mock.patch.object(wifi, "nm_available", return_value=True), \
+                mock.patch.object(wifi, "_get_connection_meta", return_value=("Cafe", "802-11-wireless")), \
+                mock.patch.object(wifi, "_get_wifi_profile_ssid", return_value="Cafe"), \
+                mock.patch.object(wifi, "_get_wifi_security_props", return_value=("wpa-psk", "")), \
+                mock.patch.object(wifi, "secret_dir", return_value=None), \
+                mock.patch.object(wifi, "_run_nmcli") as run:
+            res = wifi.wifi_connect(uuid="f4aff26e-1193-43cc-8418-9e72a62e952e", password="password123")
+        self.assertFalse(res["ok"])
+        run.assert_not_called()  # the saved password is not cleared
+
+    def test_cleanup_reads_without_lock(self):
+        with wifi._ACTIVE_LOCK:  # the signal handler may interrupt the thread holding it
+            done = []
+            t = threading.Thread(target=lambda: (wifi.cleanup_active(), done.append(1)))
+            t.start()
+            t.join(2.0)
+        self.assertEqual(done, [1])
 
     def test_password_change_refused_on_open_profile(self):
         with mock.patch.object(wifi, "nm_available", return_value=True), \
@@ -190,6 +217,24 @@ class NetMonitorHardening(unittest.TestCase):
 class CollectorHardening(unittest.TestCase):
     def setUp(self):
         self.wm = load("wlan_monitor_hardening", "wlan-monitor.py")
+
+    def test_saved_profile_ssid_is_only_a_label(self):
+        uuid = "f4aff26e-1193-43cc-8418-9e72a62e952e"
+        cmd = self.wm.parse_command('{"cmd": "wifi_connect", "ssid": "-dash net", "uuid": "%s"}' % uuid)
+        self.assertEqual((cmd["uuid"], cmd["ssid"]), (uuid, "-dash net"))
+        self.assertEqual(self.wm.parse_command('{"cmd": "wifi_connect", "ssid": "-dash net"}'), "")
+
+    def test_thread_start_failure_frees_busy(self):
+        mon = self.wm.Monitor.__new__(self.wm.Monitor)
+        mon._wifi_scan_lock = threading.Lock()
+        mon._wifi_scan_running = False
+        mon._wifi_busy = False
+        out = []
+        mon._emit_fn = out.append
+        with mock.patch.object(self.wm.threading.Thread, "start", side_effect=RuntimeError("no threads")):
+            self.assertIsNone(mon._spawn_wifi_command({"cmd": "wifi_radio", "on": True}))
+        self.assertFalse(mon._wifi_busy)
+        self.assertFalse(out[0]["ok"])
 
     def test_second_network_change_refused_while_one_runs(self):
         mon = self.wm.Monitor.__new__(self.wm.Monitor)

@@ -1415,16 +1415,19 @@ def parse_command(line):
         ssid = data.get("ssid", "")
         uuid = data.get("uuid")
         password = data.get("password")
-        if not isinstance(ssid, str) or len(ssid.encode("utf-8")) > 32 or "\n" in ssid or "\r" in ssid:
-            return ""
-        if ssid and (ssid.startswith("-") or not ssid.isprintable()):
-            return ""
         if uuid is not None:
             if not isinstance(uuid, str):
                 return ""
             uuid = uuid.strip()
             if uuid and not WIFI_UUID_RE.match(uuid):
                 return ""
+        if not isinstance(ssid, str):
+            return ""
+        if uuid:
+            # With a saved profile's uuid the SSID is only a label (nmcli gets the uuid alone).
+            ssid = "".join(ch for ch in ssid if ch.isprintable())[:32]
+        elif len(ssid.encode("utf-8")) > 32 or (ssid and (ssid.startswith("-") or not ssid.isprintable())):
+            return ""
         if password is not None:
             if not isinstance(password, str) or len(password.encode("utf-8")) > 128 or "\n" in password or "\r" in password:
                 return ""
@@ -3141,7 +3144,21 @@ class Monitor:
                     pass
                 return None
         t = threading.Thread(target=self._run_wifi_command, args=(command,), daemon=True)
-        t.start()
+        try:
+            t.start()
+        except Exception:
+            with self._wifi_scan_lock:
+                if command["cmd"] == "wifi_scan":
+                    self._wifi_scan_running = False
+                else:
+                    self._wifi_busy = False
+            if command["cmd"] != "wifi_scan":
+                try:
+                    (self._emit_fn or emit)({"event": "wifi_result", "ok": False, "action": command["cmd"],
+                                             "message": "The network change failed."})
+                except Exception:
+                    pass
+            return None
         return t
 
     # -- commands from the bar widget --
@@ -3795,9 +3812,9 @@ def main():
     def on_term(_signum, _frame):
         # A widget reload or shell restart: end nmcli children, remove passwd-files in flight,
         # give up the FRITZ!Box role and its socket, then exit.
-        if wifi_setup_mod is not None:
-            wifi_setup_mod.cleanup_active()
         try:
+            if wifi_setup_mod is not None:
+                wifi_setup_mod.cleanup_active()
             monitor.close()
         finally:
             os._exit(0)

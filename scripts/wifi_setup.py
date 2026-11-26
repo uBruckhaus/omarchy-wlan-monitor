@@ -40,12 +40,26 @@ MAX_WIRED = 32
 MAX_VPN = 64
 SSID_MAX_BYTES = 32
 SECRET_DIR_NAME = "ubruckhaus-wlan-monitor-secrets"
+SECRET_PREFIX = "wlan-wifi-"
 STALE_SECRET_AGE = 120.0
 
-# Running nmcli children and passwd-files in flight, so a SIGTERM can end and remove them.
+# Running nmcli children and passwd-files in flight, so a SIGTERM can end and remove them. Both
+# are immutable tuples replaced under _ACTIVE_LOCK, so the signal handler reads them without the
+# lock (it may interrupt the very thread that holds it).
 _ACTIVE_LOCK = threading.Lock()
-_ACTIVE_PROCS = set()
-_ACTIVE_SECRETS = set()
+_ACTIVE_PROCS = ()
+_ACTIVE_SECRETS = ()
+
+
+def _track(kind, item, add):
+    global _ACTIVE_PROCS, _ACTIVE_SECRETS
+    with _ACTIVE_LOCK:
+        current = _ACTIVE_PROCS if kind == "proc" else _ACTIVE_SECRETS
+        current = current + (item,) if add else tuple(x for x in current if x is not item and x != item)
+        if kind == "proc":
+            _ACTIVE_PROCS = current
+        else:
+            _ACTIVE_SECRETS = current
 
 AUTH_FAILURE_MARKERS = (
     "secrets were required",
@@ -228,7 +242,7 @@ def sweep_stale_secrets(now=None, max_age=STALE_SECRET_AGE):
     except OSError:
         return 0
     for name in names:
-        if not name.startswith("wlan-wifi-"):
+        if not name.startswith(SECRET_PREFIX):
             continue
         sub = os.path.join(folder, name)
         try:
@@ -250,13 +264,12 @@ def sweep_stale_secrets(now=None, max_age=STALE_SECRET_AGE):
 
 
 def cleanup_active():
-    """End running nmcli children and delete passwd-files in flight (the collector's SIGTERM)."""
-    with _ACTIVE_LOCK:
-        procs = list(_ACTIVE_PROCS)
-        paths = list(_ACTIVE_SECRETS)
+    """End running nmcli children and delete passwd-files in flight (the collector's SIGTERM).
+    Lock-free: reads the current tuples only."""
+    procs, paths = _ACTIVE_PROCS, _ACTIVE_SECRETS
     for proc in procs:
         try:
-            proc.kill()
+            os.killpg(proc.pid, signal.SIGKILL)
         except OSError:
             pass
     for path in paths:
@@ -300,11 +313,10 @@ def _write_passwd_file(password):
     folder = secret_dir()
     if not folder:
         raise OSError("No private folder for the Wi-Fi password.")
-    tmp_dir = os.path.join(folder, "wlan-wifi-%d-%s" % (os.getpid(), secrets.token_hex(8)))
+    tmp_dir = os.path.join(folder, "%s%d-%s" % (SECRET_PREFIX, os.getpid(), secrets.token_hex(8)))
     os.mkdir(tmp_dir, 0o700)
     secret_path = os.path.join(tmp_dir, "secrets")
-    with _ACTIVE_LOCK:
-        _ACTIVE_SECRETS.add(secret_path)
+    _track("secret", secret_path, True)
     try:
         fd = os.open(
             secret_path,
@@ -329,8 +341,7 @@ def _write_passwd_file(password):
             os.rmdir(tmp_dir)
         except OSError:
             pass
-        with _ACTIVE_LOCK:
-            _ACTIVE_SECRETS.discard(secret_path)
+        _track("secret", secret_path, False)
 
 
 def _run_nmcli(args, timeout=NMCLI_TIMEOUT, max_out=NMCLI_MAX_STDOUT, max_err=NMCLI_MAX_STDERR):
@@ -353,8 +364,7 @@ def _run_nmcli(args, timeout=NMCLI_TIMEOUT, max_out=NMCLI_MAX_STDOUT, max_err=NM
         return 127, "", "nmcli not found"
     except OSError as exc:
         return 1, "", str(exc)
-    with _ACTIVE_LOCK:
-        _ACTIVE_PROCS.add(proc)
+    _track("proc", proc, True)
     out_fd, err_fd = proc.stdout.fileno(), proc.stderr.fileno()
     bufs = {out_fd: bytearray(), err_fd: bytearray()}
     caps = {out_fd: max_out, err_fd: max_err}
@@ -394,11 +404,21 @@ def _run_nmcli(args, timeout=NMCLI_TIMEOUT, max_out=NMCLI_MAX_STDOUT, max_err=NM
             proc.wait()
             failure = failure or (124, "nmcli timed out")
             rc = 124
+    except Exception:
+        failure = (1, "nmcli could not be read")
     finally:
+        if proc.poll() is None:  # any early exit above: the child never outlives this call
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=2.0)
+            except Exception:
+                pass
         proc.stdout.close()
         proc.stderr.close()
-        with _ACTIVE_LOCK:
-            _ACTIVE_PROCS.discard(proc)
+        _track("proc", proc, False)
     if failure:
         return failure[0], "", failure[1]
     return (rc, bytes(bufs[out_fd]).decode("utf-8", "replace"),
@@ -867,6 +887,17 @@ def wifi_connect(ssid="", password=None, uuid=None):
                 "message": "Enterprise (802.1X) Wi-Fi passwords cannot be changed here.",
             }
 
+        if secret_dir() is None:
+            # Checked before the saved password is cleared below, so a failure leaves it intact.
+            return {
+                "ok": False,
+                "auth_failed": False,
+                "action": "connect",
+                "ssid": label,
+                "uuid": valid_uuid,
+                "message": "No private folder for the Wi-Fi password.",
+            }
+
         # Preserve WPA3 SAE; never downgrade sae -> wpa-psk. Clear only the stale PSK property.
         target_km = "sae" if key_mgmt == "sae" else "wpa-psk"
         mod_args = [
@@ -979,6 +1010,16 @@ def wifi_connect(ssid="", password=None, uuid=None):
             "ssid": label,
             "uuid": "",
             "message": "Wi-Fi password must be 8-63 UTF-8 bytes (or 64 hex chars) without leading or trailing spaces.",
+        }
+
+    if detected_sec != "owe" and secret_dir() is None:
+        return {
+            "ok": False,
+            "auth_failed": False,
+            "action": "connect",
+            "ssid": label,
+            "uuid": "",
+            "message": "No private folder for the Wi-Fi password.",
         }
 
     # Create profile first (without password on argv), bring up with passwd-file, delete on failure

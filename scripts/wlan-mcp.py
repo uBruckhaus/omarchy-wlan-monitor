@@ -21,7 +21,7 @@ import time
 
 
 SERVER_NAME = "omarchy-wlan-monitor"
-SERVER_VERSION = "0.11.1"
+SERVER_VERSION = "0.11.2"
 DEFAULT_PROTOCOL_VERSION = "2024-11-05"
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05", "2025-03-26")
 STATE_RESOURCE_URI = "wlan://state"
@@ -227,7 +227,7 @@ TOOLS = [
     },
     {
         "name": "wlan_list_devices",
-        "description": "List devices discovered on the local network with optional filtering by online state, device kind, group, search query, hidden visibility, or a fresh rescan.",
+        "description": "List devices discovered on the local network with optional filtering by online state, device kind, group, search query, or hidden visibility (no active scan; use wlan_rescan for one).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -236,7 +236,6 @@ TOOLS = [
                 "group": {"type": "string", "description": "Filter by device group (e.g. 'apple', 'android', 'media', 'network', 'smarthome', 'office', 'other')."},
                 "search": {"type": "string", "description": "Case-insensitive substring search across name, hostname, IP, MAC, vendor, and model."},
                 "include_hidden": {"type": "boolean", "description": "When true, include devices the user marked as hidden (default false)."},
-                "rescan": {"type": "boolean", "description": "Run an active subnet/mDNS scan before listing (needs --allow-changes)."},
             },
             "additionalProperties": False,
         },
@@ -248,7 +247,6 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "target": {"type": "string", "description": "Device IP address, MAC address, or case-insensitive name."},
-                "rescan": {"type": "boolean", "description": "Run an active scan before resolving (needs --allow-changes)."},
             },
             "required": ["target"],
             "additionalProperties": False,
@@ -550,9 +548,8 @@ class WlanMCPServer:
     def _tool_wlan_list_devices(self, args):
         online_only = args.get("online_only", False)
         include_hidden = args.get("include_hidden", False)
-        rescan = args.get("rescan", False)
-        if not all(isinstance(v, bool) for v in (online_only, include_hidden, rescan)):
-            raise ToolError("online_only, include_hidden, and rescan must be booleans.")
+        if not all(isinstance(v, bool) for v in (online_only, include_hidden)):
+            raise ToolError("online_only and include_hidden must be booleans.")
 
         kind_filter = args.get("kind")
         group_filter = args.get("group")
@@ -561,7 +558,7 @@ class WlanMCPServer:
             if fval is not None and not isinstance(fval, str):
                 raise ToolError("%s must be a string." % fname)
 
-        snap = self._ensure_snapshot(force=rescan, force_scan=rescan)
+        snap = self._ensure_snapshot()
         devices = list(snap.get("devices") or [])
 
         if not include_hidden:
@@ -600,10 +597,7 @@ class WlanMCPServer:
         }
 
     def _tool_wlan_get_device(self, args):
-        rescan = args.get("rescan", False)
-        if not isinstance(rescan, bool):
-            raise ToolError("rescan must be a boolean.")
-        snap = self._ensure_snapshot(force=rescan, force_scan=rescan)
+        snap = self._ensure_snapshot()
         dev = _resolve_device(args.get("target"), list(snap.get("devices") or []))
         return {"device": dev}
 
@@ -904,12 +898,12 @@ class WlanMCPServer:
             names = ", ".join(_clean(str(k), 40) for k in unknown[:5])
             return {"content": [{"type": "text", "text": json.dumps({"error": "Unknown argument(s): " + names})}],
                     "isError": True}
-        if name in WRITE_TOOLS or (name in ("wlan_list_devices", "wlan_get_device") and arguments.get("rescan") is True):
+        if name in WRITE_TOOLS:
             if not self.allow_changes:
                 return {"content": [{"type": "text", "text": json.dumps(
                     {"error": "This server is read-only. Start it with --allow-changes to allow changes and active scans."})}],
                     "isError": True}
-            if name in WRITE_TOOLS and arguments.get("confirm") is not True:
+            if arguments.get("confirm") is not True:
                 return {"content": [{"type": "text", "text": json.dumps(
                     {"error": "Pass confirm: true once the user has asked for exactly this change."})}],
                     "isError": True}

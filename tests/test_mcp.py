@@ -566,7 +566,7 @@ class McpProtocolTests(unittest.TestCase):
         self.assertFalse(names & wlan_mcp.WRITE_TOOLS)
         for name, args in (("wlan_wifi_forget", {"uuid": UUID_WIFI, "ssid": "FRITZ!Box 7690", "confirm": True}),
                            ("wlan_rescan", {"confirm": True}),
-                           ("wlan_list_devices", {"rescan": True})):
+                           ("wlan_list_devices", {"rescan": True})):  # no such argument any more
             resp = srv.handle_message({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
                                        "params": {"name": name, "arguments": args}})
             self.assertTrue(resp["result"]["isError"], name)
