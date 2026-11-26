@@ -2454,8 +2454,11 @@ class FritzMesh:
                                                             or exc.code == "fzNetworkChanged"):
                         self.state, self.message = "error", str(exc)
                         self.message_code, self.message_args = exc.code, exc.args_
-                        self.login_failure = (exc.code, str(exc), list(exc.args_))
-                        self.updated = time.time()  # the saved login is retried only later
+                        if self.generation == generation and exc.code != "fzNetworkChanged":
+                            # Kept only for this very gateway: a network change in between
+                            # never carries it (or its retry delay) over to another one.
+                            self.login_failure = (exc.code, str(exc), list(exc.args_))
+                            self.updated = time.time()  # the saved login is retried only later
                 return 5.0
             except Exception:  # anything unexpected ends the login too: never stuck at "connecting"
                 with self.lock:
@@ -2474,14 +2477,13 @@ class FritzMesh:
                     return 5.0
                 # Saved under the lock logout() takes too: a Disconnect is either before (and this
                 # generation check fails) or after (and deletes this file).
-                if not save_private_json(FRITZ_FILE, creds):
+                if not save_private_json(FRITZ_FILE, creds) or not mark_fritz_revoked(False):
+                    # Not saved (or an old revocation could not be lifted: it would not be loaded
+                    # again). Kept on screen like any failed login, not hidden by the old one's retry.
                     self.state, self.message = "error", "The login could not be stored in the settings folder."
                     self.message_code, self.message_args = "fzNotStored", []
-                    return 5.0
-                if not mark_fritz_revoked(False):
-                    # The old revocation could not be lifted: this login would not be loaded again.
-                    self.state, self.message = "error", "The login could not be stored in the settings folder."
-                    self.message_code, self.message_args = "fzNotStored", []
+                    self.login_failure = ("fzNotStored", self.message, [])
+                    self.updated = time.time()
                     return 5.0
                 self.remove_pending = False
                 self.creds = creds

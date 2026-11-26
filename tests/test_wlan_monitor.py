@@ -930,6 +930,38 @@ class FritzTests(unittest.TestCase):
             self.assertIsNone(fritz.login_failure)
         self.assertEqual(wlan_monitor.load_fritz()["pin"], "d" * 64)
 
+    def test_a_login_dropped_by_a_network_change_is_not_kept_for_the_next_gateway(self):
+        fritz = wlan_monitor.FritzMesh()
+        fritz.set_network("192.168.178.1", "1c:11:22:33:44:6c", True, True, "wlan0")
+        fritz.model_for = ("192.168.178.1", "1c:11:22:33:44:6c")
+        fritz.login("fritz1234", "pw", fritz.net_id)
+        self.neighbors = {}  # the router is gone right before the login is sent
+        with mock.patch.object(wlan_monitor, "bounded_http", side_effect=AssertionError("must not send")):
+            fritz.step()
+        self.assertEqual(fritz.snapshot()[0]["message_code"], "fzNetworkChanged")
+        self.assertIsNone(fritz.login_failure)
+
+    def test_a_login_that_cannot_be_stored_keeps_its_reason(self):
+        soap_ok = ("<s:Envelope><NewX_AVM-DE_MeshListPath>/meshlist.lua?sid=0123456789abcdef"
+                   "</NewX_AVM-DE_MeshListPath></s:Envelope>")
+        mesh_json = __import__("json").dumps(self.MESH).encode()
+
+        def fake_http(ip, port, method, path, body=None, headers=None, tls=False, pin=None, **kw):
+            if method == "POST" and "Authorization" not in (headers or {}):
+                return 401, {"www-authenticate": 'Digest realm="F!Box SOAP-Auth", nonce="N1", qop="auth"'}, b"", "c" * 64
+            if method == "POST":
+                return 200, {}, soap_ok.encode(), "c" * 64
+            return 200, {}, mesh_json, "c" * 64
+        fritz = wlan_monitor.FritzMesh()
+        fritz.set_network("192.168.178.1", "1c:11:22:33:44:6c", True, True, "wlan0")
+        fritz.model_for = ("192.168.178.1", "1c:11:22:33:44:6c")
+        fritz.login("fritz1234", "pw", fritz.net_id)
+        with mock.patch.object(wlan_monitor, "bounded_http", side_effect=fake_http), \
+                mock.patch.object(wlan_monitor, "save_private_json", return_value=False):
+            fritz.step()
+        self.assertEqual(fritz.login_failure[0], "fzNotStored")
+        self.assertGreater(fritz.updated, 0)
+
     def test_a_queued_login_never_goes_to_another_gateway(self):
         """Typed for router A, the network changes to router B (even at the same address) before
         the login is sent: nothing is sent to B, nothing is saved, the user is told."""
