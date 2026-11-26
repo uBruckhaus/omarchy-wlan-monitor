@@ -77,7 +77,7 @@ def _load_sibling_module(mod_name, filename):
 
 
 net_monitor_mod = _load_sibling_module("net_monitor", "net_monitor.py")
-wifi_setup_mod = _load_sibling_module("wifi_setup", "wifi_setup.py")
+wifi_setup_mod = _load_sibling_module("nm_wifi", "nm_wifi.py")
 
 
 def env_float(name, default, minimum):

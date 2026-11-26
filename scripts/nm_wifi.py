@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Safe NetworkManager (`nmcli`) Wi-Fi & Network setup backend (Python 3 stdlib only).
+"""Safe NetworkManager (`nmcli`) Wi-Fi & network connection backend (Python 3 stdlib only).
 
 All external calls use fixed argv lists (never a shell). Wi-Fi passwords are never passed
 on the command line or echoed in errors; they are written exclusively to an owner-only

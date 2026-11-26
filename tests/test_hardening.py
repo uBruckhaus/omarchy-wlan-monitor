@@ -21,7 +21,7 @@ def load(name, filename):
     return mod
 
 
-wifi = load("wifi_setup_hardening", "wifi_setup.py")
+wifi = load("nm_wifi_hardening", "nm_wifi.py")
 netmon = load("net_monitor_hardening", "net_monitor.py")
 
 

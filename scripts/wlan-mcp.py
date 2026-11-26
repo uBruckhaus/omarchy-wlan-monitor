@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """MCP (Model Context Protocol) JSON-RPC 2.0 stdio server for WLAN Monitor.
 
-Reuses scripts/wlan-monitor.py, scripts/net_monitor.py, and scripts/wifi_setup.py directly
+Reuses scripts/wlan-monitor.py, scripts/net_monitor.py, and scripts/nm_wifi.py directly
 (zero external dependencies, Python 3 stdlib only, works with `python3 -I`).
 FRITZ!Box passwords and Wi-Fi passphrases are never read, echoed, or exposed: the server is
 never the FRITZ!Box collector (Monitor(can_lead=False)), so it never opens the saved login.
@@ -21,7 +21,7 @@ import time
 
 
 SERVER_NAME = "omarchy-wlan-monitor"
-SERVER_VERSION = "0.11.5"
+SERVER_VERSION = "0.11.6"
 DEFAULT_PROTOCOL_VERSION = "2024-11-05"
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05", "2025-03-26")
 STATE_RESOURCE_URI = "wlan://state"
@@ -68,7 +68,7 @@ def load_wifi_setup_module(script_path=None, wlan_module=None):
         sibling = getattr(wmod, "wifi_setup_mod", None)
         if sibling is not None:
             return sibling
-    return _load_sibling("wifi_setup", "wifi_setup.py", script_path)
+    return _load_sibling("nm_wifi", "nm_wifi.py", script_path)
 
 
 def _json_depth_ok(text, max_depth=MAX_JSON_DEPTH):
@@ -450,7 +450,7 @@ RESOURCES = [
 # MCP Server
 
 class WlanMCPServer:
-    """MCP JSON-RPC 2.0 server backed by wlan_monitor.Monitor, net_monitor.NetMonitor, and wifi_setup."""
+    """MCP JSON-RPC 2.0 server backed by wlan_monitor.Monitor, net_monitor.NetMonitor, and nm_wifi."""
 
     def __init__(
         self,

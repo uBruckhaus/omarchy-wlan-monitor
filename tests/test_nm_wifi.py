@@ -8,7 +8,7 @@ from unittest import mock
 
 
 SCRIPTS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "scripts")
-WIFI_PATH = os.path.join(SCRIPTS_DIR, "wifi_setup.py")
+WIFI_PATH = os.path.join(SCRIPTS_DIR, "nm_wifi.py")
 WLAN_PATH = os.path.join(SCRIPTS_DIR, "wlan-monitor.py")
 
 spec_w = importlib.util.spec_from_file_location("wifi_setup", WIFI_PATH)
